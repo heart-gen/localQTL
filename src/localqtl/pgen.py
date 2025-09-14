@@ -1,5 +1,10 @@
-# Functions for reading dosages from PLINK pgen files based on the Pgenlib Python API:
-# https://github.com/chrchang/plink-ng/blob/master/2.0/Python/python_api.txt
+"""
+Functions for reading dosages from PLINK pgen files based on the Pgenlib Python API:
+https://github.com/chrchang/plink-ng/blob/master/2.0/Python/python_api.txt
+
+This was adapted from tensorQTL:
+https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/pgen.py
+"""
 
 import os
 import torch

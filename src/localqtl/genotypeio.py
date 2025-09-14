@@ -1,3 +1,7 @@
+"""
+This script was adapted from tensorQTL `genotypeio.py`:
+https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/genotypeio.py
+"""
 import numpy as np
 import pandas as pd
 import os, gzip, sys
