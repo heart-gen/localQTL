@@ -256,7 +256,8 @@ def get_cis_ranges(phenotype_pos_df, chr_variant_dfs, window, verbose=True):
 
 class InputGeneratorCis(object):
     """
-    Input generator for cis-mapping
+    Base input generator for cis-mapping.
+    Subclasses can extend by overriding `_postprocess_batch` to add haplotypes.
 
     Inputs:
       genotype_df:      genotype DataFrame (genotypes x samples)
@@ -268,43 +269,56 @@ class InputGeneratorCis(object):
 
     Generates: phenotype array, genotype array (2D), cis-window indices, phenotype ID
     """
-    def __init__(self, genotype_df, variant_df, phenotype_df, phenotype_pos_df, group_s=None, window=1000000):
-        assert (genotype_df.index == variant_df.index).all()
-        assert (phenotype_df.index == phenotype_df.index.unique()).all()
+    def __init__(self, genotype_df, variant_df, phenotype_df, phenotype_pos_df,
+                 group_s=None, window=1_000_000, **kwargs):
         self.genotype_df = genotype_df
         self.variant_df = variant_df.copy()
-        self.variant_df['index'] = np.arange(variant_df.shape[0])
-        self.n_samples = phenotype_df.shape[1]
-
-        # drop phenotypes without genotypes on same contig
-        variant_chrs = variant_df['chrom'].unique()
-        phenotype_chrs = phenotype_pos_df['chr'].unique()
-        self.chrs = [i for i in phenotype_chrs if i in variant_chrs]
-        m = phenotype_pos_df['chr'].isin(self.chrs)
-        if any(~m):
-            print(f'    ** dropping {sum(~m)} phenotypes on chrs. without genotypes')
-        self.phenotype_df = phenotype_df[m]
-        self.phenotype_pos_df = phenotype_pos_df[m]
-
-        # check for constant phenotypes and drop
-        m = np.all(self.phenotype_df.values == self.phenotype_df.values[:,[0]], 1)
-        if m.any():
-            print(f'    ** dropping {np.sum(m)} constant phenotypes')
-            self.phenotype_df = self.phenotype_df.loc[~m]
-            self.phenotype_pos_df = self.phenotype_pos_df.loc[~m]
-
-        if len(self.phenotype_df) == 0:
-            raise ValueError("No phenotypes remain after filters.")
-
-        self.group_s = None
+        self.phenotype_df = phenotype_df
+        self.phenotype_pos_df = phenotype_pos_df
+        self.group_s = group_s
         self.window = window
 
-        self.chr_variant_dfs = {c:g[['pos', 'index']] for c,g in self.variant_df.groupby('chrom')}
+        # core preprocessing
+        self._validate_inputs()
+        self._filter_phenotypes()
+        self._drop_constant_phenotypes()
+        self._calculate_cis_ranges()
 
-        # check phenotypes & calculate genotype ranges
-        # get genotype indexes corresponding to cis-window of each phenotype
-        self.cis_ranges, drop_ids = get_cis_ranges(self.phenotype_pos_df, self.chr_variant_dfs, self.window)
-        if len(drop_ids) > 0:
+    # Protected methods (overridable)
+    def _validate_inputs(self):
+        assert (self.genotype_df.index == self.variant_df.index).all(), \
+            "Genotype and variant DataFrames must share index order"
+        assert (self.phenotype_df.index == self.phenotype_df.index.unique()).all(), \
+            "Phenotype index must be unique"
+        self.variant_df['index'] = np.arange(self.variant_df.shape[0])
+        self.n_samples = self.phenotype_df.shape[1]
+        
+    def _filter_phenotypes(self):
+        variant_chrs = self.variant_df['chrom'].unique()
+        phenotype_chrs = self.phenotype_pos_df['chr'].unique()
+        self.chrs = [c for c in phenotype_chrs if c in variant_chrs]
+        mask = self.phenotype_pos_df['chr'].isin(self.chrs)
+        if any(~mask):
+            print(f'    ** dropping {sum(~mask)} phenotypes on chrs. without genotypes')
+        self.phenotype_df = self.phenotype_df.loc[mask]
+        self.phenotype_pos_df = self.phenotype_pos_df.loc[mask]
+
+    def _drop_constant_phenotypes(self):
+        m = np.all(self.phenotype_df.values == self.phenotype_df.values[:, [0]], axis=1)
+        if m.any():
+            print(f'    ** dropping {m.sum()} constant phenotypes')
+            self.phenotype_df = self.phenotype_df.loc[~m]
+            self.phenotype_pos_df = self.phenotype_pos_df.loc[~m]
+        if len(self.phenotype_df) == 0:
+            raise ValueError("No phenotypes remain after filters.")
+    
+    def _calculate_cis_ranges(self):
+        self.chr_variant_dfs = {c: g[['pos', 'index']]
+                                for c, g in self.variant_df.groupby('chrom')}
+        self.cis_ranges, drop_ids = get_cis_ranges(
+            self.phenotype_pos_df, self.chr_variant_dfs, self.window
+        )
+        if drop_ids:
             print(f"    ** dropping {len(drop_ids)} phenotypes without variants in cis-window")
             self.phenotype_df = self.phenotype_df.drop(drop_ids)
             self.phenotype_pos_df = self.phenotype_pos_df.drop(drop_ids)
@@ -315,18 +329,19 @@ class InputGeneratorCis(object):
             self.phenotype_start = self.phenotype_pos_df['start'].to_dict()
             self.phenotype_end = self.phenotype_pos_df['end'].to_dict()
         self.n_phenotypes = self.phenotype_df.shape[0]
-
-        if group_s is not None:
-            self.group_s = group_s.loc[self.phenotype_df.index].copy()
+        if self.group_s is not None:
+            self.group_s = self.group_s.loc[self.phenotype_df.index].copy()
             self.n_groups = self.group_s.unique().shape[0]
 
+    # Hook for subclasses
+    def _postprocess_batch(self, batch):
+        return batch
 
+    # Data generator
     @background(max_prefetch=6)
     def generate_data(self, chrom=None, verbose=False):
         """
-        Generate batches from genotype data
-
-        Returns: phenotype array, genotype matrix, genotype index, phenotype ID(s), [group ID]
+        Generate batches from genotype data.
         """
         if chrom is None:
             phenotype_ids = self.phenotype_df.index
@@ -334,30 +349,45 @@ class InputGeneratorCis(object):
         else:
             phenotype_ids = self.phenotype_pos_df[self.phenotype_pos_df['chr'] == chrom].index
             if self.group_s is None:
-                offset_dict = {i:j for i,j in zip(*np.unique(self.phenotype_pos_df['chr'], return_index=True))}
+                offset_dict = {c: i for i, c in zip(*np.unique(self.phenotype_pos_df['chr'],
+                                                               return_index=True))}
             else:
-                offset_dict = {i:j for i,j in zip(*np.unique(self.phenotype_pos_df['chr'][self.group_s.drop_duplicates().index], return_index=True))}
+                offset_dict = {c: i for i, c in zip(
+                    *np.unique(self.phenotype_pos_df['chr'][self.group_s.drop_duplicates().index],
+                               return_index=True))}
             chr_offset = offset_dict[chrom]
 
-        index_dict = {j:i for i,j in enumerate(self.phenotype_df.index)}
+        index_dict = {pid: i for i, pid in enumerate(self.phenotype_df.index)}
 
         if self.group_s is None:
-            for k,phenotype_id in enumerate(phenotype_ids, chr_offset+1):
+            for k, pid in enumerate(phenotype_ids, chr_offset+1):
                 if verbose:
                     print_progress(k, self.n_phenotypes, 'phenotype')
-                p = self.phenotype_df.values[index_dict[phenotype_id]]
-                # p = self.phenotype_df.values[k]
-                r = self.cis_ranges[phenotype_id]
-                yield p, self.genotype_df.values[r[0]:r[-1]+1], np.arange(r[0],r[-1]+1), phenotype_id
+                p = self.phenotype_df.values[index_dict[pid]]
+                r = self.cis_ranges[pid]
+                batch = (
+                    p,
+                    self.genotype_df.values[r[0]:r[-1]+1],
+                    np.arange(r[0], r[-1]+1),
+                    pid
+                )
+                yield self._postprocess_batch(batch)
         else:
             gdf = self.group_s[phenotype_ids].groupby(self.group_s, sort=False)
-            for k,(group_id,g) in enumerate(gdf, chr_offset+1):
+            for k, (group_id, g) in enumerate(gdf, chr_offset+1):
                 if verbose:
                     print_progress(k, self.n_groups, 'phenotype group')
-                # check that ranges are the same for all phenotypes within group
-                assert np.all([self.cis_ranges[g.index[0]][0] == self.cis_ranges[i][0] and self.cis_ranges[g.index[0]][1] == self.cis_ranges[i][1] for i in g.index[1:]])
-                group_phenotype_ids = g.index.tolist()
-                # p = self.phenotype_df.loc[group_phenotype_ids].values
-                p = self.phenotype_df.values[[index_dict[i] for i in group_phenotype_ids]]
+                assert np.all([self.cis_ranges[g.index[0]][0] == self.cis_ranges[i][0] and
+                               self.cis_ranges[g.index[0]][1] == self.cis_ranges[i][1]
+                               for i in g.index[1:]])
+                group_pids = g.index.tolist()
+                p = self.phenotype_df.values[[index_dict[i] for i in group_pids]]
                 r = self.cis_ranges[g.index[0]]
-                yield p, self.genotype_df.values[r[0]:r[-1]+1], np.arange(r[0],r[-1]+1), group_phenotype_ids, group_id
+                batch = (
+                    p,
+                    self.genotype_df.values[r[0]:r[-1]+1],
+                    np.arange(r[0],r[-1]+1),
+                    group_pids,
+                    group_id
+                )
+                yield self._postprocess_batch(batch)
