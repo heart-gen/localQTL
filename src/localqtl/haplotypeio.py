@@ -19,22 +19,21 @@ from typing import List, Optional, Union
 
 from rfmix_reader import read_rfmix
 
+from .utils import gpu_available
 from .genotypeio import InputGeneratorCis, background
 
-try:
-    import cupy as cp
-    get_array_module = cp.get_array_module
-except ImportError:
-    cp = np
-    def get_array_module(x):
-        return np
-
-try:
+if gpu_available():
     import cudf
+    import cupy as cp
     from cudf import DataFrame as cuDF
-except ImportError:    
+    
+    get_array_module = cp.get_array_module
+else:
+    cp = np
     cudf = pd
     cuDF = pd.DataFrame
+    def get_array_module(x):
+        return np
 
 # ----------------------------
 # Local ancestry readers

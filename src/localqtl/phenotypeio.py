@@ -5,19 +5,12 @@ https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/core.py
 import numpy as np
 import pandas as pd
 
-try:
+from .utils import gpu_available
+
+if gpu_available():
     import cupy as cp
-except ImportError:
+else:
     cp = np
-
-def gpu_available():
-    import cupy as cp
-    try:
-        ndev = cp.cuda.runtime.getDeviceCount()
-        return ndev > 0
-    except cp.cuda.runtime.CUDARuntimeError:
-        return False
-
 
 def read_phenotype_bed(path, as_tensor=False, device="cpu", dtype="float32"):
     """

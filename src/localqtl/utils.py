@@ -42,3 +42,12 @@ class SimpleLogger(object):
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
+
+
+def gpu_available():
+    import cupy as cp
+    try:
+        ndev = cp.cuda.runtime.getDeviceCount()
+        return ndev > 0
+    except cp.cuda.runtime.CUDARuntimeError:
+        return False
