@@ -137,7 +137,73 @@ class SimpleCisMapper:
         return tstats, betas, se
 
 
-import torch
+def run_batch_regression(y, G, H=None, device="cuda"):
+    """
+    Batched OLS regression for one phenotype and all variants in a cis-window.
+
+    Parameters
+    ----------
+    y : torch.Tensor
+        (n,) phenotype vector (samples)
+    G : torch.Tensor
+        (m × n) genotype matrix (variants × samples)
+    H : torch.Tensor, optional
+        (m × n × (k-1)) haplotype ancestry matrix (variants × samples × ancestries-1)
+    device : str
+        "cuda" or "cpu"
+
+    Returns
+    -------
+    betas : torch.Tensor
+        (m × p) regression coefficients (per variant, per predictor)
+    ses : torch.Tensor
+        (m × p) standard errors
+    tstats : torch.Tensor
+        (m × p) t-statistics
+    """
+    y = y.to(device)
+    G = G.to(device)
+
+    n = y.shape[0]
+
+    # Expand y across variants for batching: (m × n × 1)
+    y_exp = y.unsqueeze(0).expand(G.shape[0], -1).unsqueeze(-1)
+
+    # Build design matrix X for each variant
+    # G -> (m × n × 1)
+    G_exp = G.unsqueeze(-1)
+
+    if H is not None:
+        H = H.to(device)  # (m × n × (k-1))
+        X = torch.cat([G_exp, H], dim=2)  # (m × n × p)
+    else:
+        X = G_exp  # (m × n × 1)
+
+    m, n, p = X.shape
+
+    # Compute XtX and Xty in batch
+    XtX = torch.matmul(X.transpose(1, 2), X)      # (m × p × p)
+    Xty = torch.matmul(X.transpose(1, 2), y_exp)  # (m × p × 1)
+
+    # Solve for betas
+    betas = torch.linalg.solve(XtX, Xty).squeeze(-1)  # (m × p)
+
+    # Residuals and variance estimate
+    y_hat = torch.matmul(X, betas.unsqueeze(-1))      # (m × n × 1)
+    resid = y_exp - y_hat                             # (m × n × 1)
+    dof = n - p
+    sigma2 = (resid.transpose(1,2) @ resid).squeeze() / dof  # (m,)
+
+    # Standard errors: sqrt(diag(XtX^-1) * sigma2)
+    XtX_inv = torch.linalg.inv(XtX)                   # (m × p × p)
+    var_betas = XtX_inv * sigma2.view(-1,1,1)         # broadcast sigma2
+    ses = torch.sqrt(torch.diagonal(var_betas, dim1=1, dim2=2))  # (m × p)
+
+    # T-statistics
+    tstats = betas / ses
+
+    return betas, ses, tstats
+
 
 def run_batch_regression_with_permutations(y, G, H=None, y_perm=None, device="cuda"):
     """
