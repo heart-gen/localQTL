@@ -21,9 +21,20 @@ from rfmix_reader import read_rfmix
 
 from .genotypeio import InputGeneratorCis, background
 
-import cudf
-import cupy as cp
-from cudf import DataFrame as cuDF
+try:
+    import cupy as cp
+    get_array_module = cp.get_array_module
+except ImportError:
+    cp = np
+    def get_array_module(x):
+        return np
+
+try:
+    import cudf
+    from cudf import DataFrame as cuDF
+except ImportError:    
+    cudf = pd
+    cuDF = pd.DataFrame
 
 # ----------------------------
 # Local ancestry readers
@@ -96,7 +107,7 @@ class RFMixReader:
         if select_samples is not None:
             ix = [self.sample_ids.index(i) for i in select_samples]
             self.admix = self.admix[:, ix, :]
-            if isinstance(self.g_anc, cuDF):
+            if hasattr(self.g_anc, "to_arrow"):
                 self.g_anc = self.g_anc.loc[ix].reset_index(drop=True)
             else:
                 self.g_anc = self.g_anc.iloc[ix].reset_index(drop=True)
@@ -173,7 +184,7 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
         pair independently. Supports NumPy or CuPy arrays via arr_mod.
         """
         # Determine arrray module
-        mod = cp.get_array_module(block) if cp and isinstance(block, cp.ndarray) else np
+        mod = get_array_module(block)
 
         loci_dim, sample_dim, ancestry_dim = block.shape
         block = block.reshape(loci_dim, -1)  # Shape: (loci, samples * ancestries)
@@ -222,11 +233,11 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
 # ----------------------------
 # Helpers functions
 # ----------------------------
-def _to_pandas(df: Union[cuDF, pd.DataFrame, cudf.Series, pd.Series]) -> pd.DataFrame | pd.Series:
-    return df.to_pandas() if isinstance(df, (cuDF, cudf.Series)) else df
+def _to_pandas(df: Union[cuDF, cudf.Series]) -> pd.DataFrame | pd.Series:
+    return df.to_pandas() if hasattr(df, "to_pandas") else df
 
 
-def _get_sample_ids(df: Union[cuDF, pd.DataFrame]) -> List[str]:
-    if isinstance(df, cuDF):
+def _get_sample_ids(df: cuDF) -> List[str]:
+    if hasattr(df, "to_arrow"):
         return df["sample_id"].to_arrow().to_pylist()
     return df["sample_id"].tolist()

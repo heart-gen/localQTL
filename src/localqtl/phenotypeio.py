@@ -8,7 +8,7 @@ import pandas as pd
 try:
     import cupy as cp
 except ImportError:
-    cp = None
+    cp = np
 
 def gpu_available():
     import cupy as cp
