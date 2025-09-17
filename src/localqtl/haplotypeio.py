@@ -2,8 +2,7 @@
 GPU-enabled utilities to incorporate local ancestry (RFMix) into tensorQTL-style
 cis mapping. Provides:
   - RFMixReader: aligns RFMix local-ancestry to genotype variant order (lazy via dask)
-  - get_cis_ranges: computes per-phenotype cis windows for BOTH variants and haplotypes
-  - InputGeneratorCis: background-prefetched batch generator that yields
+  - InputGeneratorCisWithHaps: background-prefetched batch generator that yields
       phenotype, variants slice, haplotypes slice, their index ranges, and IDs
 
 Notes
