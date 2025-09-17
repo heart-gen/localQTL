@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 import sys
-sys.path.append("src")  # adjust to where genotypeio.py lives
+sys.path.append("src")
 from genotypeio import _impute_mean, get_cis_ranges, InputGeneratorCis
 
 def test_impute_mean_basic():
