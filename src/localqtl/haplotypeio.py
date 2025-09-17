@@ -18,8 +18,9 @@ import numpy as np
 import pandas as pd
 from typing import List, Optional, Union
 
-from .genotypeio import InputGeneratorCis
 from rfmix_reader import read_rfmix
+
+from .genotypeio import InputGeneratorCis, background
 
 import cudf
 import cupy as cp
@@ -159,8 +160,9 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
                  on_the_fly_impute=True, **kwargs):
         super().__init__(*args, **kwargs)
         self.haplotypes = haplotypes
-        self.loci_df = loci_df.copy()
-        self.loci_df['index'] = np.arange(self.loci_df.shape[0])
+        self.loci_df = loci_df.copy() if loci_df is not None else None
+        if self.loci_df is not None:
+            self.loci_df['index'] = np.arange(self.loci_df.shape[0])
         self.on_the_fly_impute = on_the_fly_impute
 
     @staticmethod
@@ -180,7 +182,7 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
 
         block_imputed = block.copy()
 
-        for s in range(sample_dim):
+        for s in range(block.shape[1]):
             col = block[:, s]
             mask = mod.isnan(col)
             if mod.any(mask):
@@ -201,7 +203,7 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
                 H = self._interpolate_block(H_block)
             else:
                 H = H_slice.compute() if hasattr(H_slice, "compute") else np.asarray(H_slice)
-            return p, G, G_idx, H, pid
+            return p, G, v_idx, H, pid
         elif len(batch) == 5:
             p, G, v_idx, ids, group_id = batch
             H_slice = self.haplotypes[v_idx, :, :]
@@ -210,7 +212,12 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
                 H = self._interpolate_block(H_block)
             else:
                 H = H_slice.compute() if hasattr(H_slice, "compute") else np.asarray(H_slice)
-            return p, G, G_idx, H, ids, group_id
+            return p, G, v_idx, H, ids, group_id
+
+    @background(max_prefetch=6)
+    def generate_data(self, chrom=None, verbose=False):
+        for batch in super().generate_data(chrom=chrom, verbose=verbose):
+            yield self._postprocess_batch(batch)
 
 
 # ----------------------------
