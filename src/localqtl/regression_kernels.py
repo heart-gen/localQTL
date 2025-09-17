@@ -1,5 +1,60 @@
 import torch
 
+class Residualizer(object):
+    """
+    Residualizer for regressing out covariates from genotype/phenotype matrices.
+    """
+    def __init__(self, C_t: torch.Tensor):
+        # Center and orthongonalize covariates
+        C_t = C_t - C_t.mean(0)
+        self.Q_t, _ = torch.linalg.qr(C_t, mode='reduced')
+        self.P = self.Q_t @ self.Q_t.T
+        self.dof = C_t.shape[0] - 2 - C_t.shape[1]
+
+    def transform(self, *matrices: torch.Tensor, center: bool=True
+                  ) -> tuple[torch.Tensor]:
+        """
+        Residualize one or more matrices in a single GPU pass.
+        """
+        if len(matrices) == 1:
+            M_t = matrices[0]
+            if center:
+                M_t = M_t - M_t.mean(1, keepdim=True)
+            return (M_t - M_t @ self.P,)
+
+        # Concatenate features along rows
+        M_cat = torch.cat(matrices, dim=0)
+        if center:
+            M_cat = M_cat - M_cat.mean(1, keepdim=True)
+
+        # Project once with cached P
+        M_cat_resid = M_cat - M_cat @ self.P
+
+        # Split back into original blocks
+        out = []
+        start = 0
+        for M in matrices:
+            end = start + M.shape[0]
+            out.append(M_cat_resid[start:end])
+            start = end
+        return tuple(out)
+
+    def check_orthogonality(self, M_t: torch.Tensor, atol: float = 1e-6) -> float:
+        """
+        Check maximum absolute correlation between residualized matrix and covariates.
+        """
+        # Residualize
+        M_resid = self.transform(M_t, center=True)[0]
+
+        # Project residuals onto Q
+        proj = M_resid @ self.Q_t
+        max_corr = proj.abs().max().item()
+
+        if max_corr > atol:
+            print(f"Warning: residuals not fully orthogonal (max={max_corr:.2e})")
+        return max_corr
+
+
 def run_batch_regression(y, G, H=None, device="cuda"):
     """
     Batched OLS regression for one phenotype and all variants in a cis-window.
