@@ -28,12 +28,9 @@ import numpy as np
 import pandas as pd
 import torch
 
-# Adjust this path if your package lives elsewhere
-sys.path.append("src/localqtl")
-
-# Imports from your codebase
-from cis import map_cis_nominal, SimpleCisMapper
-from genotypeio import InputGeneratorCis
+sys.path.append("/ocean/projects/bio250020p/kbenjamin/software/localQTL/src")
+from localqtl.cis import map_cis_nominal, SimpleCisMapper
+from localqtl.genotypeio import InputGeneratorCis
 
 
 def make_synthetic_data(
