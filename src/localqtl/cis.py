@@ -77,7 +77,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device):
     Includes: impute+filter, AF/MA, DoF fix (n-k-p), distances.
     Returns a single DataFrame.
     """
-        results = []
+    results = []
     # Iterate phenotypes / groups
     for batch in ig.generate_data():
         # Unpack
