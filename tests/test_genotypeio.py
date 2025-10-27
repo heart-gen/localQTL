@@ -2,11 +2,6 @@ import numpy as np
 import pandas as pd
 import pytest
 
-<<<<<<< HEAD
-import sys
-sys.path.append("src")
-from genotypeio import _impute_mean, get_cis_ranges, InputGeneratorCis
-=======
 from localqtl.genotypeio import (
     _impute_mean,
     get_cis_ranges,
@@ -17,7 +12,6 @@ from localqtl.genotypeio import (
 ############################
 # _impute_mean tests
 ############################
->>>>>>> 3e664bda0a94f7a1ce2207313b94224fcb41a88a
 
 def test_impute_mean_basic():
     """
