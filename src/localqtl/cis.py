@@ -1,3 +1,4 @@
+import math
 import torch
 import pandas as pd
 from typing import Optional, Tuple, List
@@ -8,6 +9,19 @@ from .regression_kernels import (
     run_batch_regression,
     run_batch_regression_with_permutations
 )
+
+def _impute_and_filter(G_t: torch.Tensor):
+    """Mean-impute per variant (treat -9 or non-finite as missing) and drop monomorphic variants."""
+    # mark missing
+    miss = (~torch.isfinite(G_t)) | (G_t == -9)
+    if miss.any():
+        num = torch.where(miss, torch.zeros_like(G_t), G_t).sum(dim=1, keepdim=True)
+        den = (~miss).sum(dim=1, keepdim=True).clamp_min(1)
+        row_mean = num / den
+        G_t = torch.where(miss, row_mean, G_t)
+    keep = G_t.var(dim=1, unbiased=False) > 0
+    return G_t, keep
+
 
 def _residualize_matrix_with_covariates(
     Y: torch.Tensor,           # (features x samples)
@@ -130,6 +144,24 @@ def map_cis_nominal(
         G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
         H_t = torch.tensor(H_block, dtype=torch.float32, device=device) if H_block is not None else None
 
+        # Mean-impute and drop monomorphic BEFORE residualization; update indices/H accordingly
+        G_t, keep_mask = _impute_and_filter(G_t)
+        if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
+            continue  # no valid variants
+        if keep_mask.shape[0] != G_t.shape[0]:  # safety
+            keep_mask = torch.ones(G_t.shape[0], dtype=torch.bool, device=device)
+        keep_np = keep_mask.detach().cpu().numpy()
+        v_idx = v_idx[keep_np]
+        if H_t is not None:
+            H_t = H_t[keep_mask]
+
+        # Allele frequency & minor-allele stats from RAW (imputed) G
+        n_samp = y_t.shape[0]
+        sum_g_over_05 = torch.where(G_t > 0.5, G_t, torch.zeros_like(G_t)).sum(dim=1)
+        af_t = (G_t.sum(dim=1) / (2.0 * n_samp))
+        ma_samples_t = torch.where(af_t <= 0.5, (G_t > 0.5).sum(dim=1), (G_t < 1.5).sum(dim=1)).to(torch.int32)
+        ma_count_t = torch.where(af_t <= 0.5, sum_g_over_05, 2 * n_samp - sum_g_over_05)
+ 
         # Residualize this batch (makes y/G/H orthogonal to covariates)
         y_t, G_t, H_t = _residualize_batch(y_t, G_t, H_t, rez, center=True)
         
@@ -149,14 +181,25 @@ def map_cis_nominal(
         var_ids = variant_df.index.values[v_idx]
         var_pos = variant_df.iloc[v_idx]["pos"].values
 
+        # Distances to phenotype start/end
+        start_pos = ig.phenotype_start[pid]
+        end_pos = ig.phenotype_end[pid]
+        start_distance = var_pos - start_pos
+        end_distance = var_pos - end_pos
+
         # Assemble result rows (genotype effect == column 0)
         out = {
             "phenotype_id": pid,
             "variant_id": var_ids,
             "pos": var_pos,
+            "start_distance": start_distance,
+            "end_distance": end_distance,
             "beta": betas[:, 0].detach().cpu().numpy(),
             "se": ses[:, 0].detach().cpu().numpy(),
             "tstat": tstats[:, 0].detach().cpu().numpy(),
+            "af": af_t.detach().cpu().numpy(),
+            "ma_samples": ma_samples_t.detach().cpu().numpy(),
+            "ma_count": ma_count_t.detach().cpu().numpy(),
         }
         df = pd.DataFrame(out)
 
@@ -183,6 +226,7 @@ class SimpleCisMapper:
         loci_df: Optional[pd.DataFrame] = None,
         device: str = "auto",
         window: int = 1_000_000,
+        rez: Optional[Residualizer],
     ):
         self.device = ("cuda" if (device == "auto" and torch.cuda.is_available()) else
                        device if device in ("cuda", "cpu") else "cpu")
@@ -222,6 +266,16 @@ class SimpleCisMapper:
     def map_nominal(self, nperm: Optional[int] = None) -> pd.DataFrame:
         # Delegate to the functional API for consistency
         # (We reuse the already-built ig by pulling its data and the stored residualizer.)
+        def _impute_and_filter(G_t: torch.Tensor):
+            miss = (~torch.isfinite(G_t)) | (G_t == -9)
+            if miss.any():
+                num = torch.where(miss, torch.zeros_like(G_t), G_t).sum(dim=1, keepdim=True)
+                den = (~miss).sum(dim=1, keepdim=True).clamp_min(1)
+                row_mean = num / den
+                G_t = torch.where(miss, row_mean, G_t)
+            keep = G_t.var(dim=1, unbiased=False) > 0
+            return G_t, keep
+    
         results = []
         for batch in self.ig.generate_data():
             if self.with_haps:
@@ -234,6 +288,22 @@ class SimpleCisMapper:
             G_t = torch.tensor(G_block, dtype=torch.float32, device=self.device)
             H_t = torch.tensor(H_block, dtype=torch.float32, device=self.device) if H_block is not None else None
 
+            # Impute + drop monomorphic, update indices/H
+            G_t, keep_mask = _impute_and_filter(G_t)
+            if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
+                continue
+            keep_np = keep_mask.detach().cpu().numpy()
+            v_idx = v_idx[keep_np]
+            if H_t is not None:
+                H_t = H_t[keep_mask]
+
+            # AF/MA from raw (imputed) G
+            n_samp = y_t.shape[0]
+            sum_g_over_05 = torch.where(G_t > 0.5, G_t, torch.zeros_like(G_t)).sum(dim=1)
+            af_t = (G_t.sum(dim=1) / (2.0 * n_samp))
+            ma_samples_t = torch.where(af_t <= 0.5, (G_t > 0.5).sum(dim=1), (G_t < 1.5).sum(dim=1)).to(torch.int32)
+            ma_count_t = torch.where(af_t <= 0.5, sum_g_over_05, 2 * n_samp - sum_g_over_05)
+ 
             y_t, G_t, H_t = _residualize_batch(y_t, G_t, H_t, self.rez, center=True)
 
             if nperm is not None:
@@ -249,14 +319,23 @@ class SimpleCisMapper:
 
             var_ids = self.variant_df.index.values[v_idx]
             var_pos = self.variant_df.iloc[v_idx]["pos"].values
+            start_pos = self.ig.phenotype_start[pid]
+            end_pos = self.ig.phenotype_end[pid]
+            start_distance = var_pos - start_pos
+            end_distance = var_pos - end_pos
 
             df = pd.DataFrame({
                 "phenotype_id": pid,
                 "variant_id": var_ids,
                 "pos": var_pos,
+                "start_distance": start_distance,
+                "end_distance": end_distance,
                 "beta": betas[:, 0].detach().cpu().numpy(),
                 "se": ses[:, 0].detach().cpu().numpy(),
                 "tstat": tstats[:, 0].detach().cpu().numpy(),
+                "af": af_t.detach().cpu().numpy(),
+                "ma_samples": ma_samples_t.detach().cpu().numpy(),
+                "ma_count": ma_count_t.detach().cpu().numpy(),
             })
             if perm_max_r2 is not None:
                 df["perm_max_r2"] = perm_max_r2
@@ -289,8 +368,10 @@ class SimpleCisMapper:
         betas = XtX_inv @ (X.T @ y)
         y_hat = X @ betas
         resid = y - y_hat
-        dof = X.shape[0] - X.shape[1]
-        sigma2 = (resid @ resid) / dof
+        k_eff = rez.Q_t.shape[1] if rez is not None else 0
+        p = X.shape[-1]
+        dof = X.shape[0] - k_eff - p
+        sigma2 = (resid.transpose(1,2) @ resid).squeeze() / dof
         se = torch.sqrt(torch.diag(XtX_inv) * sigma2)
         tstats = betas / se
         return tstats, betas, se
