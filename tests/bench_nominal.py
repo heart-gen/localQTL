@@ -29,7 +29,7 @@ import pandas as pd
 import torch
 
 # Adjust this path if your package lives elsewhere
-sys.path.append("src")
+sys.path.append("src/localqtl")
 
 # Imports from your codebase
 from cis import map_cis_nominal, SimpleCisMapper
