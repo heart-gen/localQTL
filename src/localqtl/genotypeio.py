@@ -9,13 +9,12 @@ import threading, queue, bisect
 from pandas_plink import read_plink
 
 sys.path.insert(1, os.path.dirname(__file__))
-from core import *
+from .phenotypeio import read_phenotype_bed
 
 try:
-    import pgen
+    import .pgen
 except ImportError as e:
     pgen = None
-
 
 class BackgroundGenerator(threading.Thread):
     def __init__(self, generator, max_prefetch=10):
