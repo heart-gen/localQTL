@@ -25,7 +25,7 @@ CSV_OUT="${CSV_OUT:-bench_results.${SLURM_JOB_ID}.csv}"
 
 # Where your repo lives; default to submission dir
 WORKDIR="${WORKDIR:-$SLURM_SUBMIT_DIR}"
-SCRIPT_REL="./bench_nominal.py"
+SCRIPT_REL="tests/bench_nominal.py"
 
 log_message "**** Job starts ****"
 
