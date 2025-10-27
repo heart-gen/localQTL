@@ -1,4 +1,3 @@
-import math
 import torch
 import pandas as pd
 from typing import Optional, Tuple, List
@@ -12,7 +11,6 @@ from .regression_kernels import (
 
 def _impute_and_filter(G_t: torch.Tensor):
     """Mean-impute per variant (treat -9 or non-finite as missing) and drop monomorphic variants."""
-    # mark missing
     miss = (~torch.isfinite(G_t)) | (G_t == -9)
     if miss.any():
         num = torch.where(miss, torch.zeros_like(G_t), G_t).sum(dim=1, keepdim=True)
@@ -24,9 +22,7 @@ def _impute_and_filter(G_t: torch.Tensor):
 
 
 def _residualize_matrix_with_covariates(
-    Y: torch.Tensor,           # (features x samples)
-    C: Optional[pd.DataFrame], # covariates_df or None
-    device: str
+        Y: torch.Tensor, C: Optional[pd.DataFrame], device: str
 ) -> Tuple[torch.Tensor, Optional[Residualizer]]:
     """
     Residualize (features x samples) matrix Y against covariates C across samples.
@@ -34,18 +30,15 @@ def _residualize_matrix_with_covariates(
     """
     if C is None:
         return Y, None
-    C_t = torch.tensor(C.values, dtype=torch.float32, device=device)  # (samples x k)
+    C_t = torch.tensor(C.values, dtype=torch.float32, device=device)
     rez = Residualizer(C_t)
     (Y_resid,) = rez.transform(Y, center=True)
     return Y_resid, rez
 
 
 def _residualize_batch(
-    y: torch.Tensor,  # (samples,)
-    G: torch.Tensor,  # (m x samples)
-    H: Optional[torch.Tensor],  # (m x samples x pH) or None
-    rez: Optional[Residualizer],
-    center: bool = True,
+        y: torch.Tensor, G: torch.Tensor, H: Optional[torch.Tensor],
+        rez: Optional[Residualizer], center: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Residualize y (1D), G (2D), and optional H (3D) with the same Residualizer.
@@ -77,16 +70,103 @@ def _residualize_batch(
     return y_resid, G_resid, H_resid
 
 
+def _run_nominal_core(ig, variant_df, rez, nperm, device):
+    """
+    Core nominal loop used by both the functional and OO APIs.
+    Assumes ig.phenotype_df is already residualized if rez is not None.
+    Includes: impute+filter, AF/MA, DoF fix (n-k-p), distances.
+    Returns a single DataFrame.
+    """
+        results = []
+    # Iterate phenotypes / groups
+    for batch in ig.generate_data():
+        # Unpack
+        if with_haps:
+            p, G_block, v_idx, H_block, pid = batch  # order as defined in InputGeneratorCisWithHaps._postprocess_batch
+        else:
+            p, G_block, v_idx, pid = batch
+            H_block = None
+
+        # Tensors (samples dimension is the last axis)
+        y_t = torch.tensor(p, dtype=torch.float32, device=device)
+        G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
+        H_t = torch.tensor(H_block, dtype=torch.float32, device=device) if H_block is not None else None
+
+        # Mean-impute and drop monomorphic BEFORE residualization; update indices/H accordingly
+        G_t, keep_mask = _impute_and_filter(G_t)
+        if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
+            continue  # no valid variants
+        if keep_mask.shape[0] != G_t.shape[0]:  # safety
+            keep_mask = torch.ones(G_t.shape[0], dtype=torch.bool, device=device)
+        keep_np = keep_mask.detach().cpu().numpy()
+        v_idx = v_idx[keep_np]
+        if H_t is not None:
+            H_t = H_t[keep_mask]
+
+        # Allele frequency & minor-allele stats from RAW (imputed) G
+        n_samp = y_t.shape[0]
+        sum_g_over_05 = torch.where(G_t > 0.5, G_t, torch.zeros_like(G_t)).sum(dim=1)
+        af_t = (G_t.sum(dim=1) / (2.0 * n_samp))
+        ma_samples_t = torch.where(af_t <= 0.5, (G_t > 0.5).sum(dim=1), (G_t < 1.5).sum(dim=1)).to(torch.int32)
+        ma_count_t = torch.where(af_t <= 0.5, sum_g_over_05, 2 * n_samp - sum_g_over_05)
+ 
+        # Residualize this batch (makes y/G/H orthogonal to covariates)
+        y_t, G_t, H_t = _residualize_batch(y_t, G_t, H_t, rez, center=True)
+
+        k_eff = rez.Q_t.shape[1] if rez is not None else 0        
+        # Permuted phenotypes (if requested)
+        if nperm is not None:
+            perms = [torch.randperm(y_t.shape[0], device=device) for _ in range(nperm)]
+            y_perm = torch.stack([y_t[idx] for idx in perms], dim=1)  # (n x nperm)
+            betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
+                y=y_t, G=G_t, H=H_t, y_perm=y_perm, k_eff=k_eff, device=device
+            )
+            perm_max_r2 = r2_perm.max().item()
+        else:
+            betas, ses, tstats = run_batch_regression(
+                y=y_t, G=G_t, H=H_t, k_eff=k_eff, device=device
+            )
+            perm_max_r2 = None
+
+        # Variant metadata for this window
+        var_ids = variant_df.index.values[v_idx]
+        var_pos = variant_df.iloc[v_idx]["pos"].values
+
+        # Distances to phenotype start/end
+        start_pos = ig.phenotype_start[pid]
+        end_pos = ig.phenotype_end[pid]
+        start_distance = var_pos - start_pos
+        end_distance = var_pos - end_pos
+
+        # Assemble result rows (genotype effect == column 0)
+        out = {
+            "phenotype_id": pid,
+            "variant_id": var_ids,
+            "pos": var_pos,
+            "start_distance": start_distance,
+            "end_distance": end_distance,
+            "beta": betas[:, 0].detach().cpu().numpy(),
+            "se": ses[:, 0].detach().cpu().numpy(),
+            "tstat": tstats[:, 0].detach().cpu().numpy(),
+            "af": af_t.detach().cpu().numpy(),
+            "ma_samples": ma_samples_t.detach().cpu().numpy(),
+            "ma_count": ma_count_t.detach().cpu().numpy(),
+        }
+        df = pd.DataFrame(out)
+
+        if perm_max_r2 is not None:
+            df["perm_max_r2"] = perm_max_r2 
+
+        results.append(df)
+
+    return pd.concat(results, axis=0).reset_index(drop=True)
+
+
 def map_cis_nominal(
-    genotype_df: pd.DataFrame,      # variants x samples
-    variant_df: pd.DataFrame,       # index=variant_id, columns ['chrom','pos']
-    phenotype_df: pd.DataFrame,     # phenotypes x samples
-    phenotype_pos_df: pd.DataFrame, # index=phenotype_id, columns ['chr','pos'] or ['chr','start','end']
-    covariates_df: Optional[pd.DataFrame] = None,
-    haplotype_reader: Optional[object] = None,  # expects attributes haplotypes, loci_df (RFMixReader)
-    window: int = 1_000_000,
-    nperm: Optional[int] = None,
-    device: str = "cuda",
+        genotype_df: pd.DataFrame, variant_df: pd.DataFrame, phenotype_df: pd.DataFrame,
+        phenotype_pos_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame] = None,
+        haplotype_reader: Optional[object] = None, window: int = 1_000_000,
+        nperm: Optional[int] = None, device: str = "cuda",
 ) -> pd.DataFrame:
     """
     Nominal cis-QTL scan with optional permutations and local ancestry.
@@ -129,86 +209,7 @@ def map_cis_nominal(
     )
     ig.phenotype_df = phenotype_df_resid
     
-    results = []
-    # Iterate phenotypes / groups
-    for batch in ig.generate_data():
-        # Unpack
-        if with_haps:
-            p, G_block, v_idx, H_block, pid = batch  # order as defined in InputGeneratorCisWithHaps._postprocess_batch
-        else:
-            p, G_block, v_idx, pid = batch
-            H_block = None
-
-        # Tensors (samples dimension is the last axis)
-        y_t = torch.tensor(p, dtype=torch.float32, device=device)
-        G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
-        H_t = torch.tensor(H_block, dtype=torch.float32, device=device) if H_block is not None else None
-
-        # Mean-impute and drop monomorphic BEFORE residualization; update indices/H accordingly
-        G_t, keep_mask = _impute_and_filter(G_t)
-        if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
-            continue  # no valid variants
-        if keep_mask.shape[0] != G_t.shape[0]:  # safety
-            keep_mask = torch.ones(G_t.shape[0], dtype=torch.bool, device=device)
-        keep_np = keep_mask.detach().cpu().numpy()
-        v_idx = v_idx[keep_np]
-        if H_t is not None:
-            H_t = H_t[keep_mask]
-
-        # Allele frequency & minor-allele stats from RAW (imputed) G
-        n_samp = y_t.shape[0]
-        sum_g_over_05 = torch.where(G_t > 0.5, G_t, torch.zeros_like(G_t)).sum(dim=1)
-        af_t = (G_t.sum(dim=1) / (2.0 * n_samp))
-        ma_samples_t = torch.where(af_t <= 0.5, (G_t > 0.5).sum(dim=1), (G_t < 1.5).sum(dim=1)).to(torch.int32)
-        ma_count_t = torch.where(af_t <= 0.5, sum_g_over_05, 2 * n_samp - sum_g_over_05)
- 
-        # Residualize this batch (makes y/G/H orthogonal to covariates)
-        y_t, G_t, H_t = _residualize_batch(y_t, G_t, H_t, rez, center=True)
-        
-        # Permuted phenotypes (if requested)
-        if nperm is not None:
-            perms = [torch.randperm(y_t.shape[0], device=device) for _ in range(nperm)]
-            y_perm = torch.stack([y_t[idx] for idx in perms], dim=1)  # (n x nperm)
-            betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
-                y=y_t, G=G_t, H=H_t, y_perm=y_perm, device=device
-            )
-            perm_max_r2 = r2_perm.max().item()
-        else:
-            betas, ses, tstats = run_batch_regression(y=y_t, G=G_t, H=H_t, device=device)
-            perm_max_r2 = None
-
-        # Variant metadata for this window
-        var_ids = variant_df.index.values[v_idx]
-        var_pos = variant_df.iloc[v_idx]["pos"].values
-
-        # Distances to phenotype start/end
-        start_pos = ig.phenotype_start[pid]
-        end_pos = ig.phenotype_end[pid]
-        start_distance = var_pos - start_pos
-        end_distance = var_pos - end_pos
-
-        # Assemble result rows (genotype effect == column 0)
-        out = {
-            "phenotype_id": pid,
-            "variant_id": var_ids,
-            "pos": var_pos,
-            "start_distance": start_distance,
-            "end_distance": end_distance,
-            "beta": betas[:, 0].detach().cpu().numpy(),
-            "se": ses[:, 0].detach().cpu().numpy(),
-            "tstat": tstats[:, 0].detach().cpu().numpy(),
-            "af": af_t.detach().cpu().numpy(),
-            "ma_samples": ma_samples_t.detach().cpu().numpy(),
-            "ma_count": ma_count_t.detach().cpu().numpy(),
-        }
-        df = pd.DataFrame(out)
-
-        if perm_max_r2 is not None:
-            df["perm_max_r2"] = perm_max_r2 
-
-        results.append(df)
-
-    return pd.concat(results, axis=0).reset_index(drop=True)
+    return _run_nominal_core(ig, variant_df, rez, nperm, device)
 
 
 class SimpleCisMapper:
@@ -216,17 +217,13 @@ class SimpleCisMapper:
     Convenience wrapper: build an InputGenerator and run nominal scans.
     """
     def __init__(
-        self,
-        genotype_df: pd.DataFrame,
-        variant_df: pd.DataFrame,
-        phenotype_df: pd.DataFrame,
-        phenotype_pos_df: pd.DataFrame,
-        covariates_df: Optional[pd.DataFrame] = None,
-        haplotypes: Optional[object] = None,  # array-like (variants x samples x ancestries) or None
-        loci_df: Optional[pd.DataFrame] = None,
-        device: str = "auto",
-        window: int = 1_000_000,
-        rez: Optional[Residualizer],
+            self, genotype_df: pd.DataFrame, variant_df: pd.DataFrame,
+            phenotype_df: pd.DataFrame, phenotype_pos_df: pd.DataFrame,
+            covariates_df: Optional[pd.DataFrame] = None,
+            haplotypes: Optional[object] = None,
+            loci_df: Optional[pd.DataFrame] = None,
+            device: str = "auto", window: int = 1_000_000,
+            rez: Optional[Residualizer],
     ):
         self.device = ("cuda" if (device == "auto" and torch.cuda.is_available()) else
                        device if device in ("cuda", "cpu") else "cpu")
@@ -264,85 +261,7 @@ class SimpleCisMapper:
         )
 
     def map_nominal(self, nperm: Optional[int] = None) -> pd.DataFrame:
-        # Delegate to the functional API for consistency
-        # (We reuse the already-built ig by pulling its data and the stored residualizer.)
-        def _impute_and_filter(G_t: torch.Tensor):
-            miss = (~torch.isfinite(G_t)) | (G_t == -9)
-            if miss.any():
-                num = torch.where(miss, torch.zeros_like(G_t), G_t).sum(dim=1, keepdim=True)
-                den = (~miss).sum(dim=1, keepdim=True).clamp_min(1)
-                row_mean = num / den
-                G_t = torch.where(miss, row_mean, G_t)
-            keep = G_t.var(dim=1, unbiased=False) > 0
-            return G_t, keep
-    
-        results = []
-        for batch in self.ig.generate_data():
-            if self.with_haps:
-                p, G_block, v_idx, H_block, pid = batch
-            else:
-                p, G_block, v_idx, pid = batch
-                H_block = None
-
-            y_t = torch.tensor(p, dtype=torch.float32, device=self.device)
-            G_t = torch.tensor(G_block, dtype=torch.float32, device=self.device)
-            H_t = torch.tensor(H_block, dtype=torch.float32, device=self.device) if H_block is not None else None
-
-            # Impute + drop monomorphic, update indices/H
-            G_t, keep_mask = _impute_and_filter(G_t)
-            if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
-                continue
-            keep_np = keep_mask.detach().cpu().numpy()
-            v_idx = v_idx[keep_np]
-            if H_t is not None:
-                H_t = H_t[keep_mask]
-
-            # AF/MA from raw (imputed) G
-            n_samp = y_t.shape[0]
-            sum_g_over_05 = torch.where(G_t > 0.5, G_t, torch.zeros_like(G_t)).sum(dim=1)
-            af_t = (G_t.sum(dim=1) / (2.0 * n_samp))
-            ma_samples_t = torch.where(af_t <= 0.5, (G_t > 0.5).sum(dim=1), (G_t < 1.5).sum(dim=1)).to(torch.int32)
-            ma_count_t = torch.where(af_t <= 0.5, sum_g_over_05, 2 * n_samp - sum_g_over_05)
- 
-            y_t, G_t, H_t = _residualize_batch(y_t, G_t, H_t, self.rez, center=True)
-
-            if nperm is not None:
-                perms = [torch.randperm(y_t.shape[0], device=self.device) for _ in range(nperm)]
-                y_perm = torch.stack([y_t[idx] for idx in perms], dim=1)
-                betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
-                    y=y_t, G=G_t, H=H_t, y_perm=y_perm, device=self.device
-                )
-                perm_max_r2 = r2_perm.max().item()
-            else:
-                betas, ses, tstats = run_batch_regression(y=y_t, G=G_t, H=H_t, device=self.device)
-                perm_max_r2 = None
-
-            var_ids = self.variant_df.index.values[v_idx]
-            var_pos = self.variant_df.iloc[v_idx]["pos"].values
-            start_pos = self.ig.phenotype_start[pid]
-            end_pos = self.ig.phenotype_end[pid]
-            start_distance = var_pos - start_pos
-            end_distance = var_pos - end_pos
-
-            df = pd.DataFrame({
-                "phenotype_id": pid,
-                "variant_id": var_ids,
-                "pos": var_pos,
-                "start_distance": start_distance,
-                "end_distance": end_distance,
-                "beta": betas[:, 0].detach().cpu().numpy(),
-                "se": ses[:, 0].detach().cpu().numpy(),
-                "tstat": tstats[:, 0].detach().cpu().numpy(),
-                "af": af_t.detach().cpu().numpy(),
-                "ma_samples": ma_samples_t.detach().cpu().numpy(),
-                "ma_count": ma_count_t.detach().cpu().numpy(),
-            })
-            if perm_max_r2 is not None:
-                df["perm_max_r2"] = perm_max_r2
-
-            results.append(df)
-
-        return pd.concat(results, axis=0).reset_index(drop=True)
+        return _run_nominal_core(self.ig, self.variant_df, self.rez, nperm, self.device)
 
     def map_permutations(self, nperm=1000, window=1_000_000):
         """Permutation-based empirical cis-QTLs"""
@@ -353,7 +272,7 @@ class SimpleCisMapper:
         """Forward–backward conditional mapping"""
         pass
 
-    # --- helper functions ---
+    # Helper functions
     def _residualize(self, Y, C):
         C_t = torch.tensor(C, dtype=torch.float32, device=self.device)
         Y_t = torch.tensor(Y, dtype=torch.float32, device=self.device)
