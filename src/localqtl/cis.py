@@ -223,7 +223,7 @@ class SimpleCisMapper:
             haplotypes: Optional[object] = None,
             loci_df: Optional[pd.DataFrame] = None,
             device: str = "auto", window: int = 1_000_000,
-            rez: Optional[Residualizer],
+            rez: Optional[Residualizer] = None,
     ):
         self.device = ("cuda" if (device == "auto" and torch.cuda.is_available()) else
                        device if device in ("cuda", "cpu") else "cpu")
