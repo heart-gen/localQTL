@@ -219,32 +219,51 @@ class SimpleCisMapper:
             columns=self.ig.phenotype_df.columns,
         )
 
-    def map_nominal(self, window=1_000_000):
-        """Nominal cis-QTL scan"""
+    def map_nominal(self, nperm: Optional[int] = None) -> pd.DataFrame:
+        # Delegate to the functional API for consistency
+        # (We reuse the already-built ig by pulling its data and the stored residualizer.)
         results = []
-        for pheno_id, pheno_vec, geno_block, var_df in self.geno_reader.generate_data(window=window):
-            pheno_t = torch.tensor(pheno_vec, dtype=torch.float32, device=self.device)
-            geno_t = torch.tensor(geno_block, dtype=torch.float32, device=self.device)
-            impute_mean(geno_t)
-
-            if self.H is not None:
-                hap_t = torch.tensor(self.H[var_df.index.values], device=self.device)
-                # concatenate genotype+haplotype as predictors
-                X = torch.cat([geno_t.unsqueeze(1), hap_t], dim=1)
+        for batch in self.ig.generate_data():
+            if self.with_haps:
+                p, G_block, v_idx, H_block, pid = batch
             else:
-                X = geno_t.unsqueeze(1)
+                p, G_block, v_idx, pid = batch
+                H_block = None
 
-            # fast correlation method
-            tstat, slope, se = self._regress(X, pheno_t)
+            y_t = torch.tensor(p, dtype=torch.float32, device=self.device)
+            G_t = torch.tensor(G_block, dtype=torch.float32, device=self.device)
+            H_t = torch.tensor(H_block, dtype=torch.float32, device=self.device) if H_block is not None else None
+
+            y_t, G_t, H_t = _residualize_batch(y_t, G_t, H_t, self.rez, center=True)
+
+            if nperm is not None:
+                perms = [torch.randperm(y_t.shape[0], device=self.device) for _ in range(nperm)]
+                y_perm = torch.stack([y_t[idx] for idx in perms], dim=1)
+                betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
+                    y=y_t, G=G_t, H=H_t, y_perm=y_perm, device=self.device
+                )
+                perm_max_r2 = r2_perm.max().item()
+            else:
+                betas, ses, tstats = run_batch_regression(y=y_t, G=G_t, H=H_t, device=self.device)
+                perm_max_r2 = None
+
+            var_ids = self.variant_df.index.values[v_idx]
+            var_pos = self.variant_df.iloc[v_idx]["pos"].values
+
             df = pd.DataFrame({
-                "variant_id": var_df.index,
-                "phenotype_id": pheno_id,
-                "tstat": tstat.cpu().numpy(),
-                "slope": slope.cpu().numpy(),
-                "slope_se": se.cpu().numpy(),
+                "phenotype_id": pid,
+                "variant_id": var_ids,
+                "pos": var_pos,
+                "beta": betas[:, 0].detach().cpu().numpy(),
+                "se": ses[:, 0].detach().cpu().numpy(),
+                "tstat": tstats[:, 0].detach().cpu().numpy(),
             })
+            if perm_max_r2 is not None:
+                df["perm_max_r2"] = perm_max_r2
+
             results.append(df)
-        return pd.concat(results)
+
+        return pd.concat(results, axis=0).reset_index(drop=True)
 
     def map_permutations(self, nperm=1000, window=1_000_000):
         """Permutation-based empirical cis-QTLs"""
