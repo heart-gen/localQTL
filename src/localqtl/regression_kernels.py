@@ -55,7 +55,7 @@ class Residualizer(object):
         return max_corr
 
 
-def run_batch_regression(y, G, H=None, device="cuda"):
+def run_batch_regression(y, G, H=None, k_eff: int = 0, device="cuda"):
     """
     Batched OLS regression for one phenotype and all variants in a cis-window.
 
@@ -67,6 +67,8 @@ def run_batch_regression(y, G, H=None, device="cuda"):
         (m × n) genotype matrix (variants × samples)
     H : torch.Tensor, optional
         (m × n × (k-1)) haplotype ancestry matrix (variants × samples × ancestries-1)
+    k_eff : int, optional
+        Number of covariate columns projected out beforehand (effective dof reduction).
     device : str
         "cuda" or "cpu"
 
@@ -109,7 +111,7 @@ def run_batch_regression(y, G, H=None, device="cuda"):
     # Residuals and variance estimate
     y_hat = torch.matmul(X, betas.unsqueeze(-1))      # (m × n × 1)
     resid = y_exp - y_hat                             # (m × n × 1)
-    dof = n - p
+    dof = n - int(k_eff) - p
     sigma2 = (resid.transpose(1,2) @ resid).squeeze() / dof  # (m,)
 
     # Standard errors: sqrt(diag(XtX^-1) * sigma2)
@@ -123,7 +125,7 @@ def run_batch_regression(y, G, H=None, device="cuda"):
     return betas, ses, tstats
 
 
-def run_batch_regression_with_permutations(y, G, H=None, y_perm=None, device="cuda"):
+def run_batch_regression_with_permutations(y, G, H=None, y_perm=None, k_eff: int = 0, device="cuda"):
     """
     Batched OLS regression for one phenotype across all variants in a cis-window,
     with optional haplotype ancestry and phenotype permutations.
@@ -138,6 +140,8 @@ def run_batch_regression_with_permutations(y, G, H=None, y_perm=None, device="cu
         (m × n × (k-1)) haplotype ancestry matrix (variants × samples × ancestries-1)
     y_perm : torch.Tensor, optional
         (n × nperm) permuted phenotype matrix
+    k_eff : int, optional
+        Number of covariate columns projected out beforehand (effective dof reduction).
     device : str
         "cuda" or "cpu"
 
@@ -181,7 +185,7 @@ def run_batch_regression_with_permutations(y, G, H=None, y_perm=None, device="cu
     # Residuals and variance
     y_hat = torch.matmul(X, betas.unsqueeze(-1))      # (m × n × 1)
     resid = y_exp - y_hat
-    dof = n - p
+    dof = n - int(k_eff) - p
     sigma2 = (resid.transpose(1,2) @ resid).squeeze() / dof  # (m,)
 
     # SEs and t-stats
