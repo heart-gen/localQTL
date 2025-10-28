@@ -226,7 +226,12 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
             return p, G, v_idx, H, pid
         elif len(batch) == 5:
             p, G, v_idx, ids, group_id = batch
-            H_slice = self.haplotypes[v_idx, :, :]
+            if self._geno2hap is None:
+                H_slice = self.haplotypes[v_idx, :, :]
+            else:
+                hap_idx = self._geno2hap[v_idx]
+                H_slice = self.haplotypes[hap_idx, :, :]
+  
             if self.on_the_fly_impute:
                 H_block = H_slice.compute() if hasattr(H_slice, "compute") else np.asarray(H_slice)
                 H = self._interpolate_block(H_block)
