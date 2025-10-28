@@ -69,11 +69,34 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
     out_rows = []
     # Iterate phenotypes / (optional) groups
     for batch in ig.generate_data():
-        if len(batch) == 5 and not isinstance(batch[3], (list, tuple)):
-            p, G_block, v_idx, H_block, pid = batch
-        elif len(batch) == 4:
+        if len(batch) == 4:
             p, G_block, v_idx, pid = batch
             H_block = None
+            P_list = [p]
+            id_list = [pid]
+        elif len(batch) == 5:
+            a3 = batch[3]
+            if isinstance(a3, (np.ndarray, torch.Tensor)) and a3.ndim >= 2:
+                p, G_block, v_idx, H_block, pid = batch
+                P_list = [p]
+                id_list = [pid]
+            else:
+                P, G_block, v_idx, ids, _group_id = batch
+                H_block = None
+                if isinstance(P, (list, tuple)):
+                    P_list = list(P)
+                else:
+                    P = np.asarray(P)
+                    P_list = [P[i, :] for i in range(P.shape[0])] if P.ndim == 2 else [P]
+                id_list = list(ids)
+        elif len(batch) == 6:
+            P, G_block, v_idx, H_block, ids, _group_id = batch
+            if isinstance(P, (list, tuple)):
+                P_list = list(P)
+            else:
+                P = np.asarray(P)
+                P_list = [P[i, :] for i in range(P.shape[0])] if P.ndim == 2 else [P]
+            id_list = list(ids)
         else:
             raise ValueError(f"Unexpected batch shape from generator: len={len(batch)}")
 
@@ -283,6 +306,7 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
 def map_nominal(
         genotype_df: pd.DataFrame, variant_df: pd.DataFrame, phenotype_df: pd.DataFrame,
         phenotype_pos_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame] = None,
+        group_s: Optional[pd.Series] = None,
         haplotypes: Optional[object] = None, loci_df: Optional[pd.DataFrame] = None,
         maf_threshold: float = 0.0, window: int = 1_000_000,
         nperm: Optional[int] = None, device: str = "cuda",
@@ -300,12 +324,12 @@ def map_nominal(
         ig = InputGeneratorCisWithHaps(
             genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
             phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes,
-            loci_df=loci_df,
+            loci_df=loci_df, group_s=group_s,
         )
     else:
         ig = InputGeneratorCis(
             genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
-            phenotype_pos_df=phenotype_pos_df, window=window,
+            phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s
         )
 
     # Residualize all phenotypes once (features x samples)
@@ -368,6 +392,7 @@ class CisMapper:
             self, genotype_df: pd.DataFrame, variant_df: pd.DataFrame,
             phenotype_df: pd.DataFrame, phenotype_pos_df: pd.DataFrame,
             covariates_df: Optional[pd.DataFrame] = None,
+            group_s: Optional[pd.Series] = None,
             haplotypes: Optional[object] = None,
             loci_df: Optional[pd.DataFrame] = None,
             device: str = "auto", window: int = 1_000_000,
@@ -388,6 +413,7 @@ class CisMapper:
                 window=window,
                 haplotypes=haplotypes,
                 loci_df=loci_df,
+                group_s=group_s,
             )
             self.with_haps = True
         else:
@@ -397,6 +423,7 @@ class CisMapper:
                 phenotype_df=phenotype_df,
                 phenotype_pos_df=phenotype_pos_df,
                 window=window,
+                group_s=group_s,
             )
             self.with_haps = False
 
