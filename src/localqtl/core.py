@@ -1,13 +1,8 @@
 ## Adapted from tensorqtl: https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/core.py
+import sys
 import torch
 import numpy as np
-import pandas as pd
 import scipy.stats as stats
-import scipy.optimize
-from scipy.special import loggamma
-import sys
-import re
-import subprocess
 
 class SimpleLogger(object):
     def __init__(self, logfile=None, verbose=True):
@@ -96,10 +91,11 @@ def get_t_pval(t, df, log=False):
     Get p-value corresponding to t statistic and degrees of freedom (df). t and/or df can be arrays.
     If log=True, returns -log10(P).
     """
-    if not log:
-        return 2 * stats.t.cdf(-abs(t), df)
+    # Compute the two-tailed p-value
+    p = 2 * stats.t.cdf(-abs(t), df)
+    
+    if log:
+        p = np.maximum(p, np.finfo(float).tiny)
+        return -np.log10(p)
     else:
-        if has_rpy2:
-            return -(rfunc.t_cdf(-abs(t), df, lower_tail=True, log=True) + log(2)) * np.log10(np.e)
-        else:
-            raise ValueError("R and rpy2 are required to compute -log10(P)")
+        return p
