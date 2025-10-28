@@ -16,6 +16,8 @@ class Residualizer(object):
         """
         Residualize one or more matrices in a single GPU pass.
         """
+        dev = self.Q_t.device
+        matrices = tuple(M.to(dev) for M in matrices)
         if len(matrices) == 1:
             M_t = matrices[0]
             if center:

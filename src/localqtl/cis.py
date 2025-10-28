@@ -37,45 +37,49 @@ def _residualize_batch(
     - If group=False: y is a single vector (n,), returns (y_resid 1D, G_resid, H_resid).
     - If group=True:  y is a stack (k x n) or list of length k, returns (list_of_k 1D tensors, G_resid, H_resid).
     """
+    dev = (rez.Q_t.device if (rez is not None and hasattr(rez, "Q_t")) else G.device)
+    G = G.to(dev)
+    if H is not None:
+        H = H.to(dev)
+
     if rez is None:
         # Pass-through; normalize return type for group mode
         if group:
             if isinstance(y, (list, tuple)):
-                y_list = [torch.as_tensor(yi) if not torch.is_tensor(yi) else yi for yi in y]
+                y_list = [torch.as_tensor(yi) if not torch.is_tensor(yi) else yi
+                          for yi in y]
             else:
                 Y = y if torch.is_tensor(y) else torch.as_tensor(y)
-                if Y.ndim == 1:
-                    y_list = [Y]
-                else:
-                    y_list = [Y[i, :] for i in range(Y.shape[0])]
+                y_list = [Y] if Y.ndim == 1 else [Y[i, :] for i in range(Y.shape[0])]
             return y_list, G, H
-        return y, G, H
+        return (y if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32)), G, H
 
-    # Ensure tensors with feature x sample layout for transform
+    # Build Y on the same device as G/rez
+    if group:
+        if isinstance(y, (list, tuple)):
+            Y = torch.stack([yi if torch.is_tensor(yi) else torch.as_tensor(yi, dtype=torch.float32, device=dev)
+                             for yi in y], dim=0).to(dev)
+        else:
+            Y = (y if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32, device=dev))
+            if Y.ndim == 1:
+                Y = Y.unsqueeze(0)
+            Y = Y.to(dev)
+    else:
+        Y = (y if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32, device=dev))
+        if Y.ndim == 1:
+            Y = Y.unsqueeze(0)
+        Y = Y.to(dev)
+    
+    # Prepare matrices for one-pass residualization
     mats: List[torch.Tensor] = [G]
     H_shape = None
     if H is not None:
         m, n, pH = H.shape
         H_shape = (m, n, pH)
-        H_flat = H.reshape(m * pH, n)
-        mats.append(H_flat)
+        mats.append(H.reshape(m * pH, n))
 
-    # Prepare Y (k x n) matrix
-    if group:
-        if isinstance(y, (list, tuple)):
-            Y = torch.stack([yi if torch.is_tensor(yi) else torch.as_tensor(yi)
-                             for yi in y], dim=0)
-        else:
-            Y = y if torch.is_tensor(y) else torch.as_tensor(y)
-            if Y.ndim == 1:
-                Y = Y.unsqueeze(0)
-    else:
-        Y = y if torch.is_tensor(y) else torch.as_tensor(y)
-        if Y.ndim == 1:
-            Y = Y.unsqueeze(0)
-
-    # Apply once across all blocks
     mats_resid = rez.transform(*mats, Y, center=center)
+
     G_resid = mats_resid[0]
     idx, H_resid = 1, None
     if H is not None:
