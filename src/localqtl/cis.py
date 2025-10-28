@@ -60,7 +60,7 @@ def _residualize_batch(
     return y_resid, G_resid, H_resid
 
 
-def _run_nominal_core(ig, variant_df, rez, nperm, device):
+def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float = 0.0):
     """
     Shared inner loop for nominal (and optional permutation) mapping.
     Handles both InputGeneratorCis (no haps) and InputGeneratorCisWithHaps (haps).
@@ -84,18 +84,25 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device):
         if H_t is not None:
             H_t = H_t[:, :, :-1]  # drop last ancestry to avoid collinearity
 
-        # Mean-impute and drop monomorphic BEFORE residualization; update indices/H accordingly
+        # Impute and drop monomorphic
         G_t, keep_mask, _ = impute_mean_and_filter(G_t)
         if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
-            continue  # no valid variants
-        if keep_mask.shape[0] != G_t.shape[0]:  # safety
-            keep_mask = torch.ones(G_t.shape[0], dtype=torch.bool, device=device)
-        keep_np = keep_mask.detach().cpu().numpy()
-        v_idx = v_idx[keep_np]
+            continue
+
+        # Optional MAF filter
+        if maf_threshold and maf_threshold > 0:
+            keep_maf, _ = filter_by_maf(G_t, maf_threshold, ploidy=2)
+            keep_mask = keep_mask & keep_maf
+            if keep_mask.sum().item() == 0:
+                continue
+
+        # Mask G, H, and indices consistently
+        G_t = G_t[keep_mask]
+        v_idx = v_idx[keep_mask.detach().cpu().numpy()]
         if H_t is not None:
             H_t = H_t[keep_mask]
 
-        # Allele frequency & minor-allele stats from RAW (imputed) G
+        # Allele statistics on imputed genotypes
         af_t, ma_samples_t, ma_count_t = allele_stats(G_t, ploidy=2)
  
         # Residualize this batch (makes y/G/H orthogonal to covariates)
@@ -150,7 +157,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device):
 
 
 def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
-                          beta_approx: bool = True) -> pd.DataFrame:
+                          beta_approx: bool = True, maf_threshold: float = 0.0) -> pd.DataFrame:
     """
     One top association per phenotype with empirical permutation p-value.
     Compatible with InputGeneratorCis and InputGeneratorCisWithHaps.
@@ -176,12 +183,21 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
         G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
         H_t = torch.tensor(H_block, dtype=torch.float32, device=device) if H_block is not None else None
 
-        # Impute/filter
+        # Impute and drop monomorphic
         G_t, keep_mask, _ = impute_mean_and_filter(G_t)
         if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
             continue
-        keep_np = keep_mask.detach().cpu().numpy()
-        v_idx = v_idx[keep_np]
+
+        # Optional MAF filter
+        if maf_threshold and maf_threshold > 0:
+            keep_maf, _ = filter_by_maf(G_t, maf_threshold, ploidy=2)
+            keep_mask = keep_mask & keep_maf
+            if keep_mask.sum().item() == 0:
+                continue
+
+        # Mask G, H, and indices consistently
+        G_t = G_t[keep_mask]
+        v_idx = v_idx[keep_mask.detach().cpu().numpy()]
         if H_t is not None:
             H_t = H_t[keep_mask]
 
@@ -263,45 +279,12 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
     return pd.DataFrame(out_rows).reset_index(drop=True)
 
 
-def map_permutations(
-        genotype_df: pd.DataFrame, variant_df: pd.DataFrame, phenotype_df: pd.DataFrame,
-        phenotype_pos_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame] = None,
-        haplotypes: Optional[object] = None, loci_df: Optional[pd.DataFrame] = None,
-        window: int = 1_000_000, nperm: int = 10_000, device: str = "cuda",
-        beta_approx: bool = True) -> pd.DataFrame:
-    """
-    Empirical cis-QTL mapping (one top variant per phenotype) with permutations.
-    Returns a DataFrame with empirical p-values (and optional Beta approximation).
-    """
-    device = device if device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Build the appropriate input generator
-    if haplotypes is not None:
-        ig = InputGeneratorCisWithHaps(
-            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
-            phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes, loci_df=loci_df,
-        )
-    else:
-        ig = InputGeneratorCis(
-            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
-            phenotype_pos_df=phenotype_pos_df, window=window,
-        )
-
-    # Residualize phenotypes once
-    Y = torch.tensor(ig.phenotype_df.values, dtype=torch.float32, device=device)
-    Y_resid, rez = _residualize_matrix_with_covariates(Y, covariates_df, device)
-    ig.phenotype_df = pd.DataFrame(Y_resid.cpu().numpy(), index=ig.phenotype_df.index,
-                                   columns=ig.phenotype_df.columns)
-
-    return _run_permutation_core(ig, variant_df, rez, nperm=nperm,
-                                 device=device, beta_approx=beta_approx)
-
-
 def map_nominal(
         genotype_df: pd.DataFrame, variant_df: pd.DataFrame, phenotype_df: pd.DataFrame,
         phenotype_pos_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame] = None,
         haplotypes: Optional[object] = None, loci_df: Optional[pd.DataFrame] = None,
-        window: int = 1_000_000, nperm: Optional[int] = None, device: str = "cuda",
+        maf_threshold: float = 0.0, window: int = 1_000_000,
+        nperm: Optional[int] = None, device: str = "cuda",
 ) -> pd.DataFrame:
     """
     Nominal cis-QTL scan with optional permutations and local ancestry.
@@ -336,7 +319,44 @@ def map_nominal(
     )
     ig.phenotype_df = phenotype_df_resid
     
-    return _run_nominal_core(ig, variant_df, rez, nperm, device)
+    return _run_nominal_core(ig, variant_df, rez, nperm, device,
+                             maf_threshold=maf_threshold)
+
+
+def map_permutations(
+        genotype_df: pd.DataFrame, variant_df: pd.DataFrame, phenotype_df: pd.DataFrame,
+        phenotype_pos_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame] = None,
+        haplotypes: Optional[object] = None, loci_df: Optional[pd.DataFrame] = None,
+        maf_threshold: float = 0.0, window: int = 1_000_000, nperm: int = 10_000,
+        device: str = "cuda", beta_approx: bool = True
+) -> pd.DataFrame:
+    """
+    Empirical cis-QTL mapping (one top variant per phenotype) with permutations.
+    Returns a DataFrame with empirical p-values (and optional Beta approximation).
+    """
+    device = device if device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Build the appropriate input generator
+    if haplotypes is not None:
+        ig = InputGeneratorCisWithHaps(
+            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+            phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes, loci_df=loci_df,
+        )
+    else:
+        ig = InputGeneratorCis(
+            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+            phenotype_pos_df=phenotype_pos_df, window=window,
+        )
+
+    # Residualize phenotypes once
+    Y = torch.tensor(ig.phenotype_df.values, dtype=torch.float32, device=device)
+    Y_resid, rez = _residualize_matrix_with_covariates(Y, covariates_df, device)
+    ig.phenotype_df = pd.DataFrame(Y_resid.cpu().numpy(), index=ig.phenotype_df.index,
+                                   columns=ig.phenotype_df.columns)
+
+    return _run_permutation_core(ig, variant_df, rez, nperm=nperm,
+                                 device=device, beta_approx=beta_approx,
+                                 maf_threshold=maf_threshold)
 
 
 class CisMapper:
@@ -350,11 +370,13 @@ class CisMapper:
             haplotypes: Optional[object] = None,
             loci_df: Optional[pd.DataFrame] = None,
             device: str = "auto", window: int = 1_000_000,
+            maf_threshold: float = 0.0,
     ):
         self.device = ("cuda" if (device == "auto" and torch.cuda.is_available()) else
                        device if device in ("cuda", "cpu") else "cpu")
         self.variant_df = variant_df
         self.window = window
+        self.maf_threshold = maf_threshold
 
         if haplotypes is not None:
             self.ig = InputGeneratorCisWithHaps(
@@ -386,14 +408,18 @@ class CisMapper:
             columns=self.ig.phenotype_df.columns,
         )
 
-    def map_nominal(self, nperm: Optional[int] = None) -> pd.DataFrame:
-        return _run_nominal_core(self.ig, self.variant_df, self.rez, nperm, self.device)
+    def map_nominal(self, nperm: int | None = None, maf_threshold: float | None = None) -> pd.DataFrame:
+        mt = self.maf_threshold if maf_threshold is None else maf_threshold
+        return _run_nominal_core(self.ig, self.variant_df, self.rez, nperm,
+                                 self.device, maf_threshold=mt)
 
-    def map_permutations(self, nperm: int=10_000, beta_approx: bool=True) -> pd.DataFrame:
+    def map_permutations(self, nperm: int=10_000, beta_approx: bool=True,
+                         maf_threshold: float | None = None) -> pd.DataFrame:
         """Empirical cis-QTLs (top per phenotype) with permutation p-values."""
+        mt = self.maf_threshold if maf_threshold is None else maf_threshold
         return _run_permutation_core(
             self.ig, self.variant_df, self.rez, nperm=nperm, device=self.device,
-            beta_approx=beta_approx
+            beta_approx=beta_approx, maf_threshold=mt
         )
 
     def map_independent(self, cis_df, fdr=0.05):
