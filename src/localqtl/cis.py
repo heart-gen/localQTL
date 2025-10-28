@@ -28,37 +28,64 @@ def _residualize_matrix_with_covariates(
 
 
 def _residualize_batch(
-        y: torch.Tensor, G: torch.Tensor, H: Optional[torch.Tensor],
-        rez: Optional[Residualizer], center: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        y, G: torch.Tensor, H: Optional[torch.Tensor],
+        rez: Optional[Residualizer], center: bool = True, group: bool = False,
+) -> Tuple[object, torch.Tensor, Optional[torch.Tensor]]:
     """
-    Residualize y (1D), G (2D), and optional H (3D) with the same Residualizer.
+    Residualize y, G, and optional H with the same Residualizer.
+    - If group=False: y is a single vector (n,), returns (y_resid 1D, G_resid, H_resid).
+    - If group=True:  y is a stack (k x n) or list of length k, returns (list_of_k 1D tensors, G_resid, H_resid).
     """
     if rez is None:
+        # Pass-through; normalize return type for group mode
+        if group:
+            if isinstance(y, (list, tuple)):
+                y_list = [torch.as_tensor(yi) if not torch.is_tensor(yi) else yi for yi in y]
+            else:
+                Y = y if torch.is_tensor(y) else torch.as_tensor(y)
+                if Y.ndim == 1:
+                    y_list = [Y]
+                else:
+                    y_list = [Y[i, :] for i in range(Y.shape[0])]
+            return y_list, G, H
         return y, G, H
 
-    # Prepare matrices as (features x samples)
-    mats: List[torch.Tensor] = [G]  # (m x n)
+    # Ensure tensors with feature x sample layout for transform
+    mats: List[torch.Tensor] = [G]
     H_shape = None
     if H is not None:
         m, n, pH = H.shape
         H_shape = (m, n, pH)
-        H_flat = H.reshape(m * pH, n)  # (m*pH x n)
+        H_flat = H.reshape(m * pH, n)
         mats.append(H_flat)
 
-    # Apply once
-    mats_resid = rez.transform(*mats, center=center)
+    # Prepare Y (k x n) matrix
+    if group:
+        if isinstance(y, (list, tuple)):
+            Y = torch.stack([yi if torch.is_tensor(yi) else torch.as_tensor(yi)
+                             for yi in y], dim=0)
+        else:
+            Y = y if torch.is_tensor(y) else torch.as_tensor(y)
+            if Y.ndim == 1:
+                Y = Y.unsqueeze(0)
+    else:
+        Y = y if torch.is_tensor(y) else torch.as_tensor(y)
+        if Y.ndim == 1:
+            Y = Y.unsqueeze(0)
 
+    # Apply once across all blocks
+    mats_resid = rez.transform(*mats, Y, center=center)
     G_resid = mats_resid[0]
-    H_resid = None
+    idx, H_resid = 1, None
     if H is not None:
-        H_resid = mats_resid[1].reshape(H_shape)
+        H_resid = mats_resid[idx].reshape(H_shape)
+        idx += 1
+    Y_resid = mats_resid[idx]
 
-    # y is (n,), make it (1 x n) for transform
-    (y_resid_mat,) = rez.transform(y.unsqueeze(0), center=center)
-    y_resid = y_resid_mat.squeeze(0)
-
-    return y_resid, G_resid, H_resid
+    if group:
+        return [Y_resid[i, :] for i in range(Y_resid.shape[0])], G_resid, H_resid
+    else:
+        return Y_resid.squeeze(0), G_resid, H_resid
 
 
 def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float = 0.0):
@@ -67,46 +94,36 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
     Handles both InputGeneratorCis (no haps) and InputGeneratorCisWithHaps (haps).
     """
     out_rows = []
-    # Iterate phenotypes / (optional) groups
+    group_mode = getattr(ig, "group_s", None) is not None
     for batch in ig.generate_data():
-        if len(batch) == 4:
-            p, G_block, v_idx, pid = batch
-            H_block = None
-            P_list = [p]
-            id_list = [pid]
-        elif len(batch) == 5:
-            a3 = batch[3]
-            if isinstance(a3, (np.ndarray, torch.Tensor)) and a3.ndim >= 2:
+        if not group_mode:
+            if len(batch) == 4:
+                p, G_block, v_idx, pid = batch
+                H_block = None
+                P_list, id_list = [p], [pid]
+            elif len(batch) == 5:
                 p, G_block, v_idx, H_block, pid = batch
-                P_list = [p]
-                id_list = [pid]
+                P_list, id_list = [p], [pid]
             else:
+                raise ValueError(f"Unexpected ungrouped batch shape: len={len(batch)}")
+        else: # grouped
+            if len(batch) == 5:
                 P, G_block, v_idx, ids, _group_id = batch
                 H_block = None
-                if isinstance(P, (list, tuple)):
-                    P_list = list(P)
-                else:
-                    P = np.asarray(P)
-                    P_list = [P[i, :] for i in range(P.shape[0])] if P.ndim == 2 else [P]
-                id_list = list(ids)
-        elif len(batch) == 6:
-            P, G_block, v_idx, H_block, ids, _group_id = batch
+            elif len(batch) == 6:
+                P, G_block, v_idx, H_block, ids, _group_id = batch
+            else:
+                raise ValueError(f"Unexpected grouped batch shape: len={len(batch)}")
             if isinstance(P, (list, tuple)):
                 P_list = list(P)
             else:
                 P = np.asarray(P)
                 P_list = [P[i, :] for i in range(P.shape[0])] if P.ndim == 2 else [P]
             id_list = list(ids)
-        else:
-            raise ValueError(f"Unexpected batch shape from generator: len={len(batch)}")
 
         # Tensors
-        y_t = torch.tensor(p, dtype=torch.float32, device=device)
         G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
         H_t = torch.tensor(H_block, dtype=torch.float32, device=device) if H_block is not None else None
-
-        if H_t is not None:
-            H_t = H_t[:, :, :-1]  # drop last ancestry to avoid collinearity
 
         # Impute and drop monomorphic
         G_t, keep_mask, _ = impute_mean_and_filter(G_t)
@@ -125,57 +142,68 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
         v_idx = v_idx[keep_mask.detach().cpu().numpy()]
         if H_t is not None:
             H_t = H_t[keep_mask]
+            # Drop one ancestry channel (K -> K-1) to avoid rank deficiency
+            if H_t.shape[2] > 1:
+                H_t = H_t[:, :, :-1] 
 
         # Allele statistics on imputed genotypes
         af_t, ma_samples_t, ma_count_t = allele_stats(G_t, ploidy=2)
  
-        # Residualize this batch (makes y/G/H orthogonal to covariates)
-        y_t, G_t, H_t = _residualize_batch(y_t, G_t, H_t, rez, center=True)
-
-        k_eff = rez.Q_t.shape[1] if rez is not None else 0        
-        # Permuted phenotypes (if requested)
-        if nperm is not None:
-            perms = [torch.randperm(y_t.shape[0], device=device) for _ in range(nperm)]
-            y_perm = torch.stack([y_t[idx] for idx in perms], dim=1)  # (n x nperm)
-            betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
-                y=y_t, G=G_t, H=H_t, y_perm=y_perm, k_eff=k_eff, device=device
-            )
-            perm_max_r2 = r2_perm.max().item()
+        # Residualize in one call; returns y as list in group mode
+        y_resid, G_resid, H_resid = _residualize_batch(
+            P_list if group_mode else P_list[0], G_t, H_t, rez, center=True,
+            group=group_mode
+        )
+        if not group_mode:
+            y_iter = [(y_resid, id_list[0])]
         else:
-            betas, ses, tstats = run_batch_regression(
-                y=y_t, G=G_t, H=H_t, k_eff=k_eff, device=device
-            )
-            r2_perm = perm_max_r2 = None
+            y_iter = list(zip(y_resid, id_list))
 
         # Variant metadata for this window
         var_ids = variant_df.index.values[v_idx]
         var_pos = variant_df.iloc[v_idx]["pos"].values
+        k_eff = rez.Q_t.shape[1] if rez is not None else 0
 
-        # Distances to phenotype start/end
-        start_pos = ig.phenotype_start[pid]
-        end_pos = ig.phenotype_end[pid]
-        start_distance = var_pos - start_pos
-        end_distance = var_pos - end_pos
+        # Per-phenotype regressions in this window
+        for y_t, pid in y_iter:
+            if nperm is not None:
+                perms = [torch.randperm(y_t.shape[0], device=device) for _ in range(nperm)]
+                y_perm = torch.stack([y_t[idx] for idx in perms], dim=1) # (n x nperm)
+                betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
+                    y=y_t, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
+                )
+                perm_max_r2 = r2_perm.max().item()
+            else:
+                betas, ses, tstats = run_batch_regression(
+                    y=y_t, G=G_resid, H=H_resid, k_eff=k_eff, device=device
+                )
+                r2_perm = perm_max_r2 = None
 
-        # Assemble result rows
-        out = {
-            "phenotype_id": pid,
-            "variant_id": var_ids,
-            "pos": var_pos,
-            "start_distance": start_distance,
-            "end_distance": end_distance,
-            "beta": betas[:, 0].detach().cpu().numpy(),
-            "se": ses[:, 0].detach().cpu().numpy(),
-            "tstat": tstats[:, 0].detach().cpu().numpy(),
-            "af": af_t.detach().cpu().numpy(),
-            "ma_samples": ma_samples_t.detach().cpu().numpy(),
-            "ma_count": ma_count_t.detach().cpu().numpy(),
-        }
-        df = pd.DataFrame(out)
+            # Distances to phenotype start/end
+            start_pos = ig.phenotype_start[pid]
+            end_pos = ig.phenotype_end[pid]
+            start_distance = var_pos - start_pos
+            end_distance = var_pos - end_pos
 
-        if perm_max_r2 is not None:
-            df["perm_max_r2"] = perm_max_r2 
-        out_rows.append(df)
+            # Assemble result rows
+            out = {
+                "phenotype_id": pid,
+                "variant_id": var_ids,
+                "pos": var_pos,
+                "start_distance": start_distance,
+                "end_distance": end_distance,
+                "beta": betas[:, 0].detach().cpu().numpy(),
+                "se": ses[:, 0].detach().cpu().numpy(),
+                "tstat": tstats[:, 0].detach().cpu().numpy(),
+                "af": af_t.detach().cpu().numpy(),
+                "ma_samples": ma_samples_t.detach().cpu().numpy(),
+                "ma_count": ma_count_t.detach().cpu().numpy(),
+            }
+            df = pd.DataFrame(out)
+
+            if perm_max_r2 is not None:
+                df["perm_max_r2"] = perm_max_r2 
+            out_rows.append(df)
 
     return pd.concat(out_rows, axis=0).reset_index(drop=True)
 
