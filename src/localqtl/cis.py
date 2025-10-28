@@ -163,8 +163,8 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device):
 def map_nominal(
         genotype_df: pd.DataFrame, variant_df: pd.DataFrame, phenotype_df: pd.DataFrame,
         phenotype_pos_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame] = None,
-        haplotype_reader: Optional[object] = None, window: int = 1_000_000,
-        nperm: Optional[int] = None, device: str = "cuda",
+        haplotypes: Optional[object] = None, loci_df: Optional[pd.DataFrame] = None,
+        window: int = 1_000_000, nperm: Optional[int] = None, device: str = "cuda",
 ) -> pd.DataFrame:
     """
     Nominal cis-QTL scan with optional permutations and local ancestry.
@@ -175,30 +175,22 @@ def map_nominal(
     device = device if device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
 
     # Build the appropriate input generator
-    if haplotype_reader is not None and getattr(haplotype_reader, "haplotypes", None) is not None:
+    if haplotypes is not None:
         ig = InputGeneratorCisWithHaps(
-            genotype_df=genotype_df,
-            variant_df=variant_df,
-            phenotype_df=phenotype_df,
-            phenotype_pos_df=phenotype_pos_df,
-            window=window,
-            haplotypes=haplotype_reader.haplotypes,  # (variants x samples x ancestries)
-            loci_df=getattr(haplotype_reader, "loci_df", None),
+            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+            phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes,
+            loci_df=loci_df,
         )
-        with_haps = True
     else:
         ig = InputGeneratorCis(
-            genotype_df=genotype_df,
-            variant_df=variant_df,
-            phenotype_df=phenotype_df,
-            phenotype_pos_df=phenotype_pos_df,
-            window=window,
+            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+            phenotype_pos_df=phenotype_pos_df, window=window,
         )
-        with_haps = False
 
     # Residualize all phenotypes once (features x samples)
-    Y = torch.tensor(ig.phenotype_df.values, dtype=torch.float32, device=device)  # (n_pheno x n_samples)
+    Y = torch.tensor(ig.phenotype_df.values, dtype=torch.float32, device=device)
     Y_resid, rez = _residualize_matrix_with_covariates(Y, covariates_df, device)
+
     # Put residuals back so the generator yields the same ordering/IDs
     phenotype_df_resid = pd.DataFrame(
         Y_resid.cpu().numpy(),
