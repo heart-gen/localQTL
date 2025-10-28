@@ -164,6 +164,158 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device):
     return pd.concat(out_rows, axis=0).reset_index(drop=True)
 
 
+def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
+                          beta_approx: bool = True) -> pd.DataFrame:
+    """
+    One top association per phenotype with empirical permutation p-value.
+    Compatible with InputGeneratorCis and InputGeneratorCisWithHaps.
+    (Group mode is not handled here.)
+    """
+    out_rows = []
+    if nperm is None or nperm <= 0:
+        raise ValueError("nperm must be a positive integer for map_permutations.")
+
+    for batch in ig.generate_data():
+        # Accept shapes: (p, G, v_idx, pid) or (p, G, v_idx, H, pid)
+        if len(batch) == 4:
+            p, G_block, v_idx, pid = batch
+            H_block = None
+        elif len(batch) == 5 and not isinstance(batch[3], (list, tuple)):
+            p, G_block, v_idx, H_block, pid = batch
+        else:
+            # Skip groups in this core (keep parity with tensorQTL's per-phenotype map_cis)
+            raise ValueError("Group mode not supported in _run_permutation_core.")
+
+        # Tensors
+        y_t = torch.tensor(p, dtype=torch.float32, device=device)
+        G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
+        H_t = torch.tensor(H_block, dtype=torch.float32, device=device) if H_block is not None else None
+
+        # Impute/filter
+        G_t, keep_mask = _impute_and_filter(G_t)
+        if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
+            continue
+        keep_np = keep_mask.detach().cpu().numpy()
+        v_idx = v_idx[keep_np]
+        if H_t is not None:
+            H_t = H_t[keep_mask]
+
+        # Minor-allele stats before residualization
+        n_samp = y_t.shape[0]
+        sum_g_over_05 = torch.where(G_t > 0.5, G_t, torch.zeros_like(G_t)).sum(dim=1)
+        af_t = (G_t.sum(dim=1) / (2.0 * n_samp))
+        ma_samples_t = torch.where(af_t <= 0.5, (G_t > 0.5).sum(dim=1), (G_t < 1.5).sum(dim=1)).to(torch.int32)
+        ma_count_t = torch.where(af_t <= 0.5, sum_g_over_05, 2 * n_samp - sum_g_over_05)
+
+        # Residualize y/G/H against covariates
+        y_t, G_t, H_t = _residualize_batch(y_t, G_t, H_t, rez, center=True)
+
+        # Build permuted phenotypes (n x nperm)
+        perms = [torch.randperm(y_t.shape[0], device=device) for _ in range(nperm)]
+        y_perm = torch.stack([y_t[idx] for idx in perms], dim=1)
+
+        # Run batched regression with permutations
+        betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
+            y=y_t, G=G_t, H=H_t, y_perm=y_perm, device=device
+        )
+
+        # Choose top variant by partial R^2 for genotype predictor
+        # For multiple regression, partial R^2 for a single predictor:
+        # R^2_partial = t^2 / (t^2 + dof), dof = n - p
+        n = y_t.shape[0]
+        p_pred = 1 + (H_t.shape[2] if H_t is not None else 0)   # genotype + (k-1) ancestry columns
+        dof = max(n - p_pred, 1)
+        t_g = tstats[:, 0]                                      # (m,)
+        r2_nominal_vec = (t_g.double().pow(2) / (t_g.double().pow(2) + dof)).cpu().numpy()
+        ix = int(np.nanargmax(r2_nominal_vec))
+
+        # Extract top variant stats
+        beta = float(betas[ix, 0].detach().cpu().numpy())
+        se = float(ses[ix, 0].detach().cpu().numpy())
+        tval = float(tstats[ix, 0].detach().cpu().numpy())
+        r2_nominal = float(r2_nominal_vec[ix])
+
+        # Nominal p (two-sided t)
+        pval_nominal = float(2.0 * stats.t.sf(np.abs(tval), df=dof))
+
+        # Empirical permutation p (max across variants each perm)
+        r2_perm_np = r2_perm.detach().cpu().numpy()  # (nperm,)
+        pval_perm = float((np.sum(r2_perm_np >= r2_nominal) + 1) / (r2_perm_np.size + 1))
+
+        # Optional Beta approximation
+        if beta_approx:
+            pval_beta, a_hat, b_hat = _beta_approx_pval(r2_perm_np, r2_nominal)
+        else:
+            pval_beta, a_hat, b_hat = np.nan, np.nan, np.nan
+
+        # Metadata
+        var_id = variant_df.index.values[v_idx[ix]]
+        var_pos = int(variant_df.iloc[v_idx[ix]]["pos"])
+        start_pos = ig.phenotype_start[pid]
+        end_pos = ig.phenotype_end[pid]
+        start_distance = int(var_pos - start_pos)
+        end_distance = int(var_pos - end_pos)
+        num_var = int(G_t.shape[0])
+
+        out_rows.append(pd.Series({
+            "phenotype_id": pid,
+            "variant_id": var_id,
+            "pos": var_pos,
+            "start_distance": start_distance,
+            "end_distance": end_distance,
+            "num_var": num_var,
+            "beta": beta,
+            "se": se,
+            "tstat": tval,
+            "r2_nominal": r2_nominal,
+            "pval_nominal": pval_nominal,
+            "pval_perm": pval_perm,
+            "pval_beta": pval_beta,
+            "beta_shape1": a_hat,
+            "beta_shape2": b_hat,
+            "af": float(af_t[ix].detach().cpu().numpy()),
+            "ma_samples": int(ma_samples_t[ix].detach().cpu().numpy()),
+            "ma_count": float(ma_count_t[ix].detach().cpu().numpy()),
+            "dof": dof,
+        }))
+
+    return pd.DataFrame(out_rows).reset_index(drop=True)
+
+
+def map_permutations(
+        genotype_df: pd.DataFrame, variant_df: pd.DataFrame, phenotype_df: pd.DataFrame,
+        phenotype_pos_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame] = None,
+        haplotypes: Optional[object] = None, loci_df: Optional[pd.DataFrame] = None,
+        window: int = 1_000_000, nperm: int = 10_000, device: str = "cuda",
+        beta_approx: bool = True) -> pd.DataFrame:
+    """
+    Empirical cis-QTL mapping (one top variant per phenotype) with permutations.
+    Returns a DataFrame with empirical p-values (and optional Beta approximation).
+    """
+    device = device if device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Build the appropriate input generator
+    if haplotypes is not None:
+        ig = InputGeneratorCisWithHaps(
+            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+            phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes, loci_df=loci_df,
+        )
+    else:
+        ig = InputGeneratorCis(
+            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+            phenotype_pos_df=phenotype_pos_df, window=window,
+        )
+
+    # Residualize phenotypes once
+    Y = torch.tensor(ig.phenotype_df.values, dtype=torch.float32, device=device)
+    Y_resid, rez = _residualize_matrix_with_covariates(Y, covariates_df, device)
+    ig.phenotype_df = pd.DataFrame(Y_resid.cpu().numpy(), index=ig.phenotype_df.index,
+                                   columns=ig.phenotype_df.columns)
+
+    return _run_permutation_core(ig, variant_df, rez, nperm=nperm,
+                                 device=device, beta_approx=beta_approx)
+
+
 def map_nominal(
         genotype_df: pd.DataFrame, variant_df: pd.DataFrame, phenotype_df: pd.DataFrame,
         phenotype_pos_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame] = None,
@@ -256,10 +408,12 @@ class CisMapper:
     def map_nominal(self, nperm: Optional[int] = None) -> pd.DataFrame:
         return _run_nominal_core(self.ig, self.variant_df, self.rez, nperm, self.device)
 
-    def map_permutations(self, nperm=1000, window=1_000_000):
-        """Permutation-based empirical cis-QTLs"""
-        # same loop, but shuffle phenotype each time and record max r2
-        pass
+    def map_permutations(self, nperm: int=10_000, beta_approx: bool=True) -> pd.DataFrame:
+        """Empirical cis-QTLs (top per phenotype) with permutation p-values."""
+        return _run_permutation_core(
+            self.ig, self.variant_df, self.rez, nperm=nperm, device=self.device,
+            beta_approx=beta_approx
+        )
 
     def map_independent(self, cis_df, fdr=0.05):
         """Forward–backward conditional mapping"""
@@ -280,7 +434,7 @@ class CisMapper:
         betas = XtX_inv @ (X.T @ y)
         y_hat = X @ betas
         resid = y - y_hat
-        k_eff = rez.Q_t.shape[1] if rez is not None else 0
+        k_eff = self.rez.Q_t.shape[1] if self.rez is not None else 0
         p = X.shape[-1]
         dof = X.shape[0] - k_eff - p
         sigma2 = (resid.transpose(1,2) @ resid).squeeze() / dof
