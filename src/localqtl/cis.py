@@ -211,9 +211,8 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
 def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
                           beta_approx: bool = True, maf_threshold: float = 0.0) -> pd.DataFrame:
     """
-    One top association per phenotype with empirical permutation p-value.
-    Compatible with InputGeneratorCis and InputGeneratorCisWithHaps.
-    (Group mode is not handled here.)
+    One top association per phenotype with empirical permutation p-value (no grouping).
+    Compatible with InputGeneratorCis and InputGeneratorCisWithHaps (ungrouped only).
     """
     out_rows = []
     if nperm is None or nperm <= 0:
@@ -293,7 +292,7 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
 
         # Optional Beta approximation
         if beta_approx:
-            pval_beta, a_hat, b_hat = _beta_approx_pval(r2_perm_np, r2_nominal)
+            pval_beta, a_hat, b_hat = beta_approx_pval(r2_perm_np, r2_nominal)
         else:
             pval_beta, a_hat, b_hat = np.nan, np.nan, np.nan
 
@@ -325,6 +324,158 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
             "af": float(af_t[ix].detach().cpu().numpy()),
             "ma_samples": int(ma_samples_t[ix].detach().cpu().numpy()),
             "ma_count": float(ma_count_t[ix].detach().cpu().numpy()),
+            "dof": dof,
+        }))
+
+    return pd.DataFrame(out_rows).reset_index(drop=True)
+
+
+def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
+                                beta_approx: bool = True, maf_threshold: float = 0.0) -> pd.DataFrame:
+    """
+    Group-aware permutation mapping: returns one top association per *group* (best phenotype within group),
+    with empirical p-values computed by taking the max R² across variants and phenotypes for each permutation.
+    Mirrors tensorQTL’s grouped behavior.
+    """
+    if nperm is None or nperm <= 0:
+        raise ValueError("nperm must be a positive integer for map_permutations.")
+
+    out_rows = []
+    for batch in ig.generate_data():
+        # Accept shapes: (P, G, v_idx, ids, group_id) or (P, G, v_idx, H, ids, group_id)
+        if len(batch) == 5:
+            P, G_block, v_idx, ids, group_id = batch
+            H_block = None
+        elif len(batch) == 6:
+            P, G_block, v_idx, H_block, ids, group_id = batch
+        else:
+            raise ValueError("Unexpected grouped batch shape.")
+
+        # Tensors for window
+        G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
+        H_t = torch.tensor(H_block, dtype=torch.float32, device=device) if H_block is not None else None
+
+        # Impute + drop monomorphic
+        G_t, keep_mask, _ = impute_mean_and_filter(G_t)
+        if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
+            continue
+        if maf_threshold and maf_threshold > 0:
+            keep_maf, _ = filter_by_maf(G_t, maf_threshold, ploidy=2)
+            keep_mask = keep_mask & keep_maf
+            if keep_mask.sum().item() == 0:
+                continue
+        G_t = G_t[keep_mask]
+        v_idx = v_idx[keep_mask.detach().cpu().numpy()]
+        if H_t is not None:
+            H_t = H_t[keep_mask]
+            if H_t.shape[2] > 1:
+                H_t = H_t[:, :, :-1]  # drop one ancestry channel to avoid rank deficiency
+
+        # Minor-allele stats prior to residualization
+        af_t, ma_samples_t, ma_count_t = allele_stats(G_t, ploidy=2)
+
+        # Prepare phenotype list
+        if isinstance(P, (list, tuple)):
+            P_list = list(P)
+        else:
+            P = np.asarray(P)
+            P_list = [P[i, :] for i in range(P.shape[0])] if P.ndim == 2 else [P]
+
+        # Residualize once; reuse G/H residuals for each phenotype
+        # Build a stacked Y for residualization
+        Y_stack = torch.stack([torch.tensor(pi, dtype=torch.float32, device=device) for pi in P_list], dim=0)  # (k x n)
+        # Use shared routine to residualize matrices with the same Residualizer
+        mats: List[torch.Tensor] = [G_t]
+        H_shape = None
+        if H_t is not None:
+            m, n, pH = H_t.shape
+            H_shape = (m, n, pH)
+            mats.append(H_t.reshape(m * pH, n))
+        mats_resid = rez.transform(*mats, Y_stack, center=True) if rez is not None else [G_t] + ([H_t.reshape(m*pH, n)] if H_t is not None else []) + [Y_stack]
+        G_resid = mats_resid[0]
+        idx = 1
+        H_resid = None
+        if H_t is not None:
+            H_resid = mats_resid[idx].reshape(H_shape)
+            idx += 1
+        Y_resid = mats_resid[idx]  # (k x n)
+
+        # Design meta
+        n = Y_resid.shape[1]
+        p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
+        dof = max(n - p_pred, 1)
+        var_ids = variant_df.index.values[v_idx]
+        var_pos = variant_df.iloc[v_idx]["pos"].values
+
+        # Evaluate each phenotype: t-stats -> partial R²; keep the global best (variant, phenotype)
+        best = dict(r2=-np.inf, ix_var=-1, ix_pheno=-1, beta=None, se=None, t=None)
+        r2_perm_list = []
+        for j in range(Y_resid.shape[0]):
+            y_t = Y_resid[j, :]
+            # Permutations for phenotype j
+            perms = [torch.randperm(n, device=device) for _ in range(nperm)]
+            y_perm = torch.stack([y_t[idx] for idx in perms], dim=1)  # (n x nperm)
+
+            betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
+                y=y_t, G=G_resid, H=H_resid, y_perm=y_perm, device=device
+            )
+            # nominal partial R² for genotype predictor
+            t_g = tstats[:, 0]
+            r2_nominal_vec = (t_g.double().pow(2) / (t_g.double().pow(2) + dof)).detach().cpu().numpy()
+            ix = int(np.nanargmax(r2_nominal_vec))
+            if r2_nominal_vec[ix] > best["r2"]:
+                best.update(
+                    r2=float(r2_nominal_vec[ix]),
+                    ix_var=ix,
+                    ix_pheno=j,
+                    beta=float(betas[ix, 0].detach().cpu().numpy()),
+                    se=float(ses[ix, 0].detach().cpu().numpy()),
+                    t=float(tstats[ix, 0].detach().cpu().numpy()),
+                )
+            r2_perm_list.append(r2_perm)  # (nperm,)
+
+        # Combine permutations across phenotypes by elementwise max
+        r2_perm_max = torch.stack(r2_perm_list, dim=0).max(dim=0).values.detach().cpu().numpy()  # (nperm,)
+
+        # Build output (metadata for the winning phenotype/variant)
+        pid = ids[best["ix_pheno"]]
+        var_id = var_ids[best["ix_var"]]
+        pos = int(var_pos[best["ix_var"]])
+        start_pos = ig.phenotype_start[pid]
+        end_pos = ig.phenotype_end[pid]
+        start_distance = int(pos - start_pos)
+        end_distance = int(pos - end_pos)
+        num_var = int(G_t.shape[0])
+
+        # p-values
+        pval_nominal = float(2.0 * stats.t.sf(abs(best["t"]), df=dof))
+        pval_perm = float((np.sum(r2_perm_max >= best["r2"]) + 1) / (r2_perm_max.size + 1))
+        if beta_approx:
+            pval_beta, a_hat, b_hat = beta_approx_pval(r2_perm_max, best["r2"])
+        else:
+            pval_beta, a_hat, b_hat = np.nan, np.nan, np.nan
+
+        out_rows.append(pd.Series({
+            "group_id": group_id,
+            "group_size": len(ids),
+            "phenotype_id": pid,
+            "variant_id": var_id,
+            "pos": pos,
+            "start_distance": start_distance,
+            "end_distance": end_distance,
+            "num_var": num_var,
+            "beta": best["beta"],
+            "se": best["se"],
+            "tstat": best["t"],
+            "r2_nominal": best["r2"],
+            "pval_nominal": pval_nominal,
+            "pval_perm": pval_perm,
+            "pval_beta": pval_beta,
+            "beta_shape1": a_hat,
+            "beta_shape2": b_hat,
+            "af": float(af_t[best["ix_var"]].detach().cpu().numpy()),
+            "ma_samples": int(ma_samples_t[best["ix_var"]].detach().cpu().numpy()),
+            "ma_count": float(ma_count_t[best["ix_var"]].detach().cpu().numpy()),
             "dof": dof,
         }))
 
@@ -379,6 +530,7 @@ def map_nominal(
 def map_permutations(
         genotype_df: pd.DataFrame, variant_df: pd.DataFrame, phenotype_df: pd.DataFrame,
         phenotype_pos_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame] = None,
+        group_s: Optional[pd.Series] = None,
         haplotypes: Optional[object] = None, loci_df: Optional[pd.DataFrame] = None,
         maf_threshold: float = 0.0, window: int = 1_000_000, nperm: int = 10_000,
         device: str = "cuda", beta_approx: bool = True
@@ -394,11 +546,12 @@ def map_permutations(
         ig = InputGeneratorCisWithHaps(
             genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
             phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes, loci_df=loci_df,
+            group_s=group_s,
         )
     else:
         ig = InputGeneratorCis(
             genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
-            phenotype_pos_df=phenotype_pos_df, window=window,
+            phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s,
         )
 
     # Residualize phenotypes once
@@ -407,9 +560,17 @@ def map_permutations(
     ig.phenotype_df = pd.DataFrame(Y_resid.cpu().numpy(), index=ig.phenotype_df.index,
                                    columns=ig.phenotype_df.columns)
 
-    return _run_permutation_core(ig, variant_df, rez, nperm=nperm,
-                                 device=device, beta_approx=beta_approx,
-                                 maf_threshold=maf_threshold)
+    # Route to grouped or single-phenotype core
+    if getattr(ig, "group_s", None) is not None:
+        return _run_permutation_core_group(
+            ig, variant_df, rez, nperm=nperm, device=device,
+            beta_approx=beta_approx, maf_threshold=maf_threshold
+        )
+    else:
+        return _run_permutation_core(
+            ig, variant_df, rez, nperm=nperm, device=device,
+            beta_approx=beta_approx, maf_threshold=maf_threshold
+        )
 
 
 class CisMapper:
@@ -473,10 +634,16 @@ class CisMapper:
                          maf_threshold: float | None = None) -> pd.DataFrame:
         """Empirical cis-QTLs (top per phenotype) with permutation p-values."""
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
-        return _run_permutation_core(
-            self.ig, self.variant_df, self.rez, nperm=nperm, device=self.device,
-            beta_approx=beta_approx, maf_threshold=mt
-        )
+        if getattr(self.ig, "group_s", None) is not None:
+            return _run_permutation_core_group(
+                self.ig, self.variant_df, self.rez, nperm=nperm, device=self.device,
+                beta_approx=beta_approx, maf_threshold=mt
+            )
+        else:
+            return _run_permutation_core(
+                self.ig, self.variant_df, self.rez, nperm=nperm, device=self.device,
+                beta_approx=beta_approx, maf_threshold=mt
+            )
 
     def map_independent(self, cis_df, fdr=0.05):
         """Forward–backward conditional mapping"""
