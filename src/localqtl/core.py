@@ -57,17 +57,6 @@ def filter_maf(genotypes_t, variant_ids, maf_threshold, alleles=2):
     return genotypes_t, variant_ids, af_t
 
 
-def filter_maf_interaction(genotypes_t, interaction_mask_t=None, maf_threshold_interaction=0.05):
-    # filter monomorphic sites (to avoid colinearity)
-    mask_t = ~((genotypes_t==0).all(1) | (genotypes_t==1).all(1) | (genotypes_t==2).all(1))
-    if interaction_mask_t is not None:
-        upper_t = calculate_maf(genotypes_t[:, interaction_mask_t]) >= maf_threshold_interaction - 1e-7
-        lower_t = calculate_maf(genotypes_t[:,~interaction_mask_t]) >= maf_threshold_interaction - 1e-7
-        mask_t = mask_t & upper_t & lower_t
-    genotypes_t = genotypes_t[mask_t]
-    return genotypes_t, mask_t
-
-
 def impute_mean(genotypes_t, missing=-9):
     """Impute missing genotypes to mean"""
     m = genotypes_t == missing
