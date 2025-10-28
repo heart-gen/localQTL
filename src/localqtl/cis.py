@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 import pandas as pd
 from typing import Optional, Tuple, List
 
@@ -66,7 +67,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
     Handles both InputGeneratorCis (no haps) and InputGeneratorCisWithHaps (haps).
     """
     out_rows = []
-    # Iterate phenotypes / groups
+    # Iterate phenotypes / (optional) groups
     for batch in ig.generate_data():
         if len(batch) == 5 and not isinstance(batch[3], (list, tuple)):
             p, G_block, v_idx, H_block, pid = batch
