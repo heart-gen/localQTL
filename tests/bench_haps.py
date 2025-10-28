@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Benchmark & correctness test for cis mapping WITH HAPLOTYPES:
-- functional core (_run_nominal_core) if available
-- SimpleCisMapper.map_nominal (using InputGeneratorCisWithHaps)
+- functional map_nominal (with haplotypes)
+- CisMapper.map_nominal (OO API with haplotypes)
 
 Scales over (#variants in cis-window, #phenotypes, #ancestries) and reports timings.
 Also checks functional vs OO numerical agreement when the functional core is available.
@@ -33,10 +33,7 @@ import torch
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
-from localqtl.regression_kernels import Residualizer
 from localqtl.cis import CisMapper, map_nominal
-from localqtl.haplotypeio import InputGeneratorCisWithHaps
-from localqtl.genotypeio import InputGeneratorCis
 
 def make_synthetic_data(
         m_variants: int, n_samples: int, n_pheno: int, n_covars: int,
@@ -151,34 +148,34 @@ def map_nominal_with_haps(
 
 def call_mapper_with_haps(
     genotype_df, variant_df, phenotype_df, phenotype_pos_df, covariates_df,
-    haplotypes, device: str
+    haplotypes, device: str, loci_df=None
 ):
     """
-    Build a mapper around an InputGeneratorCisWithHaps and run map_nominal().
+    Build a CisMapper with haplotypes and run map_nominal().
     """
     sig = inspect.signature(CisMapper.__init__).parameters
-    # Older API: (genotype_reader, phenotype_df, phenotype_pos_df, ...)
-    if "genotype_reader" in sig:
-        ig = InputGeneratorCis(
-            genotype_df, variant_df, phenotype_df, phenotype_pos_df, window=2_000_000
-        )
-        mapper = CisMapper(
-            genotype_reader=ig,
-            phenotype_df=phenotype_df,
-            phenotype_pos_df=phenotype_pos_df,
-            covariates_df=covariates_df,
-            device=device,
-        )
-    else:
-        # Newer API (assumes CisMapper builds the generator itself)
+    # Newer API (cis.py provided): accepts haplotypes (and optional loci_df)
+    if "haplotypes" in sig:
         mapper = CisMapper(
             genotype_df=genotype_df,
             variant_df=variant_df,
             phenotype_df=phenotype_df,
             phenotype_pos_df=phenotype_pos_df,
             covariates_df=covariates_df,
+            haplotypes=haplotypes,
+            loci_df=loci_df,
             device=device,
         )
+    else:
+        # Very old fallback (unlikely for your tree). Runs without H.
+        mapper = CisMapper(
+             genotype_df=genotype_df,
+             variant_df=variant_df,
+             phenotype_df=phenotype_df,
+             phenotype_pos_df=phenotype_pos_df,
+             covariates_df=covariates_df,
+             device=device,
+         )
     t0 = time.perf_counter()
     df_class = mapper.map_nominal()
     t1 = time.perf_counter()
@@ -263,7 +260,7 @@ def main():
                 func_note = None
                 df_func = None
 
-                df_func, t_func, note = map_nominal_maybe_with_haps(
+                df_func, t_func, note = map_nominal_with_haps(
                     genotype_df=geno,
                     variant_df=var_df,
                     phenotype_df=pheno,
@@ -279,7 +276,8 @@ def main():
 
                 # OO API
                 df_class, cls_time = call_mapper_with_haps(
-                    geno, var_df, pheno, pheno_pos, covs, H, device
+                    geno, var_df, pheno, pheno_pos, covs, H, device,
+                    loci_df=None  # synthetic H already aligned to variant order
                 )
                 print(f"CisMapper.map_nominal (with H): {cls_time:.3f} s, rows={len(df_class):,}")
 
@@ -303,7 +301,7 @@ def main():
                         covars=args.covars,
                         device=device,
                         time_map_cis_nominal_sec=t_func,
-                        time_simple_mapper_sec=t_class,
+                        time_simple_mapper_sec=cls_time,
                         rows_func=len(df_func),
                         rows_class=len(df_class),
                         ran_functional_with_H=bool(ran_with_H),
