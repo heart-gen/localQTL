@@ -13,6 +13,18 @@ from .regression_kernels import (
 from .stats import beta_approx_pval
 from .preproc import impute_mean_and_filter, allele_stats, filter_by_maf
 
+def _as_key(x):
+    """Return a hashable Python scalar/str from numpy scalars/arrays."""
+    if isinstance(x, (str, int)):
+        return x
+    import numpy as np
+    if isinstance(x, np.generic):
+        return x.item()
+    if isinstance(x, np.ndarray):
+        return x.item() if x.ndim == 0 else x.tolist()[0]
+    return str(x)
+
+
 def _residualize_matrix_with_covariates(
         Y: torch.Tensor, C: Optional[pd.DataFrame], device: str
 ) -> Tuple[torch.Tensor, Optional[Residualizer]]:
@@ -187,15 +199,17 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 )
                 r2_perm = perm_max_r2 = None
 
+            pid_key = _as_key(pid)
+
             # Distances to phenotype start/end
-            start_pos = ig.phenotype_start[pid]
-            end_pos = ig.phenotype_end[pid]
+            start_pos = ig.phenotype_start[pid_key]
+            end_pos = ig.phenotype_end[pid_key]
             start_distance = var_pos - start_pos
             end_distance = var_pos - end_pos
 
             # Assemble result rows
             out = {
-                "phenotype_id": pid,
+                "phenotype_id": pid_key,
                 "variant_id": var_ids,
                 "pos": var_pos,
                 "start_distance": start_distance,
@@ -305,16 +319,17 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
             pval_beta, a_hat, b_hat = np.nan, np.nan, np.nan
 
         # Metadata
+        pid_key = _as_key(pid)
         var_id = variant_df.index.values[v_idx[ix]]
         var_pos = int(variant_df.iloc[v_idx[ix]]["pos"])
-        start_pos = ig.phenotype_start[pid]
-        end_pos = ig.phenotype_end[pid]
+        start_pos = ig.phenotype_start[pid_key]
+        end_pos = ig.phenotype_end[pid_key]
         start_distance = int(var_pos - start_pos)
         end_distance = int(var_pos - end_pos)
         num_var = int(G_t.shape[0])
 
         out_rows.append(pd.Series({
-            "phenotype_id": pid,
+            "phenotype_id": pid_key,
             "variant_id": var_id,
             "pos": var_pos,
             "start_distance": start_distance,
@@ -446,11 +461,11 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
         r2_perm_max = torch.stack(r2_perm_list, dim=0).max(dim=0).values.detach().cpu().numpy()  # (nperm,)
 
         # Build output (metadata for the winning phenotype/variant)
-        pid = ids[best["ix_pheno"]]
+        pid_key = _as_key(ids[best["ix_pheno"]])
         var_id = var_ids[best["ix_var"]]
         pos = int(var_pos[best["ix_var"]])
-        start_pos = ig.phenotype_start[pid]
-        end_pos = ig.phenotype_end[pid]
+        start_pos = ig.phenotype_start[pid_key]
+        end_pos = ig.phenotype_end[pid_key]
         start_distance = int(pos - start_pos)
         end_distance = int(pos - end_pos)
         num_var = int(G_t.shape[0])
@@ -466,7 +481,7 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
         out_rows.append(pd.Series({
             "group_id": group_id,
             "group_size": len(ids),
-            "phenotype_id": pid,
+            "phenotype_id": pid_key,
             "variant_id": var_id,
             "pos": pos,
             "start_distance": start_distance,
