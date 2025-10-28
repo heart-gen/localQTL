@@ -29,7 +29,7 @@ import pandas as pd
 import torch
 
 sys.path.append("/ocean/projects/bio250020p/kbenjamin/software/localQTL/src")
-from localqtl.cis import map_cis_nominal, SimpleCisMapper
+from localqtl.cis import map_nominal, CisMapper
 from localqtl.genotypeio import InputGeneratorCis
 
 
@@ -88,20 +88,20 @@ def make_synthetic_data(
     return genotype_df, variant_df, phenotype_df, phenotype_pos_df, covariates_df, window
 
 
-def call_simple_mapper_robust(
+def call_mapper_robust(
     genotype_df, variant_df, phenotype_df, phenotype_pos_df, covariates_df, device: str
 ) -> pd.DataFrame:
     """
-    Instantiates SimpleCisMapper regardless of whether it expects a 'genotype_reader'
+    Instantiates CisMapper regardless of whether it expects a 'genotype_reader'
     or builds its own generator internally. Returns mapper.map_nominal() DataFrame.
     """
-    sig = inspect.signature(SimpleCisMapper.__init__).parameters
+    sig = inspect.signature(CisMapper.__init__).parameters
     # Older API: (genotype_reader, phenotype_df, phenotype_pos_df, ...)
     if "genotype_reader" in sig:
         ig = InputGeneratorCis(
             genotype_df, variant_df, phenotype_df, phenotype_pos_df, window=2_000_000
         )
-        mapper = SimpleCisMapper(
+        mapper = CisMapper(
             genotype_reader=ig,
             phenotype_df=phenotype_df,
             phenotype_pos_df=phenotype_pos_df,
@@ -109,8 +109,8 @@ def call_simple_mapper_robust(
             device=device,
         )
     else:
-        # Newer API (assumes SimpleCisMapper builds the generator itself)
-        mapper = SimpleCisMapper(
+        # Newer API (assumes CisMapper builds the generator itself)
+        mapper = CisMapper(
             genotype_df=genotype_df,
             variant_df=variant_df,
             phenotype_df=phenotype_df,
@@ -188,12 +188,12 @@ def main():
                 n_pheno=p,
                 n_covars=args.covars,
                 window=2_000_000,
-                seed=42,
+                seed=13,
             )
 
             # Functional API
             t0 = time.perf_counter()
-            df_func = map_cis_nominal(
+            df_func = map_nominal(
                 genotype_df=geno,
                 variant_df=var_df,
                 phenotype_df=pheno,
@@ -209,7 +209,7 @@ def main():
 
             # OO API
             t0 = time.perf_counter()
-            df_class = call_simple_mapper_robust(
+            df_class = call_mapper_robust(
                 genotype_df=geno,
                 variant_df=var_df,
                 phenotype_df=pheno,
