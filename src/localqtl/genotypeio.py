@@ -12,7 +12,7 @@ sys.path.insert(1, os.path.dirname(__file__))
 from .phenotypeio import read_phenotype_bed
 
 try:
-    import .pgen
+    import pgen
 except ImportError as e:
     pgen = None
 
