@@ -72,22 +72,21 @@ def _residualize_batch(
 
 def _run_nominal_core(ig, variant_df, rez, nperm, device):
     """
-    Core nominal loop used by both the functional and OO APIs.
-    Assumes ig.phenotype_df is already residualized if rez is not None.
-    Includes: impute+filter, AF/MA, DoF fix (n-k-p), distances.
-    Returns a single DataFrame.
+    Shared inner loop for nominal (and optional permutation) mapping.
+    Handles both InputGeneratorCis (no haps) and InputGeneratorCisWithHaps (haps).
     """
-    results = []
+    out_rows = []
     # Iterate phenotypes / groups
     for batch in ig.generate_data():
-        # Unpack
-        if with_haps:
-            p, G_block, v_idx, H_block, pid = batch  # order as defined in InputGeneratorCisWithHaps._postprocess_batch
-        else:
+        if len(batch) == 5 and not isinstance(batch[3], (list, tuple)):
+            p, G_block, v_idx, H_block, pid = batch
+        elif len(batch) == 4:
             p, G_block, v_idx, pid = batch
             H_block = None
+        else:
+            raise ValueError(f"Unexpected batch shape from generator: len={len(batch)}")
 
-        # Tensors (samples dimension is the last axis)
+        # Tensors
         y_t = torch.tensor(p, dtype=torch.float32, device=device)
         G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
         H_t = torch.tensor(H_block, dtype=torch.float32, device=device) if H_block is not None else None
@@ -126,7 +125,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device):
             betas, ses, tstats = run_batch_regression(
                 y=y_t, G=G_t, H=H_t, k_eff=k_eff, device=device
             )
-            perm_max_r2 = None
+            r2_perm = perm_max_r2 = None
 
         # Variant metadata for this window
         var_ids = variant_df.index.values[v_idx]
@@ -138,7 +137,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device):
         start_distance = var_pos - start_pos
         end_distance = var_pos - end_pos
 
-        # Assemble result rows (genotype effect == column 0)
+        # Assemble result rows
         out = {
             "phenotype_id": pid,
             "variant_id": var_ids,
@@ -156,10 +155,9 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device):
 
         if perm_max_r2 is not None:
             df["perm_max_r2"] = perm_max_r2 
+        out_rows.append(df)
 
-        results.append(df)
-
-    return pd.concat(results, axis=0).reset_index(drop=True)
+    return pd.concat(out_rows, axis=0).reset_index(drop=True)
 
 
 def map_cis_nominal(
