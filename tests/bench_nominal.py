@@ -205,7 +205,7 @@ def main():
             )
             t1 = time.perf_counter()
             t_func = t1 - t0
-            print(f"map_cis_nominal: {t_func:.3f} s, rows={len(df_func):,}")
+            print(f"map_nominal: {t_func:.3f} s, rows={len(df_func):,}")
 
             # OO API
             t0 = time.perf_counter()
@@ -219,7 +219,7 @@ def main():
             )
             t1 = time.perf_counter()
             t_class = t1 - t0
-            print(f"SimpleCisMapper.map_nominal: {t_class:.3f} s, rows={len(df_class):,}")
+            print(f"CisMapper.map_nominal: {t_class:.3f} s, rows={len(df_class):,}")
 
             # Compare numerics
             try:

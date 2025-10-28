@@ -34,20 +34,14 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from localqtl.regression_kernels import Residualizer
-from localqtl.cis import CisMapper
+from localqtl.cis import CisMapper, map_nominal
 from localqtl.haplotypeio import InputGeneratorCisWithHaps
 from localqtl.genotypeio import InputGeneratorCis
 
 def make_synthetic_data(
-    m_variants: int,
-    n_samples: int,
-    n_pheno: int,
-    n_covars: int,
-    chrom: str = "1",
-    region_start: int = 1_000_000,
-    region_step: int = 50,
-    window: int = 2_000_000,
-    seed: int = 1337,
+        m_variants: int, n_samples: int, n_pheno: int, n_covars: int,
+        chrom: str = "1", region_start: int = 1_000_000, region_step: int = 50,
+        window: int = 2_000_000, seed: int = 1337,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, int]:
     """
     Create synthetic genotype/phenotype/covariate data. Every phenotype's cis-window covers all variants.
@@ -93,11 +87,8 @@ def make_synthetic_data(
 
 
 def make_synthetic_haplotypes(
-    m_variants: int,
-    n_samples: int,
-    n_ancestries: int,
-    seed: int = 1337,
-    frac_missing: float = 0.02,
+        m_variants: int, n_samples: int, n_ancestries: int, seed: int = 1337,
+        frac_missing: float = 0.02,
 ) -> np.ndarray:
     """
     Create one-hot local ancestry calls per (variant, sample) over K ancestries.
@@ -105,7 +96,6 @@ def make_synthetic_haplotypes(
     A small fraction set to NaN to exercise on-the-fly interpolation in InputGeneratorCisWithHaps.
     """
     rng = np.random.default_rng(seed)
-    # Choose one ancestry index per (variant, sample)
     anc_ix = rng.integers(low=0, high=n_ancestries, size=(m_variants, n_samples))
     H = np.zeros((m_variants, n_samples, n_ancestries), dtype=np.float32)
     rows = np.arange(m_variants)[:, None]
@@ -115,52 +105,80 @@ def make_synthetic_haplotypes(
     if frac_missing > 0:
         mask = rng.random(size=(m_variants, n_samples, 1)) < frac_missing
         H = H.astype(np.float32)
-        H[mask.repeat(n_ancestries, axis=2)] = np.nan  # will be interpolated/rounded
+        H[mask.repeat(n_ancestries, axis=2)] = np.nan # will be interpolated/rounded
 
     return H
 
 
-def try_functional_core_with_haps(
-    genotype_df, variant_df, phenotype_df, phenotype_pos_df, covariates_df, haplotypes, device: str
+def map_nominal_with_haps(
+        genotype_df, variant_df, phenotype_df, phenotype_pos_df, covariates_df,
+        haplotypes, window: int, device: str
 ):
     """
-    Try to call localqtl.cis._run_nominal_core using an InputGeneratorCisWithHaps.
-    If not available, return (None, None) to indicate 'skipped'.
+    Try to call map_nominal with haplotypes if the function signature supports it.
+    Falls back to calling without haplotypes and returns a note.
     """
-    import localqtl.cis as cis_mod
-    if not hasattr(cis_mod, "_run_nominal_core"):
-        return None, "functional core (_run_nominal_core) not exported; skipping."
-
-    rez = Residualizer(torch.tensor(covariates_df.values, dtype=torch.float32).to(device))
-    ig_h = InputGeneratorCisWithHaps(
-        genotype_df, variant_df, phenotype_df, phenotype_pos_df,
-        haplotypes=haplotypes, on_the_fly_impute=True, window=2_000_000
+    sig = inspect.signature(map_nominal).parameters
+    kwargs = dict(
+        genotype_df=genotype_df,
+        variant_df=variant_df,
+        phenotype_df=phenotype_df,
+        phenotype_pos_df=phenotype_pos_df,
+        covariates_df=covariates_df,
+        window=window,
+        nperm=None,
+        device=device,
     )
-
+    supported_h_keys = [k for k in ("haplotypes", "H", "haplotype_reader") if k in sig]
+    if haplotypes is not None and len(supported_h_keys) > 0:
+        # Prefer explicit "haplotypes" or "H"
+        if "haplotypes" in supported_h_keys:
+            kwargs["haplotypes"] = haplotypes
+            note = ""
+        elif "H" in supported_h_keys:
+            kwargs["H"] = haplotypes
+            note = ""
+        else:
+            note = "functional API exposes haplotype_reader but no direct haplotype array; ran without H"
+    else:
+        note = "functional API does not accept H; ran without H"
+    
     t0 = time.perf_counter()
-    df_func = cis_mod._run_nominal_core(ig_h, variant_df, rez, nperm=None, device=device)
+    df = map_nominal(**kwargs)
     t1 = time.perf_counter()
-    return (df_func, t1 - t0), None
+    return df, (t1 - t0), note
 
 
-def call_simple_mapper_with_haps(
-    genotype_df, variant_df, phenotype_df, phenotype_pos_df, covariates_df, haplotypes, device: str
+def call_mapper_with_haps(
+    genotype_df, variant_df, phenotype_df, phenotype_pos_df, covariates_df,
+    haplotypes, device: str
 ):
     """
     Build a mapper around an InputGeneratorCisWithHaps and run map_nominal().
     """
-    ig = InputGeneratorCisWithHaps(
-        genotype_df, variant_df, phenotype_df, phenotype_pos_df,
-        haplotypes=haplotypes, on_the_fly_impute=True, window=2_000_000
-    )
-    # SimpleCisMapper that accepts 'genotype_reader'
-    mapper = CisMapper(
-        genotype_reader=ig,
-        phenotype_df=phenotype_df,
-        phenotype_pos_df=phenotype_pos_df,
-        covariates_df=covariates_df,
-        device=device,
-    )
+    sig = inspect.signature(CisMapper.__init__).parameters
+    # Older API: (genotype_reader, phenotype_df, phenotype_pos_df, ...)
+    if "genotype_reader" in sig:
+        ig = InputGeneratorCis(
+            genotype_df, variant_df, phenotype_df, phenotype_pos_df, window=2_000_000
+        )
+        mapper = CisMapper(
+            genotype_reader=ig,
+            phenotype_df=phenotype_df,
+            phenotype_pos_df=phenotype_pos_df,
+            covariates_df=covariates_df,
+            device=device,
+        )
+    else:
+        # Newer API (assumes CisMapper builds the generator itself)
+        mapper = CisMapper(
+            genotype_df=genotype_df,
+            variant_df=variant_df,
+            phenotype_df=phenotype_df,
+            phenotype_pos_df=phenotype_pos_df,
+            covariates_df=covariates_df,
+            device=device,
+        )
     t0 = time.perf_counter()
     df_class = mapper.map_nominal()
     t1 = time.perf_counter()
@@ -239,29 +257,35 @@ def main():
                     frac_missing=0.02,
                 )
 
-                # --- Functional core (if available) ---
+                # Functional API
                 func_time = np.nan
                 max_beta = max_se = max_t = np.nan
                 func_note = None
                 df_func = None
 
-                res, func_note = try_functional_core_with_haps(
+                df_func, t_func, note = map_nominal_maybe_with_haps(
+                    genotype_df=geno,
+                    variant_df=var_df,
+                    phenotype_df=pheno,
+                    phenotype_pos_df=pheno_pos,
+                    covariates_df=covs,
+                    haplotypes=H,
+                    window=window,
+                    device=device,
+                )
+                ran_with_H = (note == "")
+                print(f"map_nominal: {t_func:.3f} s, rows={len(df_func):,}"
+                      + ("" if ran_with_H else f"  [NOTE: {note}]"))
+
+                # OO API
+                df_class, cls_time = call_mapper_with_haps(
                     geno, var_df, pheno, pheno_pos, covs, H, device
                 )
-                if res is not None:
-                    df_func, func_time = res
-                    print(f"_run_nominal_core (with H): {func_time:.3f} s, rows={len(df_func):,}")
-                else:
-                    print(f"[SKIP] functional core: {func_note}")
+                print(f"CisMapper.map_nominal (with H): {cls_time:.3f} s, rows={len(df_class):,}")
 
-                # --- OO path (SimpleCisMapper with H) ---
-                df_class, cls_time = call_simple_mapper_with_haps(
-                    geno, var_df, pheno, pheno_pos, covs, H, device
-                )
-                print(f"SimpleCisMapper.map_nominal (with H): {cls_time:.3f} s, rows={len(df_class):,}")
-
-                # Compare numerics if functional core ran
-                if df_func is not None:
+                # Compare numerics only
+                max_beta = max_se = max_t = np.nan
+                if ran_with_H:
                     try:
                         diffs = compare_results(df_func, df_class, tol=1e-5)
                         max_beta = float(diffs.get("beta", np.nan))
@@ -278,14 +302,15 @@ def main():
                         samples=args.samples,
                         covars=args.covars,
                         device=device,
-                        time_func_core_sec=func_time,
-                        time_simple_mapper_sec=cls_time,
-                        rows_func=(len(df_func) if df_func is not None else 0),
+                        time_map_cis_nominal_sec=t_func,
+                        time_simple_mapper_sec=t_class,
+                        rows_func=len(df_func),
                         rows_class=len(df_class),
+                        ran_functional_with_H=bool(ran_with_H),
                         max_abs_diff_beta=max_beta,
                         max_abs_diff_se=max_se,
                         max_abs_diff_tstat=max_t,
-                        note=(func_note or ""),
+                        note=note,
                     )
                 )
 
@@ -293,7 +318,8 @@ def main():
     print("\n=== Timing summary (seconds) ===")
     cols = [
         "variants", "phenotypes", "ancestries", "samples", "device",
-        "time_func_core_sec", "time_simple_mapper_sec", "rows_func", "rows_class"
+        "time_map_cis_nominal_sec", "time_simple_mapper_sec",
+        "rows_func", "rows_class", "ran_functional_with_H"
     ]
     print(bench_df[cols].to_string(index=False))
 
