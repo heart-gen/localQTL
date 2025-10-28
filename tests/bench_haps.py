@@ -5,7 +5,7 @@ Benchmark & correctness test for cis mapping WITH HAPLOTYPES:
 - CisMapper.map_nominal (OO API with haplotypes)
 
 Scales over (#variants in cis-window, #phenotypes, #ancestries) and reports timings.
-Also checks functional vs OO numerical agreement when the functional core is available.
+Also checks functional vs OO numerical agreement (beta, se, tstat).
 
 Usage:
   python tests/bench_haps.py \
@@ -14,12 +14,12 @@ Usage:
       --ancestries 2,3 \
       --samples 256 \
       --covars 6 \
+      --maf 0.00 \
       --device auto \
       --csv bench_haps_results.csv
 """
 
 import argparse
-import inspect
 import os
 import sys
 import time
@@ -35,10 +35,17 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from localqtl.cis import CisMapper, map_nominal
 
+
 def make_synthetic_data(
-        m_variants: int, n_samples: int, n_pheno: int, n_covars: int,
-        chrom: str = "1", region_start: int = 1_000_000, region_step: int = 50,
-        window: int = 2_000_000, seed: int = 1337,
+    m_variants: int,
+    n_samples: int,
+    n_pheno: int,
+    n_covars: int,
+    chrom: str = "1",
+    region_start: int = 1_000_000,
+    region_step: int = 50,
+    window: int = 2_000_000,
+    seed: int = 1337,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, int]:
     """
     Create synthetic genotype/phenotype/covariate data. Every phenotype's cis-window covers all variants.
@@ -50,8 +57,8 @@ def make_synthetic_data(
     samples = [f"S{i:03d}" for i in range(n_samples)]
 
     # Variants (positions evenly spaced)
-    variant_ids = [f"{chrom}_{region_start + i*region_step}_A_G" for i in range(m_variants)]
-    positions = np.array([region_start + i*region_step for i in range(m_variants)], dtype=np.int32)
+    variant_ids = [f"{chrom}_{region_start + i * region_step}_A_G" for i in range(m_variants)]
+    positions = np.array([region_start + i * region_step for i in range(m_variants)], dtype=np.int32)
     variant_df = pd.DataFrame(
         {"chrom": chrom, "pos": positions},
         index=pd.Index(variant_ids, name="variant_id"),
@@ -84,8 +91,11 @@ def make_synthetic_data(
 
 
 def make_synthetic_haplotypes(
-        m_variants: int, n_samples: int, n_ancestries: int, seed: int = 1337,
-        frac_missing: float = 0.02,
+    m_variants: int,
+    n_samples: int,
+    n_ancestries: int,
+    seed: int = 1337,
+    frac_missing: float = 0.02,
 ) -> np.ndarray:
     """
     Create one-hot local ancestry calls per (variant, sample) over K ancestries.
@@ -102,84 +112,9 @@ def make_synthetic_haplotypes(
     if frac_missing > 0:
         mask = rng.random(size=(m_variants, n_samples, 1)) < frac_missing
         H = H.astype(np.float32)
-        H[mask.repeat(n_ancestries, axis=2)] = np.nan # will be interpolated/rounded
+        H[mask.repeat(n_ancestries, axis=2)] = np.nan  # will be interpolated/rounded
 
     return H
-
-
-def map_nominal_with_haps(
-        genotype_df, variant_df, phenotype_df, phenotype_pos_df, covariates_df,
-        haplotypes, window: int, device: str
-):
-    """
-    Try to call map_nominal with haplotypes if the function signature supports it.
-    Falls back to calling without haplotypes and returns a note.
-    """
-    sig = inspect.signature(map_nominal).parameters
-    kwargs = dict(
-        genotype_df=genotype_df,
-        variant_df=variant_df,
-        phenotype_df=phenotype_df,
-        phenotype_pos_df=phenotype_pos_df,
-        covariates_df=covariates_df,
-        window=window,
-        nperm=None,
-        device=device,
-    )
-    supported_h_keys = [k for k in ("haplotypes", "H", "haplotype_reader") if k in sig]
-    if haplotypes is not None and len(supported_h_keys) > 0:
-        # Prefer explicit "haplotypes" or "H"
-        if "haplotypes" in supported_h_keys:
-            kwargs["haplotypes"] = haplotypes
-            note = ""
-        elif "H" in supported_h_keys:
-            kwargs["H"] = haplotypes
-            note = ""
-        else:
-            note = "functional API exposes haplotype_reader but no direct haplotype array; ran without H"
-    else:
-        note = "functional API does not accept H; ran without H"
-    
-    t0 = time.perf_counter()
-    df = map_nominal(**kwargs)
-    t1 = time.perf_counter()
-    return df, (t1 - t0), note
-
-
-def call_mapper_with_haps(
-    genotype_df, variant_df, phenotype_df, phenotype_pos_df, covariates_df,
-    haplotypes, device: str, loci_df=None
-):
-    """
-    Build a CisMapper with haplotypes and run map_nominal().
-    """
-    sig = inspect.signature(CisMapper.__init__).parameters
-    # Newer API (cis.py provided): accepts haplotypes (and optional loci_df)
-    if "haplotypes" in sig:
-        mapper = CisMapper(
-            genotype_df=genotype_df,
-            variant_df=variant_df,
-            phenotype_df=phenotype_df,
-            phenotype_pos_df=phenotype_pos_df,
-            covariates_df=covariates_df,
-            haplotypes=haplotypes,
-            loci_df=loci_df,
-            device=device,
-        )
-    else:
-        # Very old fallback (unlikely for your tree). Runs without H.
-        mapper = CisMapper(
-             genotype_df=genotype_df,
-             variant_df=variant_df,
-             phenotype_df=phenotype_df,
-             phenotype_pos_df=phenotype_pos_df,
-             covariates_df=covariates_df,
-             device=device,
-         )
-    t0 = time.perf_counter()
-    df_class = mapper.map_nominal()
-    t1 = time.perf_counter()
-    return df_class, (t1 - t0)
 
 
 def compare_results(df_func: pd.DataFrame, df_class: pd.DataFrame, tol=1e-5) -> pd.Series:
@@ -222,11 +157,16 @@ def main():
                         help="Comma-separated list of #ancestries (K).")
     parser.add_argument("--samples", type=int, default=256)
     parser.add_argument("--covars", type=int, default=6)
+    parser.add_argument("--maf", type=float, default=0.0,
+                        help="MAF threshold (e.g., 0.01). 0 disables filtering.")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--csv", type=str, default="")
     args = parser.parse_args()
 
-    device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else (args.device if args.device != "auto" else "cpu")
+    device = (
+        "cuda" if (args.device == "auto" and torch.cuda.is_available())
+        else (args.device if args.device != "auto" else "cpu")
+    )
 
     var_list = [int(x) for x in args.variants.split(",") if x.strip()]
     phe_list = [int(x) for x in args.phenotypes.split(",") if x.strip()]
@@ -255,42 +195,50 @@ def main():
                 )
 
                 # Functional API
-                func_time = np.nan
-                max_beta = max_se = max_t = np.nan
-                func_note = None
-                df_func = None
+                t0 = time.perf_counter()
+                df_func = map_nominal(
+                    genotype_df=geno,
+                    variant_df=var_df,
+                    phenotype_df=pheno,
+                    phenotype_pos_df=pheno_pos,
+                    covariates_df=covs,
+                    haplotypes=H,          # direct, per updated cis.py
+                    loci_df=None,          # synthetic H already aligned to variant order
+                    maf_threshold=args.maf,
+                    window=window,
+                    nperm=None,
+                    device=device,
+                )
+                t_func = time.perf_counter() - t0
+                print(f"map_nominal (with H): {t_func:.3f} s, rows={len(df_func):,}")
 
-                df_func, t_func, note = map_nominal_with_haps(
+                # OO API
+                mapper = CisMapper(
                     genotype_df=geno,
                     variant_df=var_df,
                     phenotype_df=pheno,
                     phenotype_pos_df=pheno_pos,
                     covariates_df=covs,
                     haplotypes=H,
-                    window=window,
+                    loci_df=None,
                     device=device,
+                    window=window,
+                    maf_threshold=args.maf,
                 )
-                ran_with_H = (note == "")
-                print(f"map_nominal: {t_func:.3f} s, rows={len(df_func):,}"
-                      + ("" if ran_with_H else f"  [NOTE: {note}]"))
-
-                # OO API
-                df_class, cls_time = call_mapper_with_haps(
-                    geno, var_df, pheno, pheno_pos, covs, H, device,
-                    loci_df=None  # synthetic H already aligned to variant order
-                )
+                t0 = time.perf_counter()
+                df_class = mapper.map_nominal()
+                cls_time = time.perf_counter() - t0
                 print(f"CisMapper.map_nominal (with H): {cls_time:.3f} s, rows={len(df_class):,}")
 
-                # Compare numerics only
+                # Compare numerics
                 max_beta = max_se = max_t = np.nan
-                if ran_with_H:
-                    try:
-                        diffs = compare_results(df_func, df_class, tol=1e-5)
-                        max_beta = float(diffs.get("beta", np.nan))
-                        max_se = float(diffs.get("se", np.nan))
-                        max_t = float(diffs.get("tstat", np.nan))
-                    except Exception as e:
-                        print(f"[WARN] Comparison failed: {e}")
+                try:
+                    diffs = compare_results(df_func, df_class, tol=1e-5)
+                    max_beta = float(diffs.get("beta", np.nan))
+                    max_se = float(diffs.get("se", np.nan))
+                    max_t = float(diffs.get("tstat", np.nan))
+                except Exception as e:
+                    print(f"[WARN] Comparison failed: {e}")
 
                 records.append(
                     dict(
@@ -299,25 +247,27 @@ def main():
                         ancestries=k,
                         samples=args.samples,
                         covars=args.covars,
+                        maf=args.maf,
                         device=device,
                         time_map_cis_nominal_sec=t_func,
                         time_simple_mapper_sec=cls_time,
                         rows_func=len(df_func),
                         rows_class=len(df_class),
-                        ran_functional_with_H=bool(ran_with_H),
+                        ran_functional_with_H=True,
                         max_abs_diff_beta=max_beta,
                         max_abs_diff_se=max_se,
                         max_abs_diff_tstat=max_t,
-                        note=note,
                     )
                 )
 
-    bench_df = pd.DataFrame.from_records(records).sort_values(["variants", "phenotypes", "ancestries"])
+    bench_df = pd.DataFrame.from_records(records).sort_values(
+        ["variants", "phenotypes", "ancestries"]
+    )
     print("\n=== Timing summary (seconds) ===")
     cols = [
-        "variants", "phenotypes", "ancestries", "samples", "device",
+        "variants", "phenotypes", "ancestries", "samples", "maf", "device",
         "time_map_cis_nominal_sec", "time_simple_mapper_sec",
-        "rows_func", "rows_class", "ran_functional_with_H"
+        "rows_func", "rows_class", "ran_functional_with_H",
     ]
     print(bench_df[cols].to_string(index=False))
 
