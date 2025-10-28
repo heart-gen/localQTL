@@ -34,7 +34,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from localqtl.regression_kernels import Residualizer
-from localqtl.cis import SimpleCisMapper
+from localqtl.cis import CisMapper
 from localqtl.haplotypeio import InputGeneratorCisWithHaps
 from localqtl.genotypeio import InputGeneratorCis
 
@@ -154,7 +154,7 @@ def call_simple_mapper_with_haps(
         haplotypes=haplotypes, on_the_fly_impute=True, window=2_000_000
     )
     # SimpleCisMapper that accepts 'genotype_reader'
-    mapper = SimpleCisMapper(
+    mapper = CisMapper(
         genotype_reader=ig,
         phenotype_df=phenotype_df,
         phenotype_pos_df=phenotype_pos_df,
