@@ -171,7 +171,13 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
         self.haplotypes = haplotypes
         self.loci_df = loci_df.copy() if loci_df is not None else None
         if self.loci_df is not None:
-            self.loci_df['index'] = np.arange(self.loci_df.shape[0])
+            m = (self.variant_df.reset_index()
+                 .merge(self.loci_df.reset_index(), on=["chrom","pos"], how="left"))
+            if m["index"].isnull().any():
+                raise ValueError("Some variants not found in loci_df for hap mapping.")
+            self._geno2hap = m["index"].to_numpy(dtype=int)
+        else:
+            self._geno2hap = None
         self.on_the_fly_impute = on_the_fly_impute
 
     @staticmethod
@@ -206,7 +212,12 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
     def _postprocess_batch(self, batch):
         if len(batch) == 4:
             p, G, v_idx, pid = batch
-            H_slice = self.haplotypes[v_idx, :, :]
+            if self._geno2hap is None:
+                H_slice = self.haplotypes[v_idx, :, :]
+            else:
+                hap_idx = self._geno2hap[v_idx]
+                H_slice = self.haplotypes[hap_idx, :, :]
+
             if self.on_the_fly_impute:
                 H_block = H_slice.compute() if hasattr(H_slice, "compute") else np.asarray(H_slice)
                 H = self._interpolate_block(H_block)
