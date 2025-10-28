@@ -91,6 +91,9 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device):
         G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
         H_t = torch.tensor(H_block, dtype=torch.float32, device=device) if H_block is not None else None
 
+        if H_t is not None:
+            H_t = H_t[:, :, :-1]  # drop last ancestry to avoid collinearity
+
         # Mean-impute and drop monomorphic BEFORE residualization; update indices/H accordingly
         G_t, keep_mask = _impute_and_filter(G_t)
         if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
