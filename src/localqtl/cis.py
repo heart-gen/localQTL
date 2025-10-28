@@ -8,6 +8,7 @@ from .regression_kernels import (
     run_batch_regression,
     run_batch_regression_with_permutations
 )
+from .stats import beta_approx_pval
 
 def _impute_and_filter(G_t: torch.Tensor):
     """Mean-impute per variant (treat -9 or non-finite as missing) and drop monomorphic variants."""
