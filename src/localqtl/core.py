@@ -2,7 +2,6 @@
 import sys
 import torch
 import numpy as np
-import scipy.stats as stats
 
 class SimpleLogger(object):
     def __init__(self, logfile=None, verbose=True):
@@ -79,23 +78,4 @@ def impute_mean(genotypes_t, missing=-9):
         mu = (a - missing*b) / (genotypes_t.shape[1] - b)
         genotypes_t[m] = mu[ix]
 
-
-def center_normalize(M_t, dim=0):
-    """Center and normalize M"""
-    N_t = M_t - M_t.mean(dim=dim, keepdim=True)
     return N_t / torch.sqrt(torch.pow(N_t, 2).sum(dim=dim, keepdim=True))
-
-
-def get_t_pval(t, df, log=False):
-    """
-    Get p-value corresponding to t statistic and degrees of freedom (df). t and/or df can be arrays.
-    If log=True, returns -log10(P).
-    """
-    # Compute the two-tailed p-value
-    p = 2 * stats.t.cdf(-abs(t), df)
-    
-    if log:
-        p = np.maximum(p, np.finfo(float).tiny)
-        return -np.log10(p)
-    else:
-        return p
