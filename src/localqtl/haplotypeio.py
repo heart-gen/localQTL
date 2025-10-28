@@ -10,8 +10,6 @@ Notes
 - Designed for large-scale GPU eQTL with CuPy/cuDF where possible.
 - Avoids materialization; uses dask-backed arrays and cuDF slicing.
 - Compatible with original tensorQTL patterns while adding local ancestry.
-
-Author: Kynon J Benjamin
 """
 import numpy as np
 import pandas as pd
@@ -180,6 +178,20 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
             self._geno2hap = None
         self.on_the_fly_impute = on_the_fly_impute
 
+        # Sanity check
+        if self.haplotypes is None:
+            raise ValueError("`haplotypes` array is required for InputGeneratorCisWithHaps.")
+        try:
+            h_len = int(self.haplotypes.shape[0])
+        except Exception as e:
+            raise ValueError("`haplotypes` must be an array-like with shape "
+                             "(variants, samples, ancestries).") from e
+        if self._geno2hap is None and h_len != int(self.variant_df.shape[0]):
+            raise ValueError(
+                f"haplotypes first dimension ({h_len}) does not match variant_df rows "
+                f"({self.variant_df.shape[0]}). Provide `loci_df` to map genotypes to hap indices."
+            )
+
     @staticmethod
     def _interpolate_block(block):
         """
@@ -188,7 +200,7 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
         Performs linear interpolation along the loci axis (axis=0) for each (sample, ancestry)
         pair independently. Supports NumPy or CuPy arrays via arr_mod.
         """
-        # Determine arrray module
+        # Determine array module
         mod = get_array_module(block)
 
         loci_dim, sample_dim, ancestry_dim = block.shape
@@ -207,40 +219,37 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
                     interpolated = mod.interp(idx[mask], idx[valid], col[valid])
                     block_imputed[mask, s] = mod.round(interpolated).astype(int)
 
-        return block_imputed.reshape(loci_dim, sample_dim, ancestry_dim)
+        return block_imputed.reshape(loci_dim, sample_dim, ancestry_dim).astype(np.float32, copy=False)
+
+    def _fetch_hap_block(self, v_idx):
+        """Helper: index haplotypes with genotype variant indices (or mapped loci)."""
+        if self._geno2hap is None:
+            H_slice = self.haplotypes[v_idx, :, :]
+        else:
+            hap_idx = self._geno2hap[v_idx]
+            H_slice = self.haplotypes[hap_idx, :, :]
+        if self.on_the_fly_impute:
+            H_block = H_slice.compute() if hasattr(H_slice, "compute") else np.asarray(H_slice)
+            return self._interpolate_block(H_block)
+        else:
+            return H_slice.compute() if hasattr(H_slice, "compute") else np.asarray(H_slice)
 
     def _postprocess_batch(self, batch):
+        """Preserve grouping contract from `InputGeneratorCis` and just append H."""
         if len(batch) == 4:
             p, G, v_idx, pid = batch
-            if self._geno2hap is None:
-                H_slice = self.haplotypes[v_idx, :, :]
-            else:
-                hap_idx = self._geno2hap[v_idx]
-                H_slice = self.haplotypes[hap_idx, :, :]
-
-            if self.on_the_fly_impute:
-                H_block = H_slice.compute() if hasattr(H_slice, "compute") else np.asarray(H_slice)
-                H = self._interpolate_block(H_block)
-            else:
-                H = H_slice.compute() if hasattr(H_slice, "compute") else np.asarray(H_slice)
+            H = self._fetch_hap_block(v_idx)
             return p, G, v_idx, H, pid
         elif len(batch) == 5:
             p, G, v_idx, ids, group_id = batch
-            if self._geno2hap is None:
-                H_slice = self.haplotypes[v_idx, :, :]
-            else:
-                hap_idx = self._geno2hap[v_idx]
-                H_slice = self.haplotypes[hap_idx, :, :]
-  
-            if self.on_the_fly_impute:
-                H_block = H_slice.compute() if hasattr(H_slice, "compute") else np.asarray(H_slice)
-                H = self._interpolate_block(H_block)
-            else:
-                H = H_slice.compute() if hasattr(H_slice, "compute") else np.asarray(H_slice)
+            H = self._fetch_hap_block(v_idx)
             return p, G, v_idx, H, ids, group_id
+        else:
+            raise ValueError(f"Unexpected batch structure from base generator: len={len(batch)}")
 
     @background(max_prefetch=6)
     def generate_data(self, chrom=None, verbose=False):
+        """Delegate grouping decision to the base generator; append haplotypes accordingly."""
         for batch in super().generate_data(chrom=chrom, verbose=verbose):
             yield self._postprocess_batch(batch)
 
