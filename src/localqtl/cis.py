@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import pandas as pd
+from scipy import stats
 from typing import Optional, Tuple, List
 
 from .haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
@@ -96,30 +97,36 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
     out_rows = []
     group_mode = getattr(ig, "group_s", None) is not None
     for batch in ig.generate_data():
-        if not group_mode:
-            if len(batch) == 4:
-                p, G_block, v_idx, pid = batch
-                H_block = None
-                P_list, id_list = [p], [pid]
-            elif len(batch) == 5:
+        H_block, grouped = None, False
+        if len(batch) == 4:
+            p, G_block, v_idx, pid = batch
+            P_list, id_list = [p], [pid]
+        elif len(batch) == 5:
+            if isinstance(batch[3], (list, tuple, np.ndarray, pd.Index)):
+                P, G_block, v_idx, H_block, pid = batch
+                grouped = True
+                if isinstance(P, (list, tuple)):
+                    P_list = list(P)
+                else:
+                    P = np.asarray(P)
+                    P_list = [P[i, :] for i in range(P.shape[0])] if P.ndim == 2 else [P]
+                id_list = list(ids)
+            else:
                 p, G_block, v_idx, H_block, pid = batch
                 P_list, id_list = [p], [pid]
-            else:
-                raise ValueError(f"Unexpected ungrouped batch shape: len={len(batch)}")
-        else: # grouped
-            if len(batch) == 5:
-                P, G_block, v_idx, ids, _group_id = batch
-                H_block = None
-            elif len(batch) == 6:
-                P, G_block, v_idx, H_block, ids, _group_id = batch
-            else:
-                raise ValueError(f"Unexpected grouped batch shape: len={len(batch)}")
+
+        elif len(batch) == 6:
+            P, G_block, v_idx, H_block, ids, _group_id = batch
+            grouped = True
             if isinstance(P, (list, tuple)):
                 P_list = list(P)
             else:
                 P = np.asarray(P)
                 P_list = [P[i, :] for i in range(P.shape[0])] if P.ndim == 2 else [P]
             id_list = list(ids)
+            
+        else:
+            raise ValueError(f"Unexpected batch length: len={len(batch)}")
 
         # Tensors
         G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
@@ -151,13 +158,10 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
  
         # Residualize in one call; returns y as list in group mode
         y_resid, G_resid, H_resid = _residualize_batch(
-            P_list if group_mode else P_list[0], G_t, H_t, rez, center=True,
-            group=group_mode
+            P_list if grouped else P_list[0], G_t, H_t, rez, center=True,
+            group=grouped
         )
-        if not group_mode:
-            y_iter = [(y_resid, id_list[0])]
-        else:
-            y_iter = list(zip(y_resid, id_list))
+        y_iter = list(zip(y_resid, id_list)) if grouped else [(y_resid, id_list[0])]
 
         # Variant metadata for this window
         var_ids = variant_df.index.values[v_idx]
@@ -264,7 +268,7 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
 
         # Run batched regression with permutations
         betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
-            y=y_t, G=G_t, H=H_t, y_perm=y_perm, device=device
+            y=y_t, G=G_t, H=H_t, y_perm=y_perm, k_eff=k_eff, device=device
         )
 
         # Choose top variant by partial R^2 for genotype predictor
@@ -417,7 +421,7 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
             y_perm = torch.stack([y_t[idx] for idx in perms], dim=1)  # (n x nperm)
 
             betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
-                y=y_t, G=G_resid, H=H_resid, y_perm=y_perm, device=device
+                y=y_t, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
             )
             # nominal partial R² for genotype predictor
             t_g = tstats[:, 0]
