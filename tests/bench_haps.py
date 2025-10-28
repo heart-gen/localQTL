@@ -37,15 +37,9 @@ from localqtl.cis import CisMapper, map_nominal
 
 
 def make_synthetic_data(
-    m_variants: int,
-    n_samples: int,
-    n_pheno: int,
-    n_covars: int,
-    chrom: str = "1",
-    region_start: int = 1_000_000,
-    region_step: int = 50,
-    window: int = 2_000_000,
-    seed: int = 1337,
+        m_variants: int, n_samples: int, n_pheno: int, n_covars: int,
+        chrom: str = "1", region_start: int = 1_000_000, region_step: int = 50,
+        window: int = 2_000_000, seed: int = 1337,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, int]:
     """
     Create synthetic genotype/phenotype/covariate data. Every phenotype's cis-window covers all variants.
@@ -91,11 +85,8 @@ def make_synthetic_data(
 
 
 def make_synthetic_haplotypes(
-    m_variants: int,
-    n_samples: int,
-    n_ancestries: int,
-    seed: int = 1337,
-    frac_missing: float = 0.02,
+        m_variants: int, n_samples: int, n_ancestries: int, seed: int = 1337,
+        frac_missing: float = 0.02,
 ) -> np.ndarray:
     """
     Create one-hot local ancestry calls per (variant, sample) over K ancestries.
@@ -179,34 +170,20 @@ def main():
             for k in anc_list:
                 print(f"\n=== Bench HAPS: m={m} variants, p={p} phenotypes, K={k} ancestries ===")
                 geno, var_df, pheno, pheno_pos, covs, window = make_synthetic_data(
-                    m_variants=m,
-                    n_samples=args.samples,
-                    n_pheno=p,
-                    n_covars=args.covars,
-                    window=2_000_000,
-                    seed=42,
+                    m_variants=m, n_samples=args.samples, n_pheno=p,
+                    n_covars=args.covars, window=2_000_000, seed=42,
                 )
                 H = make_synthetic_haplotypes(
-                    m_variants=m,
-                    n_samples=args.samples,
-                    n_ancestries=k,
-                    seed=1234,
-                    frac_missing=0.02,
+                    m_variants=m, n_samples=args.samples, n_ancestries=k,
+                    seed=1234, frac_missing=0.02,
                 )
 
                 # Functional API
                 t0 = time.perf_counter()
                 df_func = map_nominal(
-                    genotype_df=geno,
-                    variant_df=var_df,
-                    phenotype_df=pheno,
-                    phenotype_pos_df=pheno_pos,
-                    covariates_df=covs,
-                    haplotypes=H,          # direct, per updated cis.py
-                    loci_df=None,          # synthetic H already aligned to variant order
-                    maf_threshold=args.maf,
-                    window=window,
-                    nperm=None,
+                    genotype_df=geno, variant_df=var_df, phenotype_df=pheno,
+                    phenotype_pos_df=pheno_pos, covariates_df=covs, haplotypes=H,
+                    loci_df=None, maf_threshold=args.maf, window=window, nperm=None,
                     device=device,
                 )
                 t_func = time.perf_counter() - t0
@@ -214,16 +191,9 @@ def main():
 
                 # OO API
                 mapper = CisMapper(
-                    genotype_df=geno,
-                    variant_df=var_df,
-                    phenotype_df=pheno,
-                    phenotype_pos_df=pheno_pos,
-                    covariates_df=covs,
-                    haplotypes=H,
-                    loci_df=None,
-                    device=device,
-                    window=window,
-                    maf_threshold=args.maf,
+                    genotype_df=geno, variant_df=var_df, phenotype_df=pheno,
+                    phenotype_pos_df=pheno_pos, covariates_df=covs, haplotypes=H,
+                    loci_df=None, device=device, window=window, maf_threshold=args.maf,
                 )
                 t0 = time.perf_counter()
                 df_class = mapper.map_nominal()
@@ -242,13 +212,9 @@ def main():
 
                 records.append(
                     dict(
-                        variants=m,
-                        phenotypes=p,
-                        ancestries=k,
-                        samples=args.samples,
-                        covars=args.covars,
-                        maf=args.maf,
-                        device=device,
+                        variants=m, phenotypes=p, ancestries=k,
+                        samples=args.samples, covars=args.covars,
+                        maf=args.maf, device=device,
                         time_map_cis_nominal_sec=t_func,
                         time_simple_mapper_sec=cls_time,
                         rows_func=len(df_func),
