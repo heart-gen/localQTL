@@ -1,3 +1,5 @@
+## Adapted from tensorqtl
+## https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/core.py
 import torch
 
 def impute_mean_and_filter(
