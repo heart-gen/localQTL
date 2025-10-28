@@ -9,18 +9,7 @@ from .regression_kernels import (
     run_batch_regression_with_permutations
 )
 from .stats import beta_approx_pval
-
-def _impute_and_filter(G_t: torch.Tensor):
-    """Mean-impute per variant (treat -9 or non-finite as missing) and drop monomorphic variants."""
-    miss = (~torch.isfinite(G_t)) | (G_t == -9)
-    if miss.any():
-        num = torch.where(miss, torch.zeros_like(G_t), G_t).sum(dim=1, keepdim=True)
-        den = (~miss).sum(dim=1, keepdim=True).clamp_min(1)
-        row_mean = num / den
-        G_t = torch.where(miss, row_mean, G_t)
-    keep = G_t.var(dim=1, unbiased=False) > 0
-    return G_t, keep
-
+from .preproc import impute_mean_and_filter, allele_stats, filter_by_maf
 
 def _residualize_matrix_with_covariates(
         Y: torch.Tensor, C: Optional[pd.DataFrame], device: str
@@ -96,7 +85,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device):
             H_t = H_t[:, :, :-1]  # drop last ancestry to avoid collinearity
 
         # Mean-impute and drop monomorphic BEFORE residualization; update indices/H accordingly
-        G_t, keep_mask = _impute_and_filter(G_t)
+        G_t, keep_mask, _ = impute_mean_and_filter(G_t)
         if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
             continue  # no valid variants
         if keep_mask.shape[0] != G_t.shape[0]:  # safety
@@ -107,11 +96,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device):
             H_t = H_t[keep_mask]
 
         # Allele frequency & minor-allele stats from RAW (imputed) G
-        n_samp = y_t.shape[0]
-        sum_g_over_05 = torch.where(G_t > 0.5, G_t, torch.zeros_like(G_t)).sum(dim=1)
-        af_t = (G_t.sum(dim=1) / (2.0 * n_samp))
-        ma_samples_t = torch.where(af_t <= 0.5, (G_t > 0.5).sum(dim=1), (G_t < 1.5).sum(dim=1)).to(torch.int32)
-        ma_count_t = torch.where(af_t <= 0.5, sum_g_over_05, 2 * n_samp - sum_g_over_05)
+        af_t, ma_samples_t, ma_count_t = allele_stats(G_t, ploidy=2)
  
         # Residualize this batch (makes y/G/H orthogonal to covariates)
         y_t, G_t, H_t = _residualize_batch(y_t, G_t, H_t, rez, center=True)
@@ -192,7 +177,7 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
         H_t = torch.tensor(H_block, dtype=torch.float32, device=device) if H_block is not None else None
 
         # Impute/filter
-        G_t, keep_mask = _impute_and_filter(G_t)
+        G_t, keep_mask, _ = impute_mean_and_filter(G_t)
         if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
             continue
         keep_np = keep_mask.detach().cpu().numpy()
@@ -201,11 +186,7 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
             H_t = H_t[keep_mask]
 
         # Minor-allele stats before residualization
-        n_samp = y_t.shape[0]
-        sum_g_over_05 = torch.where(G_t > 0.5, G_t, torch.zeros_like(G_t)).sum(dim=1)
-        af_t = (G_t.sum(dim=1) / (2.0 * n_samp))
-        ma_samples_t = torch.where(af_t <= 0.5, (G_t > 0.5).sum(dim=1), (G_t < 1.5).sum(dim=1)).to(torch.int32)
-        ma_count_t = torch.where(af_t <= 0.5, sum_g_over_05, 2 * n_samp - sum_g_over_05)
+        af_t, ma_samples_t, ma_count_t = allele_stats(G_t, ploidy=2)
 
         # Residualize y/G/H against covariates
         y_t, G_t, H_t = _residualize_batch(y_t, G_t, H_t, rez, center=True)
