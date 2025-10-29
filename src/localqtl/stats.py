@@ -61,56 +61,61 @@ def get_t_pval(t, df, two_tailed: bool = True, log10: bool = False):
         return p
 
 
+def t_two_sided_pval_torch(t_abs: torch.Tensor, dof: int | torch.Tensor) -> torch.Tensor:
+    """
+    Two-sided p-value for t-statistics using regularized incomplete beta:
+        p = I_{ν/(ν + t^2)}(ν/2, 1/2)
+    Works fully on GPU. Falls back to CPU/NumPy if torch.special.betainc is unavailable.
+    """
+    # Ensure tensors with good precision on the same device as t_abs
+    dev = t_abs.device
+    dtype_work = torch.float64
+    t2  = t_abs.to(dtype_work)**2
+    nu  = (torch.as_tensor(dof, device=dev, dtype=dtype_work)
+           .expand_as(t_abs.to(dtype_work)))
+    x   = (nu / (nu + t2)).clamp(0.0, 1.0)            # ν/(ν+t^2)
+    a   = 0.5 * nu                                    # ν/2
+    b   = torch.full_like(a, 0.5)                     # 1/2
+
+    try:
+        p = torch.special.betainc(a, b, x)            # regularized I_x(a,b)
+        return p.to(t_abs.dtype)
+    except Exception: # Fallback (CPU)
+        p_np = get_t_pval(t_abs.detach().cpu().numpy(), dof=int(nu.flatten()[0].item()), log=False)
+        return torch.as_tensor(p_np, device=dev, dtype=t_abs.dtype)
+
+
 def nominal_pvals_tensorqtl(
         y_t: torch.Tensor, G_resid: torch.Tensor, H_resid: torch.Tensor | None,
-        k_eff: int, tstats: torch.Tensor | None = None, use_torch_cdf: bool = True,
-        return_t: bool = False,
+        k_eff: int, tstats: torch.Tensor,
 ):
     """
-    Compute tensorQTL-style nominal p-values per variant for a single phenotype window.
-
-    - If H_resid is None: use correlation-based t (t = r * sqrt(dof / (1 - r^2)),
-      dof = n - k_eff - 2).
-    - Else: use OLS t-stat for genotype coefficient (col 0) with
-      dof = n - k_eff - p, where p = 1 + (K-1).
-
-    Returns:
-      pvals_torch (m,), optionally t_used (m,) and dof (int).
+    TensorQTL-style nominal p-values.
+    - If H is None: use correlation route (dof = n - k_eff - 2) to match tensorQTL.
+    - Else: use the genotype-column t-stat (column 0) with dof = n - k_eff - p.
+    Returns (pvals, dof_used)
     """
-    assert y_t.ndim == 1, "y_t must be (n,)"
-    assert G_resid.ndim == 2, "G_resid must be (m, n)"
-
     n = y_t.shape[0]
-    device = y_t.device
+    dev = y_t.device
+    dt  = y_t.dtype
 
     if H_resid is None:
-        # correlation-based
-        # center (rez.transform(center=True) should already do it, but be defensive)
+        # correlation-based t -> p (tensorQTL uses n - k_eff - 2)
+        dof_used = max(n - int(k_eff) - 2, 1)
         y_c = y_t - y_t.mean()
         G_c = G_resid - G_resid.mean(dim=1, keepdim=True)
-
-        # r per variant
-        num = torch.mv(G_c, y_c)
-        den = (torch.linalg.norm(G_c, dim=1) * torch.linalg.norm(y_c)).clamp_min(1e-12)
-        r = num / den
-        r2 = (r * r).clamp(max=1 - 1e-12)
-
-        dof = max(int(n) - int(k_eff) - 2, 1)
-        t_used = r * torch.sqrt(torch.tensor(dof, dtype=r.dtype, device=device) / (1.0 - r2))
+        num = torch.mv(G_c, y_c)                                   # (m,)
+        den = (G_c.norm(dim=1) * y_c.norm()).clamp_min(1e-30)
+        r   = (num / den).clamp(-1.0 + 1e-12, 1.0 - 1e-12)
+        r2  = r * r
+        t_abs = (r.abs() * torch.sqrt(torch.tensor(dof_used, device=dev, dtype=dt)
+                                      / (1.0 - r2))).to(dt)
+        pvals = t_two_sided_pval_torch(t_abs.abs(), dof_used)
+        return pvals, dof_used
     else:
-        # multi-predictor: use OLS t for genotype coeff (col 0)
-        assert tstats is not None and tstats.ndim == 2 and tstats.shape[1] >= 1, \
-            "tstats (m, p) with genotype in col 0 is required when H_resid is not None"
-        p_pred = 1 + H_resid.shape[2]  # genotype + (K-1)
-        dof = max(int(n) - int(k_eff) - int(p_pred), 1)
-        t_used = tstats[:, 0]
-
-    if use_torch_cdf:
-        # two-sided p = 2 * CDF_t(-|t|)
-        dist = torch.distributions.StudentT(df=float(dof))
-        pvals = 2.0 * dist.cdf(-t_used.abs())
-    else:
-        pvals_np = get_t_pval(t_used.detach().cpu().numpy(), dof, log=False)
-        pvals = torch.from_numpy(np.asarray(pvals_np)).to(device=device, dtype=t_used.dtype)
-
-    return (pvals, t_used, dof) if return_t else (pvals, dof)
+        # multi-predictor: use genotype t-stat (column 0)
+        p_pred = 1 + H_resid.shape[2]
+        dof_used = max(n - int(k_eff) - int(p_pred), 1)
+        t_abs = tstats[:, 0].abs()
+        pvals = t_two_sided_pval_torch(t_abs, dof_used)
+        return pvals, dof_used
