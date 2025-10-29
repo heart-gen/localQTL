@@ -640,6 +640,19 @@ class CisMapper:
         self.window = window
         self.maf_threshold = maf_threshold
 
+        if haplotypes is not None:
+            self.ig = InputGeneratorCisWithHaps(
+                genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+                phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes,
+                loci_df=loci_df, group_s=group_s,
+            )
+        else:
+            self.ig = InputGeneratorCis(
+                genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+                phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s,
+            )
+
+        # Header
         if self.logger:
             k = getattr(self.ig, "n_groups", None)
             self.logger.write("CisMapper initialized")
@@ -653,18 +666,6 @@ class CisMapper:
                 self.logger.write(f"  * MAF filter: {self.maf_threshold:g}")
             if hasattr(self.ig, "haplotypes") and self.ig.haplotypes is not None:
                 self.logger.write(f"  * local ancestry channels (K={int(self.ig.haplotypes.shape[2])})")
-
-        if haplotypes is not None:
-            self.ig = InputGeneratorCisWithHaps(
-                genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
-                phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes,
-                loci_df=loci_df, group_s=group_s,
-            )
-        else:
-            self.ig = InputGeneratorCis(
-                genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
-                phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s,
-            )
 
         # Residualize all phenotypes once and store
         Y = torch.tensor(self.ig.phenotype_df.values, dtype=torch.float32, device=self.device)
