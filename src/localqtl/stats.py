@@ -70,6 +70,13 @@ def t_two_sided_pval_torch(t_abs: torch.Tensor, dof: int | torch.Tensor) -> torc
     # Ensure tensors with good precision on the same device as t_abs
     dev = t_abs.device
     dtype_work = torch.float64
+
+    # Normalize df into a tensor on the same device
+    if torch.is_tensor(df):
+        nu = df.to(device=dev, dtype=dtype_work).expand_as(t_abs.to(dtype_work))
+    else:
+        nu = torch.as_tensor(df, device=dev, dtype=dtype_work).expand_as(t_abs.to(dtype_work))
+
     t2  = t_abs.to(dtype_work)**2
     nu  = (torch.as_tensor(dof, device=dev, dtype=dtype_work)
            .expand_as(t_abs.to(dtype_work)))
@@ -81,7 +88,7 @@ def t_two_sided_pval_torch(t_abs: torch.Tensor, dof: int | torch.Tensor) -> torc
         p = torch.special.betainc(a, b, x)            # regularized I_x(a,b)
         return p.to(t_abs.dtype)
     except Exception: # Fallback (CPU)
-        p_np = get_t_pval(t_abs.detach().cpu().numpy(), dof=int(nu.flatten()[0].item()), log=False)
+        p_np = get_t_pval(t_abs.detach().cpu().numpy(), int(nu.flatten()[0].item()), log=False)
         return torch.as_tensor(p_np, device=dev, dtype=t_abs.dtype)
 
 
