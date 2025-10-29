@@ -758,7 +758,7 @@ def _run_independent_core_group(
         ig, variant_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame],
         seed_by_group_df: pd.DataFrame, signif_threshold: float, nperm: int,
         device: str, maf_threshold: float = 0.0, random_tiebreak: bool = False,
-        missing: float = -9.0, beta_approx: bool = True,
+        logp: bool = False, missing: float = -9.0, beta_approx: bool = True,
 ) -> pd.DataFrame:
     """Forward–backward independent mapping for grouped phenotypes."""
     out_rows = []
@@ -1181,9 +1181,7 @@ def map_independent(
     signif_df = cis_df[cis_df[fdr_col] <= fdr].copy()
     if signif_df.empty:
         raise ValueError(f"No significant phenotypes at FDR ≤ {fdr} in cis_df[{fdr_col}].")
-    
     signif_threshold = float(np.nanmax(signif_df["pval_beta"].values))
-    mt = self.maf_threshold if maf_threshold is None else maf_threshold
 
     # Header (tensorQTL-style)
     logger.write("cis-QTL mapping: conditionally independent variants")
@@ -1201,16 +1199,17 @@ def map_independent(
         K = int(haplotypes.shape[2])
         logger.write(f"  * including local ancestry channels (K={K})")
 
-    # Build the appropriate input generator (no residualization)
+    # Build the appropriate input generator (no residualization up front)
     ig = (
         InputGeneratorCisWithHaps(
             genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
             phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes,
-            loci_df=loci_df, group_s=group_s) if haplotypes is not None else
+            loci_df=loci_df, group_s=group_s)
+        if haplotypes is not None else
         InputGeneratorCis(
             genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
             phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s)
-    )    
+    )
     if ig.n_phenotypes == 0:
         raise ValueError("No valid phenotypes after generator preprocessing.")
 
