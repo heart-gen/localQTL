@@ -1311,9 +1311,57 @@ class CisMapper:
             return core(self.ig, self.variant_df, self.rez, nperm=nperm, device=self.device,
                         beta_approx=beta_approx, maf_threshold=mt)
 
-    def map_independent(self, cis_df, fdr=0.05):
-        """Forward–backward conditional mapping"""
-        pass
+    def map_independent(self, cis_df: pd.DataFrame, fdr: float = 0.05,
+                        fdr_col: str = "qval", nperm: int = 10_000, 
+                        maf_threshold: float | None = None,
+                        random_tiebreak: bool = False, seed: int | None = None,
+                        logp: bool = False, missing_val: float = -9.0) -> pd.DataFrame:
+        """
+        Forward–backward conditional cis-QTLs, seeded from FDR-significant rows in `cis_df`.
+        """
+        if fdr_col not in cis_df.columns:
+            raise ValueError(f"cis_df is missing column '{fdr_col}' (q-values).")
+        if "pval_beta" not in cis_df.columns:
+            raise ValueError("cis_df must contain 'pval_beta' to set the forward/backward threshold.")
+
+        signif_df = cis_df.loc[cis_df[fdr_col] <= fdr].copy()
+        if signif_df.empty:
+            raise ValueError(f"No significant phenotypes at FDR ≤ {fdr} in cis_df[{fdr_col}].")
+
+        signif_threshold = float(np.nanmax(signif_df["pval_beta"].values))
+        mt = self.maf_threshold if maf_threshold is None else maf_threshold
+
+        if seed is not None:
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+
+        # Rebuild a generator on RAW phenotypes (we’ll add dosages into the residualizer as we go)
+        if getattr(self.ig, "haplotypes", None) is not None:
+            ig_raw = InputGeneratorCisWithHaps(
+                genotype_df=self.ig.genotype_df, variant_df=self.variant_df,
+                phenotype_df=self.phenotype_df_raw, phenotype_pos_df=self.ig.phenotype_pos_df,
+                window=self.window, haplotypes=self.ig.haplotypes, 
+                loci_df=getattr(self.ig, "loci_df", None),
+                group_s=getattr(self.ig, "group_s", None),
+            )
+        else:
+            ig_raw = InputGeneratorCis(
+                genotype_df=self.ig.genotype_df, variant_df=self.variant_df,
+                phenotype_df=self.phenotype_df_raw, phenotype_pos_df=self.ig.phenotype_pos_df,
+                window=self.window, group_s=getattr(self.ig, "group_s", None),
+            )
+
+        if getattr(ig_raw, "group_s", None) is not None:
+            raise NotImplementedError("Grouped map_independent not yet implemented.")
+
+        sync = (torch.cuda.synchronize if self.device == "cuda" else None)
+        with self.logger.time_block("Computing associations (independent: forward–backward)", sync=sync):
+            return _run_independent_core(
+                ig=ig_raw, variant_df=self.variant_df, device=self.device, signif_df=signif_df, 
+                signif_threshold=signif_threshold, nperm=nperm, maf_threshold=mt, 
+                random_tiebreak=random_tiebreak, logp=logp, missing_val=missing_val,
+                build_rez_aug=self._build_residualizer_aug, sample_order=self.sample_order,
+            )
 
     def _build_residualizer_aug(self, extra_cols: list[np.ndarray]) -> Residualizer:
         """
