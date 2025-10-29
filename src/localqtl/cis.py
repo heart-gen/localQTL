@@ -507,26 +507,13 @@ def map_nominal(
     """
     device = device if device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
     logger = logger or SimpleLogger(verbose=verbose, timestamps=True)
-    
-    # Build the appropriate input generator
-    if haplotypes is not None:
-        ig = InputGeneratorCisWithHaps(
-            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
-            phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes,
-            loci_df=loci_df, group_s=group_s,
-        )
-    else:
-        ig = InputGeneratorCis(
-            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
-            phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s
-        )
+    sync = (torch.cuda.synchronize if device == "cuda" else None)
 
     # Header (tensorQTL-style)
     logger.write("cis-QTL mapping: nominal associations for all variant–phenotype pairs")
     logger.write(f"  * device: {device}")
     logger.write(f"  * {phenotype_df.shape[1]} samples")
-    logger.write(f"  * {phenotype_df.shape[0]} phenotypes"
-                 + (f" (grouped into {ig.n_groups} groups)" if getattr(ig, 'n_groups', None) else ""))
+    logger.write(f"  * {phenotype_df.shape[0]} phenotypes")
     logger.write(f"  * {variant_df.shape[0]} variants")
     logger.write(f"  * cis-window: \u00B1{window:,}")
     if maf_threshold and maf_threshold > 0:
@@ -539,17 +526,29 @@ def map_nominal(
     if nperm is not None:
         logger.write(f"  * computing tensorQTL-style nominal p-values and {nperm:,} permutations")
 
-    # Residualize all phenotypes once (features x samples)
-    Y = torch.tensor(ig.phenotype_df.values, dtype=torch.float32, device=device)
-    Y_resid, rez = _residualize_matrix_with_covariates(Y, covariates_df, device)
-
-    # Put residuals back so the generator yields the same ordering/IDs
+    # Residualize once
+    Y = torch.tensor(phenotype_df.values, dtype=torch.float32, device=device)
+    with logger.time_block("Residualizing phenotypes", sync=sync):
+        Y_resid, rez = _residualize_matrix_with_covariates(Y, covariates_df, device)
+        
+    # Build the appropriate input generator
+    ig = (
+        InputGeneratorCisWithHaps(
+            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+            phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes,
+            loci_df=loci_df, group_s=group_s) if haplotypes is not None else
+        InputGeneratorCis(
+            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+            phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s)
+    )
     ig.phenotype_df = pd.DataFrame(
         Y_resid.cpu().numpy(), index=ig.phenotype_df.index, columns=ig.phenotype_df.columns
     )
-    
-    return _run_nominal_core(ig, variant_df, rez, nperm, device,
-                             maf_threshold=maf_threshold)
+
+    # Core compute
+    with logger.time_block("Computing associations (nominal)", sync=sync):
+        return _run_nominal_core(ig, variant_df, rez, nperm, device,
+                                 maf_threshold=maf_threshold)
 
 
 def map_permutations(
@@ -567,26 +566,13 @@ def map_permutations(
     """
     device = device if device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
     logger = logger or SimpleLogger(verbose=verbose, timestamps=True)
-    
-    # Build the appropriate input generator
-    if haplotypes is not None:
-        ig = InputGeneratorCisWithHaps(
-            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
-            phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes, loci_df=loci_df,
-            group_s=group_s,
-        )
-    else:
-        ig = InputGeneratorCis(
-            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
-            phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s,
-        )
+    sync = (torch.cuda.synchronize if device == "cuda" else None)
 
     # Header (tensorQTL-style)
     logger.write("cis-QTL mapping: permutation scan (top per phenotype)")
     logger.write(f"  * device: {device}")
     logger.write(f"  * {phenotype_df.shape[1]} samples")
-    logger.write(f"  * {phenotype_df.shape[0]} phenotypes"
-                 + (f" (grouped into {ig.n_groups} groups)" if getattr(ig, 'n_groups', None) else ""))
+    logger.write(f"  * {phenotype_df.shape[0]} phenotypes")
     logger.write(f"  * {variant_df.shape[0]} variants")
     logger.write(f"  * cis-window: \u00B1{window:,}")
     logger.write(f"  * nperm={nperm:,} (beta_approx={'on' if beta_approx else 'off'})")
@@ -599,22 +585,31 @@ def map_permutations(
         logger.write(f"  * including local ancestry channels (K={K})")
 
     # Residualize phenotypes once
-    Y = torch.tensor(ig.phenotype_df.values, dtype=torch.float32, device=device)
-    Y_resid, rez = _residualize_matrix_with_covariates(Y, covariates_df, device)
+    Y = torch.tensor(phenotype_df.values, dtype=torch.float32, device=device)
+    with logger.time_block("Residualizing phenotypes", sync=sync):
+        Y_resid, rez = _residualize_matrix_with_covariates(Y, covariates_df, device)
+
+    # Build the appropriate input generator
+    ig = (
+        InputGeneratorCisWithHaps(
+            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+            phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes,
+            loci_df=loci_df, group_s=group_s) if haplotypes is not None else
+        InputGeneratorCis(
+            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+            phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s)
+    )
+    ig.phenotype_df = pd.DataFrame(
+        Y_resid.cpu().numpy(), index=ig.phenotype_df.index, columns=ig.phenotype_df.columns
+    )
     ig.phenotype_df = pd.DataFrame(Y_resid.cpu().numpy(), index=ig.phenotype_df.index,
                                    columns=ig.phenotype_df.columns)
 
-    # Route to grouped or single-phenotype core
-    if getattr(ig, "group_s", None) is not None:
-        return _run_permutation_core_group(
-            ig, variant_df, rez, nperm=nperm, device=device,
-            beta_approx=beta_approx, maf_threshold=maf_threshold
-        )
-    else:
-        return _run_permutation_core(
-            ig, variant_df, rez, nperm=nperm, device=device,
-            beta_approx=beta_approx, maf_threshold=maf_threshold
-        )
+    # Core either grouped or single-phenotype
+    with logger.time_block("Computing associations (permutations)", sync=sync):
+        core = _run_permutation_core_group if getattr(ig, "group_s", None) is not None else _run_permutation_core
+        return core(ig, variant_df, rez, nperm=nperm, device=device,
+                    beta_approx=beta_approx, maf_threshold=maf_threshold)
 
 
 class CisMapper:
@@ -635,66 +630,56 @@ class CisMapper:
         self.device = ("cuda" if (device == "auto" and torch.cuda.is_available()) else
                        device if device in ("cuda", "cpu") else "cpu")
         self.logger = logger or SimpleLogger(verbose=verbose, timestamps=True)
-        self.verbose = verbose
         self.variant_df = variant_df
         self.window = window
         self.maf_threshold = maf_threshold
-
-        if haplotypes is not None:
-            self.ig = InputGeneratorCisWithHaps(
+        
+        self.ig = (
+            InputGeneratorCisWithHaps(
                 genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
                 phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes,
-                loci_df=loci_df, group_s=group_s,
-            )
-        else:
-            self.ig = InputGeneratorCis(
+                loci_df=loci_df, group_s=group_s) if haplotypes is not None else
+            InputGeneratorCis(
                 genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
-                phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s,
-            )
+                phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s)
+        )
+        # Residualize phenotypes once
+        Y = torch.tensor(self.ig.phenotype_df.values, dtype=torch.float32, device=self.device)
+        sync = (torch.cuda.synchronize if self.device == "cuda" else None)
+        with self.logger.time_block("Residualizing phenotypes", sync=sync):
+            Y_resid, self.rez = _residualize_matrix_with_covariates(Y, covariates_df, self.device)
+        self.ig.phenotype_df = pd.DataFrame(Y_resid.cpu().numpy(),
+                                            index=self.ig.phenotype_df.index,
+                                            columns=self.ig.phenotype_df.columns)
 
         # Header
-        if self.logger:
-            k = getattr(self.ig, "n_groups", None)
-            self.logger.write("CisMapper initialized")
-            self.logger.write(f"  * device: {self.device}")
-            self.logger.write(f"  * phenotypes: {self.ig.phenotype_df.shape[0]}"
-                              + (f" (groups: {k})" if k else ""))
-            self.logger.write(f"  * samples: {self.ig.phenotype_df.shape[1]}")
-            self.logger.write(f"  * variants: {self.variant_df.shape[0]}")
-            self.logger.write(f"  * cis-window: \u00B1{self.window:,}")
-            if self.maf_threshold and self.maf_threshold > 0:
-                self.logger.write(f"  * MAF filter: {self.maf_threshold:g}")
-            if hasattr(self.ig, "haplotypes") and self.ig.haplotypes is not None:
-                self.logger.write(f"  * local ancestry channels (K={int(self.ig.haplotypes.shape[2])})")
-
-        # Residualize all phenotypes once and store
-        Y = torch.tensor(self.ig.phenotype_df.values, dtype=torch.float32, device=self.device)
-        Y_resid, self.rez = _residualize_matrix_with_covariates(Y, covariates_df, self.device)
-        self.ig.phenotype_df = pd.DataFrame(
-            Y_resid.cpu().numpy(),
-            index=self.ig.phenotype_df.index,
-            columns=self.ig.phenotype_df.columns,
-        )
+        self.logger.write("CisMapper initialized")
+        self.logger.write(f"  * device: {self.device}")
+        self.logger.write(f"  * phenotypes: {self.ig.phenotype_df.shape[0]}")
+        self.logger.write(f"  * samples: {self.ig.phenotype_df.shape[1]}")
+        self.logger.write(f"  * variants: {self.variant_df.shape[0]}")
+        self.logger.write(f"  * cis-window: \u00B1{self.window:,}")
+        if self.maf_threshold and self.maf_threshold > 0:
+            self.logger.write(f"  * MAF filter: {self.maf_threshold:g}")
+        if hasattr(self.ig, "haplotypes") and self.ig.haplotypes is not None:
+            self.logger.write(f"  * local ancestry channels (K={int(self.ig.haplotypes.shape[2])})")
 
     def map_nominal(self, nperm: int | None = None, maf_threshold: float | None = None) -> pd.DataFrame:
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
-        return _run_nominal_core(self.ig, self.variant_df, self.rez, nperm,
-                                 self.device, maf_threshold=mt)
+        sync = (torch.cuda.synchronize if self.device == "cuda" else None)
+        with self.logger.time_block("Computing associations (nominal)", sync=sync):
+            return _run_nominal_core(self.ig, self.variant_df, self.rez, nperm,
+                                     self.device, maf_threshold=mt)
 
     def map_permutations(self, nperm: int=10_000, beta_approx: bool=True,
                          maf_threshold: float | None = None) -> pd.DataFrame:
         """Empirical cis-QTLs (top per phenotype) with permutation p-values."""
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
-        if getattr(self.ig, "group_s", None) is not None:
-            return _run_permutation_core_group(
-                self.ig, self.variant_df, self.rez, nperm=nperm, device=self.device,
-                beta_approx=beta_approx, maf_threshold=mt
-            )
-        else:
-            return _run_permutation_core(
-                self.ig, self.variant_df, self.rez, nperm=nperm, device=self.device,
-                beta_approx=beta_approx, maf_threshold=mt
-            )
+        sync = (torch.cuda.synchronize if self.device == "cuda" else None)
+        with self.logger.time_block("Computing associations (permutations)", sync=sync):
+            core = _run_permutation_core_group if getattr(self.ig, "group_s", None) is not None else _run_permutation_core
+            return core(self.ig, self.variant_df, self.rez, nperm=nperm, device=self.device,
+                        beta_approx=beta_approx, maf_threshold=mt)
 
     def map_independent(self, cis_df, fdr=0.05):
         """Forward–backward conditional mapping"""
