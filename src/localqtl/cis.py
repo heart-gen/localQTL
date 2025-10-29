@@ -566,7 +566,8 @@ def map_permutations(
     Returns a DataFrame with empirical p-values (and optional Beta approximation).
     """
     device = device if device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
-
+    logger = logger or SimpleLogger(verbose=verbose, timestamps=True)
+    
     # Build the appropriate input generator
     if haplotypes is not None:
         ig = InputGeneratorCisWithHaps(
@@ -579,6 +580,23 @@ def map_permutations(
             genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
             phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s,
         )
+
+    # Header (tensorQTL-style)
+    logger.write("cis-QTL mapping: permutation scan (top per phenotype)")
+    logger.write(f"  * device: {device}")
+    logger.write(f"  * {phenotype_df.shape[1]} samples")
+    logger.write(f"  * {phenotype_df.shape[0]} phenotypes"
+                 + (f" (grouped into {ig.n_groups} groups)" if getattr(ig, 'n_groups', None) else ""))
+    logger.write(f"  * {variant_df.shape[0]} variants")
+    logger.write(f"  * cis-window: \u00B1{window:,}")
+    logger.write(f"  * nperm={nperm:,} (beta_approx={'on' if beta_approx else 'off'})")
+    if maf_threshold and maf_threshold > 0:
+        logger.write(f"  * applying in-sample {maf_threshold:g} MAF filter")
+    if covariates_df is not None:
+        logger.write(f"  * {covariates_df.shape[1]} covariates")
+    if haplotypes is not None:
+        K = int(haplotypes.shape[2])
+        logger.write(f"  * including local ancestry channels (K={K})")
 
     # Residualize phenotypes once
     Y = torch.tensor(ig.phenotype_df.values, dtype=torch.float32, device=device)
@@ -612,9 +630,12 @@ class CisMapper:
             loci_df: Optional[pd.DataFrame] = None,
             device: str = "auto", window: int = 1_000_000,
             maf_threshold: float = 0.0,
+            logger: SimpleLogger | None = None, verbose: bool = True
     ):
         self.device = ("cuda" if (device == "auto" and torch.cuda.is_available()) else
                        device if device in ("cuda", "cpu") else "cpu")
+        self.logger = logger or SimpleLogger(verbose=verbose, timestamps=True)
+        self.verbose = verbose
         self.variant_df = variant_df
         self.window = window
         self.maf_threshold = maf_threshold
