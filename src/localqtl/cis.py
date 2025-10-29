@@ -522,18 +522,31 @@ def map_nominal(
         )
 
     # Header (tensorQTL-style)
-    
+    logger.write("cis-QTL mapping: nominal associations for all variant–phenotype pairs")
+    logger.write(f"  * device: {device}")
+    logger.write(f"  * {phenotype_df.shape[1]} samples")
+    logger.write(f"  * {phenotype_df.shape[0]} phenotypes"
+                 + (f" (grouped into {ig.n_groups} groups)" if getattr(ig, 'n_groups', None) else ""))
+    logger.write(f"  * {variant_df.shape[0]} variants")
+    logger.write(f"  * cis-window: \u00B1{window:,}")
+    if maf_threshold and maf_threshold > 0:
+        logger.write(f"  * applying in-sample {maf_threshold:g} MAF filter")
+    if covariates_df is not None:
+        logger.write(f"  * {covariates_df.shape[1]} covariates")
+    if haplotypes is not None:
+        K = int(haplotypes.shape[2])
+        logger.write(f"  * including local ancestry channels (K={K})")
+    if nperm is not None:
+        logger.write(f"  * computing tensorQTL-style nominal p-values and {nperm:,} permutations")
+
     # Residualize all phenotypes once (features x samples)
     Y = torch.tensor(ig.phenotype_df.values, dtype=torch.float32, device=device)
     Y_resid, rez = _residualize_matrix_with_covariates(Y, covariates_df, device)
 
     # Put residuals back so the generator yields the same ordering/IDs
-    phenotype_df_resid = pd.DataFrame(
-        Y_resid.cpu().numpy(),
-        index=ig.phenotype_df.index,
-        columns=ig.phenotype_df.columns,
+    ig.phenotype_df = pd.DataFrame(
+        Y_resid.cpu().numpy(), index=ig.phenotype_df.index, columns=ig.phenotype_df.columns
     )
-    ig.phenotype_df = phenotype_df_resid
     
     return _run_nominal_core(ig, variant_df, rez, nperm, device,
                              maf_threshold=maf_threshold)
