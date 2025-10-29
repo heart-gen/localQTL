@@ -1,47 +1,54 @@
-import sys
-from time import strftime
+## SimpleLogger adapted from tensorqtl:
+## https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/core.py
+from __future__ import annotations
+import sys, time
+from typing import Optional
+from datetime import datetime
+from contextlib import contextmanager
 
-class SimpleLogger(object):
-    """
-    Simple logger that writes timestamped messages to console and optionally to a file.
-    Supports context manager usage to ensure logfile is always closed.
-
-    Example
-    -------
-    with SimpleLogger("analysis.log") as logger:
-        logger.write("Starting cis-mapping")
-    """
-
-    def __init__(self, logfile: str = None, verbose: bool = True):
+class SimpleLogger:
+    def __init__(self, logfile: Optional[str] = None, verbose: bool = True,
+                 timestamps: bool = False, timefmt: str = "%Y-%m-%d %H:%M:%S"):
         self.console = sys.stdout
         self.verbose = verbose
         self.log = open(logfile, "w") if logfile else None
+        self.timestamps = timestamps
+        self.timefmt = timefmt
 
-    def _timestamp(self) -> str:
-        """Return current timestamp as string."""
-        return strftime("%Y-%m-%d %H:%M:%S")
+    def _stamp(self, msg: str) -> str:
+        if self.timestamps:
+            return f"[{datetime.now().strftime(self.timefmt)}] {msg}"
+        return msg
 
     def write(self, message: str):
-        """Write a timestamped message to console and logfile (if provided)."""
-        msg = f"[{self._timestamp()}] {message}"
+        line = self._stamp(message)
         if self.verbose:
-            self.console.write(msg + "\n")
+            self.console.write(line + "\n")
         if self.log is not None:
-            self.log.write(msg + "\n")
+            self.log.write(line + "\n")
             self.log.flush()
 
+    @contextmanager
+    def time_block(self, label: str):
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            dt = time.perf_counter() - t0
+            self.write(f"{label} done in {dt:.2f}s")
+
     def close(self):
-        """Close the logfile if open."""
-        if self.log is not None:
-            self.log.close()
-            self.log = None
+        if self.log:
+            try: self.log.close()
+            finally: self.log = None
 
-    # Context manager methods
-    def __enter__(self):
-        return self
+    def __enter__(self): return self
+    def __exit__(self, *exc): self.close()
 
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.close()
+
+class NullLogger(SimpleLogger):
+    def __init__(self): super().__init__(logfile=None, verbose=False)
+    def write(self, message: str): pass
 
 
 def gpu_available():

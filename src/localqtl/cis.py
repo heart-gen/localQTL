@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Tuple, List
 
+from .utils import SimpleLogger
 from .haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from .regression_kernels import (
     Residualizer,
@@ -493,10 +494,10 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
 def map_nominal(
         genotype_df: pd.DataFrame, variant_df: pd.DataFrame, phenotype_df: pd.DataFrame,
         phenotype_pos_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame] = None,
-        group_s: Optional[pd.Series] = None,
         haplotypes: Optional[object] = None, loci_df: Optional[pd.DataFrame] = None,
-        maf_threshold: float = 0.0, window: int = 1_000_000,
-        nperm: Optional[int] = None, device: str = "cuda",
+        group_s: Optional[pd.Series] = None, maf_threshold: float = 0.0,
+        window: int = 1_000_000, nperm: Optional[int] = None, device: str = "cuda",
+        logger: SimpleLogger | None = None, verbose: bool = True
 ) -> pd.DataFrame:
     """
     Nominal cis-QTL scan with optional permutations and local ancestry.
@@ -505,7 +506,8 @@ def map_nominal(
     same Residualizer (projection onto the orthogonal complement of C).
     """
     device = device if device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
-
+    logger = logger or SimpleLogger(verbose=verbose, timestamps=True)
+    
     # Build the appropriate input generator
     if haplotypes is not None:
         ig = InputGeneratorCisWithHaps(
@@ -519,6 +521,8 @@ def map_nominal(
             phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s
         )
 
+    # Header (tensorQTL-style)
+    
     # Residualize all phenotypes once (features x samples)
     Y = torch.tensor(ig.phenotype_df.values, dtype=torch.float32, device=device)
     Y_resid, rez = _residualize_matrix_with_covariates(Y, covariates_df, device)
@@ -538,10 +542,11 @@ def map_nominal(
 def map_permutations(
         genotype_df: pd.DataFrame, variant_df: pd.DataFrame, phenotype_df: pd.DataFrame,
         phenotype_pos_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame] = None,
-        group_s: Optional[pd.Series] = None,
         haplotypes: Optional[object] = None, loci_df: Optional[pd.DataFrame] = None,
-        maf_threshold: float = 0.0, window: int = 1_000_000, nperm: int = 10_000,
-        device: str = "cuda", beta_approx: bool = True
+        group_s: Optional[pd.Series] = None, maf_threshold: float = 0.0,
+        window: int = 1_000_000, nperm: int = 10_000,
+        device: str = "cuda", beta_approx: bool = True,
+        logger: SimpleLogger | None = None, verbose: bool = True
 ) -> pd.DataFrame:
     """
     Empirical cis-QTL mapping (one top variant per phenotype) with permutations.
