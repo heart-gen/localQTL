@@ -137,4 +137,4 @@ def nominal_pvals_tensorqtl(
         dof = max(n - int(k_eff) - p_pred, 1)
         t_g = tstats[:, 0].abs()
         pvals = t_two_sided_pval_torch(t_g, dof)
-        return pvals, dof_used
+        return pvals, dof
