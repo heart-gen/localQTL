@@ -262,10 +262,13 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
         # Residualize y/G/H against covariates
         y_t, G_t, H_t = _residualize_batch(y_t, G_t, H_t, rez, center=True)
 
+        # Compute effective covariate rank for DoF
+        k_eff = rez.Q_t.shape[1] if rez is not None else 0
+
         # Build permuted phenotypes (n x nperm)
         perms = [torch.randperm(y_t.shape[0], device=device) for _ in range(nperm)]
         y_perm = torch.stack([y_t[idx] for idx in perms], dim=1)
-
+        
         # Run batched regression with permutations
         betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
             y=y_t, G=G_t, H=H_t, y_perm=y_perm, k_eff=k_eff, device=device
@@ -410,6 +413,7 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
         dof = max(n - p_pred, 1)
         var_ids = variant_df.index.values[v_idx]
         var_pos = variant_df.iloc[v_idx]["pos"].values
+        k_eff = rez.Q_t.shape[1] if rez is not None else 0
 
         # Evaluate each phenotype: t-stats -> partial R²; keep the global best (variant, phenotype)
         best = dict(r2=-np.inf, ix_var=-1, ix_pheno=-1, beta=None, se=None, t=None)
