@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --partition=GPU-shared
-#SBATCH --job-name=bench_haps
+#SBATCH --job-name=bench_perm
 #SBATCH --mail-type=FAIL
 #SBATCH --mail-user=kj.benjamin90@gmail.com
 #SBATCH --gpus=v100-32:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=5
-#SBATCH --time=04:00:00
-#SBATCH --output=logs/bench_haps.%j.log
+#SBATCH --time=08:00:00
+#SBATCH --output=logs/bench_permutations.%j.log
 
 set -euo pipefail
 
@@ -19,14 +19,15 @@ log_message() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 VARIANTS="${VARIANTS:-2000,8000,20000}"
 PHENOTYPES="${PHENOTYPES:-50,200,500}"
 SAMPLES="${SAMPLES:-256}"
-ANCESTRIES="${SAMPLES:-2,3}"
+ANCESTRIES="${ANCESTRIES:-2,3}"
+NPERMS="${NPERMS:-200}"
 COVARS="${COVARS:-6}"
 DEVICE="${DEVICE:-auto}"     # auto|cpu|cuda
-CSV_OUT="${CSV_OUT:-bench_haps_results.${SLURM_JOB_ID}.csv}"
+CSV_OUT="${CSV_OUT:-bench_permutations_results.${SLURM_JOB_ID}.csv}"
 
 # Where your repo lives; default to submission dir
 WORKDIR="${WORKDIR:-$SLURM_SUBMIT_DIR}"
-SCRIPT_REL="./bench_haps.py"
+SCRIPT_REL="./bench_permutations.py"
 
 log_message "**** Job starts ****"
 
@@ -65,13 +66,14 @@ echo "PWD: $(pwd)"
 mkdir -p results
 
 log_message "**** Run benchmark ****"
-echo "Variants:   ${VARIANTS}"
-echo "Phenotypes: ${PHENOTYPES}"
-echo "Samples:    ${SAMPLES}"
-echo "Ancestries: ${ANCESTRIES}"
-echo "Covariates: ${COVARS}"
-echo "Device:     ${DEVICE}"
-echo "CSV out:    results/${CSV_OUT}"
+echo "Variants:     ${VARIANTS}"
+echo "Phenotypes:   ${PHENOTYPES}"
+echo "Samples:      ${SAMPLES}"
+echo "Ancestries:   ${ANCESTRIES}"
+echo "Permutations: ${NPERMS}"
+echo "Covariates:   ${COVARS}"
+echo "Device:       ${DEVICE}"
+echo "CSV out:      results/${CSV_OUT}"
 
 # Use /usr/bin/time for a walltime summary (separate from the script's own timing)
 { /usr/bin/time -f "WALLCLOCK %E  MEM %M KB" \
@@ -81,6 +83,7 @@ python "${SCRIPT_REL}" \
   --samples "${SAMPLES}" \
   --ancestries "${ANCESTRIES}" \
   --covars "${COVARS}" \
+  --nperm "${NPERMS}" \
   --device "${DEVICE}" \
   --csv "results/${CSV_OUT}"; } 2>&1 | tee -a "results/bench_console.${SLURM_JOB_ID}.log"
 

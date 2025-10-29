@@ -19,7 +19,7 @@ log_message() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 VARIANTS="${VARIANTS:-2000,8000,20000}"
 PHENOTYPES="${PHENOTYPES:-50,200,500}"
 SAMPLES="${SAMPLES:-256}"
-ANCESTRIES="${SAMPLES:-2,3}"
+ANCESTRIES="${ANCESTRIES:-2,3}"
 COVARS="${COVARS:-6}"
 DEVICE="${DEVICE:-auto}"     # auto|cpu|cuda
 CSV_OUT="${CSV_OUT:-bench_haps_results.${SLURM_JOB_ID}.csv}"
