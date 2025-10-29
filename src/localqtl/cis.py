@@ -4,6 +4,7 @@ import pandas as pd
 from typing import Optional, Tuple, List
 
 from .utils import SimpleLogger
+from .iosinks import ParquetSink
 from .haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from .regression_kernels import (
     Residualizer,
@@ -12,6 +13,23 @@ from .regression_kernels import (
 )
 from .stats import beta_approx_pval, get_t_pval, nominal_pvals_tensorqtl
 from .preproc import impute_mean_and_filter, allele_stats, filter_by_maf
+
+def _dosage_vector_for_covariate(genotype_df: pd.DataFrame, variant_id: str,
+                                 sample_order: pd.Index, missing: float | int | None) -> np.ndarray:
+    """Fetch a dosage row aligned to samples; impute 'missing' to mean of observed."""
+    if not genotype_df.columns.equals(sample_order):
+        row = genotype_df.loc[variant_id, sample_order].to_numpy(dtype=np.float32, copy=True)
+    else:
+        row = genotype_df.loc[variant_id].to_numpy(dtype=np.float32, copy=True)
+    if missing is not None:
+        mm = (row == missing)
+        if mm.any():
+            if (~mm).any():
+                row[mm] = row[~mm].mean(dtype=np.float32)
+            else:
+                row[mm] = 0.0
+    return row
+
 
 def _residualize_matrix_with_covariates(
         Y: torch.Tensor, C: Optional[pd.DataFrame], device: str
@@ -491,48 +509,23 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
     return pd.DataFrame(out_rows).reset_index(drop=True)
 
 
-def _dosage_vector_for_covariate(genotype_df: pd.DataFrame, variant_id: str,
-                                 sample_order: pd.Index, missing: float | int | None) -> np.ndarray:
-    """Fetch a dosage row aligned to samples; impute 'missing' to mean of observed."""
-    if not genotype_df.columns.equals(sample_order):
-        row = genotype_df.loc[variant_id, sample_order].to_numpy(dtype=np.float32, copy=True)
-    else:
-        row = genotype_df.loc[variant_id].to_numpy(dtype=np.float32, copy=True)
-    if missing is not None:
-        mm = (row == missing)
-        if mm.any():
-            if (~mm).any():
-                row[mm] = row[~mm].mean(dtype=np.float32)
-            else:
-                row[mm] = 0.0
-    return row
-
-
 def _run_independent_core(
-    ig, variant_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame],
-    signif_seed_df: pd.DataFrame,      # index: phenotype_id, includes seed row from cis_df
-    signif_threshold: float,           # max pval_beta among FDR-significant rows
-    nperm: int,
-    device: str,
-    maf_threshold: float = 0.0,
-    random_tiebreak: bool = False,
-    missing: float = -9.0,
-    beta_approx: bool = True,
+        ig, variant_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame],
+        signif_seed_df: pd.DataFrame, signif_threshold: float, nperm: int,
+        device: str, maf_threshold: float = 0.0, random_tiebreak: bool = False,
+        missing: float = -9.0, beta_approx: bool = True,
 ) -> pd.DataFrame:
     """Forward–backward independent mapping for ungrouped phenotypes."""
     out_rows = []
 
     # Basic alignment checks
     if covariates_df is not None and not covariates_df.index.equals(ig.phenotype_df.columns):
-        # align once; keep sample order used by the generator
         covariates_df = covariates_df.loc[ig.phenotype_df.columns]
 
     # Precompute variant index lookup for dosages
-    # (The generator already handles variant *rows*; here we only need full-sample dosages by variant_id)
     var_in_frame = set(variant_df.index)
 
     for batch in ig.generate_data():
-        # Accept: (p, G_block, v_idx, pid) or (p, G_block, v_idx, H, pid)
         if len(batch) == 4:
             p, G_block, v_idx, pid = batch
             H_block = None
@@ -575,7 +568,7 @@ def _run_independent_core(
         n = y_t.shape[0]
         perms = torch.stack([torch.randperm(n, device=device) for _ in range(nperm)], dim=0)  # (nperm, n)
 
-        # Forward pass -------------------------------------------------------
+        # Forward pass
         forward_rows = [seed_row.to_frame().T]  # initialize with seed from cis_df
         dosage_dict: dict[str, np.ndarray] = {}
         seed_vid = str(seed_row["variant_id"])
@@ -676,7 +669,7 @@ def _run_independent_core(
         forward_df = pd.concat(forward_rows, axis=0, ignore_index=True)
         forward_df["rank"] = np.arange(1, forward_df.shape[0] + 1, dtype=int)
 
-        # Backward pass ------------------------------------------------------
+        # Backward pass
         if forward_df.shape[0] > 1:
             kept_rows = []
             selected = forward_df["variant_id"].tolist()
@@ -762,17 +755,10 @@ def _run_independent_core(
 
 
 def _run_independent_core_group(
-    ig,
-    variant_df: pd.DataFrame,
-    covariates_df: Optional[pd.DataFrame],
-    seed_by_group_df: pd.DataFrame,    # one seed row per group_id (from cis_df), includes group_id
-    signif_threshold: float,
-    nperm: int,
-    device: str,
-    maf_threshold: float = 0.0,
-    random_tiebreak: bool = False,
-    missing: float = -9.0,
-    beta_approx: bool = True,
+        ig, variant_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame],
+        seed_by_group_df: pd.DataFrame, signif_threshold: float, nperm: int,
+        device: str, maf_threshold: float = 0.0, random_tiebreak: bool = False,
+        missing: float = -9.0, beta_approx: bool = True,
 ) -> pd.DataFrame:
     """Forward–backward independent mapping for grouped phenotypes."""
     out_rows = []
@@ -781,7 +767,6 @@ def _run_independent_core_group(
         covariates_df = covariates_df.loc[ig.phenotype_df.columns]
 
     for batch in ig.generate_data():
-        # (P, G, v_idx, ids, group_id) or +H
         if len(batch) == 5:
             P, G_block, v_idx, ids, group_id = batch
             H_block = None
@@ -1049,84 +1034,6 @@ def _run_independent_core_group(
     return pd.concat(out_rows, axis=0, ignore_index=True)
 
 
-def map_independent(
-    genotype_df: pd.DataFrame,
-    variant_df: pd.DataFrame,
-    cis_df: pd.DataFrame,
-    phenotype_df: pd.DataFrame,
-    phenotype_pos_df: pd.DataFrame,
-    covariates_df: Optional[pd.DataFrame] = None,
-    group_s: Optional[pd.Series] = None,
-    haplotypes: Optional[object] = None,
-    loci_df: Optional[pd.DataFrame] = None,
-    maf_threshold: float = 0.0,
-    fdr: float = 0.05,
-    fdr_col: str = "qval",
-    nperm: int = 10_000,
-    window: int = 1_000_000,
-    missing: float = -9.0,
-    random_tiebreak: bool = False,
-    device: str = "auto",
-    beta_approx: bool = True,
-    verbose: bool = True,
-) -> pd.DataFrame:
-    """Entry point: build IG; derive seed/threshold from cis_df; dispatch to grouped/ungrouped core."""
-    device = ("cuda" if (device in ("auto", None) and torch.cuda.is_available())
-              else (device if device in ("cuda", "cpu") else "cpu"))
-
-    if not phenotype_df.index.equals(phenotype_pos_df.index):
-        raise ValueError("phenotype_df and phenotype_pos_df must share identical indices")
-
-    # Build an InputGenerator (no pre-residualization here!)
-    if haplotypes is not None:
-        ig = InputGeneratorCisWithHaps(
-            genotype_df=genotype_df, variant_df=variant_df,
-            phenotype_df=phenotype_df, phenotype_pos_df=phenotype_pos_df,
-            window=window, haplotypes=haplotypes, loci_df=loci_df, group_s=group_s,
-        )
-    else:
-        ig = InputGeneratorCis(
-            genotype_df=genotype_df, variant_df=variant_df,
-            phenotype_df=phenotype_df, phenotype_pos_df=phenotype_pos_df,
-            window=window, group_s=group_s,
-        )
-    if ig.n_phenotypes == 0:
-        raise ValueError("No valid phenotypes after generator preprocessing.")
-
-    # Subset FDR-significant rows and compute threshold (max pval_beta)
-    if fdr_col not in cis_df.columns:
-        raise ValueError(f"cis_df must contain '{fdr_col}'")
-    signif_all = cis_df[cis_df[fdr_col] <= fdr].copy()
-    if len(signif_all) == 0:
-        raise ValueError(f"No significant entries at FDR ≤ {fdr}.")
-    if "pval_beta" not in signif_all.columns:
-        raise ValueError("cis_df must contain 'pval_beta'.")
-    signif_threshold = float(np.nanmax(signif_all["pval_beta"].values))
-
-    # Build seed tables: ungrouped (index by phenotype_id) vs grouped (one per group_id)
-    if group_s is None:
-        if "phenotype_id" not in signif_all.columns:
-            raise ValueError("cis_df must contain 'phenotype_id' for ungrouped mapping.")
-        signif_seed_df = signif_all.set_index("phenotype_id", drop=False)
-        return _run_independent_core(
-            ig=ig, variant_df=variant_df, covariates_df=covariates_df,
-            signif_seed_df=signif_seed_df, signif_threshold=signif_threshold,
-            nperm=nperm, device=device, maf_threshold=maf_threshold,
-            random_tiebreak=random_tiebreak, missing=missing, beta_approx=beta_approx,
-        )
-    else:
-        if "group_id" not in signif_all.columns:
-            raise ValueError("cis_df must contain 'group_id' for grouped mapping.")
-        seed_by_group_df = (signif_all.sort_values(["group_id", "pval_beta"])
-                                      .groupby("group_id", sort=False).head(1))
-        return _run_independent_core_group(
-            ig=ig, variant_df=variant_df, covariates_df=covariates_df,
-            seed_by_group_df=seed_by_group_df, signif_threshold=signif_threshold,
-            nperm=nperm, device=device, maf_threshold=maf_threshold,
-            random_tiebreak=random_tiebreak, missing=missing, beta_approx=beta_approx,
-        )
-
-
 def map_nominal(
         genotype_df: pd.DataFrame, variant_df: pd.DataFrame, phenotype_df: pd.DataFrame,
         phenotype_pos_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame] = None,
@@ -1235,9 +1142,6 @@ def map_permutations(
             genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
             phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s)
     )
-    ig.phenotype_df = pd.DataFrame(
-        Y_resid.cpu().numpy(), index=ig.phenotype_df.index, columns=ig.phenotype_df.columns
-    )
     ig.phenotype_df = pd.DataFrame(Y_resid.cpu().numpy(), index=ig.phenotype_df.index,
                                    columns=ig.phenotype_df.columns)
 
@@ -1246,6 +1150,92 @@ def map_permutations(
         core = _run_permutation_core_group if getattr(ig, "group_s", None) is not None else _run_permutation_core
         return core(ig, variant_df, rez, nperm=nperm, device=device,
                     beta_approx=beta_approx, maf_threshold=maf_threshold)
+
+
+def map_independent(
+        genotype_df: pd.DataFrame, variant_df: pd.DataFrame, cis_df: pd.DataFrame,
+        phenotype_df: pd.DataFrame, phenotype_pos_df: pd.DataFrame,
+        covariates_df: Optional[pd.DataFrame] = None,
+        haplotypes: Optional[object] = None, loci_df: Optional[pd.DataFrame] = None,
+        group_s: Optional[pd.Series] = None, maf_threshold: float = 0.0,
+        fdr: float = 0.05, fdr_col: str = "qval", nperm: int = 10_000,
+        window: int = 1_000_000, missing: float = -9.0, random_tiebreak: bool = False,
+        device: str = "auto", beta_approx: bool = True,
+        logger: SimpleLogger | None = None, verbose: bool = True,
+) -> pd.DataFrame:
+    """Entry point: build IG; derive seed/threshold from cis_df; dispatch to grouped/ungrouped core."""
+    device = ("cuda" if (device in ("auto", None) and torch.cuda.is_available())
+              else (device if device in ("cuda", "cpu") else "cpu"))
+    logger = logger or SimpleLogger(verbose=verbose, timestamps=True)
+    sync = (torch.cuda.synchronize if device == "cuda" else None)
+
+    if not phenotype_df.index.equals(phenotype_pos_df.index):
+        raise ValueError("phenotype_df and phenotype_pos_df must share identical indices")
+
+    # Subset FDR-significant rows and compute threshold (max pval_beta)
+    if fdr_col not in cis_df.columns:
+        raise ValueError(f"cis_df must contain '{fdr_col}'")
+    if "pval_beta" not in cis_df.columns:
+        raise ValueError("cis_df must contain 'pval_beta'.")
+
+    signif_df = cis_df[cis_df[fdr_col] <= fdr].copy()
+    if signif_df.empty:
+        raise ValueError(f"No significant phenotypes at FDR ≤ {fdr} in cis_df[{fdr_col}].")
+    
+    signif_threshold = float(np.nanmax(signif_df["pval_beta"].values))
+    mt = self.maf_threshold if maf_threshold is None else maf_threshold
+
+    # Header (tensorQTL-style)
+    logger.write("cis-QTL mapping: conditionally independent variants")
+    logger.write(f"  * device: {device}")
+    logger.write(f"  * {phenotype_df.shape[1]} samples")
+    logger.write(f'  * {signif_df.shape[0]}/{cis_df.shape[0]} significant phenotypes')
+    logger.write(f"  * {variant_df.shape[0]} variants")
+    logger.write(f"  * cis-window: \u00B1{window:,}")
+    logger.write(f"  * nperm={nperm:,} (beta_approx={'on' if beta_approx else 'off'})")
+    if maf_threshold and maf_threshold > 0:
+        logger.write(f"  * applying in-sample {maf_threshold:g} MAF filter")
+    if covariates_df is not None:
+        logger.write(f"  * {covariates_df.shape[1]} covariates")
+    if haplotypes is not None:
+        K = int(haplotypes.shape[2])
+        logger.write(f"  * including local ancestry channels (K={K})")
+
+    # Build the appropriate input generator (no residualization)
+    ig = (
+        InputGeneratorCisWithHaps(
+            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+            phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes,
+            loci_df=loci_df, group_s=group_s) if haplotypes is not None else
+        InputGeneratorCis(
+            genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+            phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s)
+    )    
+    if ig.n_phenotypes == 0:
+        raise ValueError("No valid phenotypes after generator preprocessing.")
+
+    # Build seed tables: ungrouped (index by phenotype_id) vs grouped (one per group_id)
+    if group_s is None:
+        if "phenotype_id" not in signif_df.columns:
+            raise ValueError("cis_df must contain 'phenotype_id' for ungrouped mapping.")
+        signif_seed_df = signif_df.set_index("phenotype_id", drop=False)
+        return _run_independent_core(
+            ig=ig, variant_df=variant_df, covariates_df=covariates_df,
+            signif_seed_df=signif_seed_df, signif_threshold=signif_threshold,
+            nperm=nperm, device=device, maf_threshold=maf_threshold,
+            random_tiebreak=random_tiebreak, missing=missing, beta_approx=beta_approx,
+        )
+    else:
+        if "group_id" not in signif_df.columns:
+            raise ValueError("cis_df must contain 'group_id' for grouped mapping.")
+        seed_by_group_df = (signif_df.sort_values(["group_id", "pval_beta"])
+                                      .groupby("group_id", sort=False).head(1))
+        return _run_independent_core_group(
+            ig=ig, variant_df=variant_df, covariates_df=covariates_df,
+            seed_by_group_df=seed_by_group_df, signif_threshold=signif_threshold,
+            nperm=nperm, device=device, maf_threshold=maf_threshold,
+            random_tiebreak=random_tiebreak, missing=missing, beta_approx=beta_approx,
+        )
 
 
 class CisMapper:
@@ -1269,7 +1259,11 @@ class CisMapper:
         self.variant_df = variant_df
         self.window = window
         self.maf_threshold = maf_threshold
-        
+
+        self.phenotype_df_raw = phenotype_df.copy()                 # keep RAW phenotypes
+        self.covariates_df = covariates_df.copy() if covariates_df is not None else None
+        self.sample_order = self.ig.phenotype_df.columns.tolist()
+
         self.ig = (
             InputGeneratorCisWithHaps(
                 genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
@@ -1320,6 +1314,22 @@ class CisMapper:
     def map_independent(self, cis_df, fdr=0.05):
         """Forward–backward conditional mapping"""
         pass
+
+    def _build_residualizer_aug(self, extra_cols: list[np.ndarray]) -> Residualizer:
+        """
+        Build a Residualizer for [baseline covariates || accepted lead-variant dosages].
+        """
+        if self.covariates_df is None:
+            C = np.empty((len(self.sample_order), 0), dtype=np.float32)
+        else:
+            C = self.covariates_df.loc[self.sample_order].to_numpy(dtype=np.float32, copy=False)
+
+        if extra_cols:
+            Xadd = np.column_stack([np.asarray(x, dtype=np.float32) for x in extra_cols])
+            C = np.hstack([C, Xadd]).astype(np.float32, copy=False)
+
+        C_t = torch.tensor(C, dtype=torch.float32, device=self.device)
+        return Residualizer(C_t)
 
     # Helper functions
     def _residualize(self, Y, C):
