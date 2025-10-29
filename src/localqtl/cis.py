@@ -1,7 +1,6 @@
 import torch
 import numpy as np
 import pandas as pd
-from scipy import stats
 from typing import Optional, Tuple, List
 
 from .haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
@@ -10,20 +9,8 @@ from .regression_kernels import (
     run_batch_regression,
     run_batch_regression_with_permutations
 )
-from .stats import beta_approx_pval
+from .stats import beta_approx_pval, get_t_pval, nominal_pvals_tensorqtl
 from .preproc import impute_mean_and_filter, allele_stats, filter_by_maf
-
-def _as_key(x):
-    """Return a hashable Python scalar/str from numpy scalars/arrays."""
-    if isinstance(x, (str, int)):
-        return x
-    import numpy as np
-    if isinstance(x, np.generic):
-        return x.item()
-    if isinstance(x, np.ndarray):
-        return x.item() if x.ndim == 0 else x.tolist()[0]
-    return str(x)
-
 
 def _residualize_matrix_with_covariates(
         Y: torch.Tensor, C: Optional[pd.DataFrame], device: str
@@ -184,10 +171,16 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
                     y=y_t, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
                 )
+                pvals_t, _dof = nominal_pvals_tensorqtl(
+                    y_t=y_t, G_resid=G_resid, H_resid=H_resid, k_eff=k_eff, tstats=tstats
+                )
                 perm_max_r2 = r2_perm.max().item()
             else:
                 betas, ses, tstats = run_batch_regression(
                     y=y_t, G=G_resid, H=H_resid, k_eff=k_eff, device=device
+                )
+                pvals_t, _dof = nominal_pvals_tensorqtl(
+                    y_t=y_t, G_resid=G_resid, H_resid=H_resid, k_eff=k_eff, tstats=tstats
                 )
                 r2_perm = perm_max_r2 = None
 
@@ -207,6 +200,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 "beta": betas[:, 0].detach().cpu().numpy(),
                 "se": ses[:, 0].detach().cpu().numpy(),
                 "tstat": tstats[:, 0].detach().cpu().numpy(),
+                "pval_nominal": pvals_t.detach().cpu().numpy(),
                 "af": af_t.detach().cpu().numpy(),
                 "ma_samples": ma_samples_t.detach().cpu().numpy(),
                 "ma_count": ma_count_t.detach().cpu().numpy(),
@@ -294,7 +288,7 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
         r2_nominal = float(r2_nominal_vec[ix])
 
         # Nominal p (two-sided t)
-        pval_nominal = float(2.0 * stats.t.sf(np.abs(tval), df=dof))
+        pval_nominal = float(get_t_pval(tval, dof))
 
         # Empirical permutation p (max across variants each perm)
         r2_perm_np = r2_perm.detach().cpu().numpy()  # (nperm,)
@@ -307,17 +301,16 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
             pval_beta, a_hat, b_hat = np.nan, np.nan, np.nan
 
         # Metadata
-        pid_key = _as_key(pid)
         var_id = variant_df.index.values[v_idx[ix]]
         var_pos = int(variant_df.iloc[v_idx[ix]]["pos"])
-        start_pos = ig.phenotype_start[pid_key]
-        end_pos = ig.phenotype_end[pid_key]
+        start_pos = ig.phenotype_start[pid]
+        end_pos = ig.phenotype_end[pid]
         start_distance = int(var_pos - start_pos)
         end_distance = int(var_pos - end_pos)
         num_var = int(G_t.shape[0])
 
         out_rows.append(pd.Series({
-            "phenotype_id": pid_key,
+            "phenotype_id": pid,
             "variant_id": var_id,
             "pos": var_pos,
             "start_distance": start_distance,
@@ -449,17 +442,17 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
         r2_perm_max = torch.stack(r2_perm_list, dim=0).max(dim=0).values.detach().cpu().numpy()  # (nperm,)
 
         # Build output (metadata for the winning phenotype/variant)
-        pid_key = _as_key(ids[best["ix_pheno"]])
+        pid = ids[best["ix_pheno"]]
         var_id = var_ids[best["ix_var"]]
         pos = int(var_pos[best["ix_var"]])
-        start_pos = ig.phenotype_start[pid_key]
-        end_pos = ig.phenotype_end[pid_key]
+        start_pos = ig.phenotype_start[pid]
+        end_pos = ig.phenotype_end[pid]
         start_distance = int(pos - start_pos)
         end_distance = int(pos - end_pos)
         num_var = int(G_t.shape[0])
 
         # p-values
-        pval_nominal = float(2.0 * stats.t.sf(abs(best["t"]), df=dof))
+        pval_nominal = float(get_t_pval(best["t"], dof))
         pval_perm = float((np.sum(r2_perm_max >= best["r2"]) + 1) / (r2_perm_max.size + 1))
         if beta_approx:
             pval_beta, a_hat, b_hat = beta_approx_pval(r2_perm_max, best["r2"])
@@ -469,7 +462,7 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
         out_rows.append(pd.Series({
             "group_id": group_id,
             "group_size": len(ids),
-            "phenotype_id": pid_key,
+            "phenotype_id": pid,
             "variant_id": var_id,
             "pos": pos,
             "start_distance": start_distance,
@@ -606,26 +599,15 @@ class CisMapper:
 
         if haplotypes is not None:
             self.ig = InputGeneratorCisWithHaps(
-                genotype_df=genotype_df,
-                variant_df=variant_df,
-                phenotype_df=phenotype_df,
-                phenotype_pos_df=phenotype_pos_df,
-                window=window,
-                haplotypes=haplotypes,
-                loci_df=loci_df,
-                group_s=group_s,
+                genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+                phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes,
+                loci_df=loci_df, group_s=group_s,
             )
-            self.with_haps = True
         else:
             self.ig = InputGeneratorCis(
-                genotype_df=genotype_df,
-                variant_df=variant_df,
-                phenotype_df=phenotype_df,
-                phenotype_pos_df=phenotype_pos_df,
-                window=window,
-                group_s=group_s,
+                genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+                phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s,
             )
-            self.with_haps = False
 
         # Residualize all phenotypes once and store
         Y = torch.tensor(self.ig.phenotype_df.values, dtype=torch.float32, device=self.device)
