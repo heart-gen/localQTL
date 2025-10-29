@@ -29,11 +29,13 @@ class SimpleLogger:
             self.log.flush()
 
     @contextmanager
-    def time_block(self, label: str):
+    def time_block(self, label: str, sync=None):
+        if sync: sync()
         t0 = time.perf_counter()
         try:
             yield
         finally:
+            if sync: sync()
             dt = time.perf_counter() - t0
             self.write(f"{label} done in {dt:.2f}s")
 
