@@ -186,7 +186,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
         for y_t, pid in y_iter:
             if nperm is not None:
                 perms = [torch.randperm(y_t.shape[0], device=device) for _ in range(nperm)]
-                y_perm = torch.stack([y_t[idx] for idx in perms], dim=1) # (n x nperm)
+                y_perm = torch.stack([y_t[idxp] for idxp in perms], dim=1) # (n x nperm)
                 betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
                     y=y_t, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
                 )
@@ -286,7 +286,7 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
 
         # Build permuted phenotypes (n x nperm)
         perms = [torch.randperm(y_t.shape[0], device=device) for _ in range(nperm)]
-        y_perm = torch.stack([y_t[idx] for idx in perms], dim=1)
+        y_perm = torch.stack([y_t[idxp] for idxp in perms], dim=1)
         
         # Run batched regression with permutations
         betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
@@ -441,7 +441,7 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
             y_t = Y_resid[j, :]
             # Permutations for phenotype j
             perms = [torch.randperm(n, device=device) for _ in range(nperm)]
-            y_perm = torch.stack([y_t[idx] for idx in perms], dim=1)  # (n x nperm)
+            y_perm = torch.stack([y_t[idxp] for idxp in perms], dim=1)  # (n x nperm)
 
             betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
                 y=y_t, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
@@ -593,7 +593,7 @@ def _run_independent_core(
 
             rez_aug = Residualizer(torch.tensor(C_aug, dtype=torch.float32, device=device)) if C_aug.shape[1] > 0 else None
             y_resid, G_resid, H_resid = _residualize_batch(y_t, G_t, H_t, rez_aug, center=True, group=False)
-            y_perm = torch.stack([y_resid[idx] for idx in perms], dim=1)  # (n x nperm)
+            y_perm = torch.stack([y_resid[idxp] for idxp in perms], dim=1)  # (n x nperm)
 
             k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
             betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
@@ -686,7 +686,7 @@ def _run_independent_core(
 
                 rez_aug = Residualizer(torch.tensor(C_aug, dtype=torch.float32, device=device)) if C_aug.shape[1] > 0 else None
                 y_resid, G_resid, H_resid = _residualize_batch(y_t, G_t, H_t, rez_aug, center=True, group=False)
-                y_perm = torch.stack([y_resid[idx] for idx in perms], dim=1)
+                y_perm = torch.stack([y_resid[idxp] for idxp in perms], dim=1)
 
                 k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
                 betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
@@ -758,7 +758,7 @@ def _run_independent_core_group(
         ig, variant_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame],
         seed_by_group_df: pd.DataFrame, signif_threshold: float, nperm: int,
         device: str, maf_threshold: float = 0.0, random_tiebreak: bool = False,
-        logp: bool = False, missing: float = -9.0, beta_approx: bool = True,
+        missing: float = -9.0, beta_approx: bool = True,
 ) -> pd.DataFrame:
     """Forward–backward independent mapping for grouped phenotypes."""
     out_rows = []
@@ -1239,7 +1239,7 @@ def map_independent(
 
 class CisMapper:
     """
-    Convenience wrapper: build an InputGenerator and run nominal scans.
+    Convenience wrapper to run analysis.
     """
     def __init__(
             self, genotype_df: pd.DataFrame, variant_df: pd.DataFrame,
@@ -1259,9 +1259,9 @@ class CisMapper:
         self.window = window
         self.maf_threshold = maf_threshold
 
+        # Keep RAW phenotypes and covariates for independent mapping
         self.phenotype_df_raw = phenotype_df.copy()                 # keep RAW phenotypes
         self.covariates_df = covariates_df.copy() if covariates_df is not None else None
-        self.sample_order = self.ig.phenotype_df.columns.tolist()
 
         self.ig = (
             InputGeneratorCisWithHaps(
@@ -1272,7 +1272,11 @@ class CisMapper:
                 genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
                 phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s)
         )
-        # Residualize phenotypes once
+
+        # Record sample order
+        self.sample_order = self.ig.phenotype_df.columns.tolist()
+
+        # Residualize phenotypes once for nominal/permutation scans
         Y = torch.tensor(self.ig.phenotype_df.values, dtype=torch.float32, device=self.device)
         sync = (torch.cuda.synchronize if self.device == "cuda" else None)
         with self.logger.time_block("Residualizing phenotypes", sync=sync):
@@ -1314,53 +1318,32 @@ class CisMapper:
                         fdr_col: str = "qval", nperm: int = 10_000, 
                         maf_threshold: float | None = None,
                         random_tiebreak: bool = False, seed: int | None = None,
-                        logp: bool = False, missing_val: float = -9.0) -> pd.DataFrame:
+                        missing_val: float = -9.0, beta_approx: bool = True) -> pd.DataFrame:
         """
         Forward–backward conditional cis-QTLs, seeded from FDR-significant rows in `cis_df`.
         """
-        if fdr_col not in cis_df.columns:
-            raise ValueError(f"cis_df is missing column '{fdr_col}' (q-values).")
-        if "pval_beta" not in cis_df.columns:
-            raise ValueError("cis_df must contain 'pval_beta' to set the forward/backward threshold.")
-
-        signif_df = cis_df.loc[cis_df[fdr_col] <= fdr].copy()
-        if signif_df.empty:
-            raise ValueError(f"No significant phenotypes at FDR ≤ {fdr} in cis_df[{fdr_col}].")
-
-        signif_threshold = float(np.nanmax(signif_df["pval_beta"].values))
-        mt = self.maf_threshold if maf_threshold is None else maf_threshold
-
         if seed is not None:
             np.random.seed(seed)
             torch.manual_seed(seed)
 
-        # Rebuild a generator on RAW phenotypes (we’ll add dosages into the residualizer as we go)
-        if getattr(self.ig, "haplotypes", None) is not None:
-            ig_raw = InputGeneratorCisWithHaps(
-                genotype_df=self.ig.genotype_df, variant_df=self.variant_df,
-                phenotype_df=self.phenotype_df_raw, phenotype_pos_df=self.ig.phenotype_pos_df,
-                window=self.window, haplotypes=self.ig.haplotypes, 
-                loci_df=getattr(self.ig, "loci_df", None),
-                group_s=getattr(self.ig, "group_s", None),
-            )
-        else:
-            ig_raw = InputGeneratorCis(
-                genotype_df=self.ig.genotype_df, variant_df=self.variant_df,
-                phenotype_df=self.phenotype_df_raw, phenotype_pos_df=self.ig.phenotype_pos_df,
-                window=self.window, group_s=getattr(self.ig, "group_s", None),
-            )
-
-        if getattr(ig_raw, "group_s", None) is not None:
-            raise NotImplementedError("Grouped map_independent not yet implemented.")
-
-        sync = (torch.cuda.synchronize if self.device == "cuda" else None)
-        with self.logger.time_block("Computing associations (independent: forward–backward)", sync=sync):
-            return _run_independent_core(
-                ig=ig_raw, variant_df=self.variant_df, device=self.device, signif_df=signif_df, 
-                signif_threshold=signif_threshold, nperm=nperm, maf_threshold=mt, 
-                random_tiebreak=random_tiebreak, logp=logp, missing_val=missing_val,
-                build_rez_aug=self._build_residualizer_aug, sample_order=self.sample_order,
-            )
+        mt = self.maf_threshold if maf_threshold is None else maf_threshold
+        return map_independent(
+            genotype_df=self.ig.genotype_df,
+            variant_df=self.variant_df,
+            cis_df=cis_df,
+            phenotype_df=self.phenotype_df_raw,
+            phenotype_pos_df=self.ig.phenotype_pos_df,
+            covariates_df=self.covariates_df,
+            haplotypes=getattr(self.ig, "haplotypes", None),
+            loci_df=getattr(self.ig, "loci_df", None),
+            group_s=getattr(self.ig, "group_s", None),
+            maf_threshold=mt,
+            fdr=fdr, fdr_col=fdr_col, nperm=nperm,
+            window=self.window, missing=missing_val,
+            random_tiebreak=random_tiebreak, device=self.device,
+            beta_approx=beta_approx,
+            logger=self.logger, verbose=self.logger.verbose if hasattr(self.logger, "verbose") else True,
+        )
 
     def _build_residualizer_aug(self, extra_cols: list[np.ndarray]) -> Residualizer:
         """
