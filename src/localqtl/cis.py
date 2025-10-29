@@ -640,6 +640,20 @@ class CisMapper:
         self.window = window
         self.maf_threshold = maf_threshold
 
+        if self.logger:
+            k = getattr(self.ig, "n_groups", None)
+            self.logger.write("CisMapper initialized")
+            self.logger.write(f"  * device: {self.device}")
+            self.logger.write(f"  * phenotypes: {self.ig.phenotype_df.shape[0]}"
+                              + (f" (groups: {k})" if k else ""))
+            self.logger.write(f"  * samples: {self.ig.phenotype_df.shape[1]}")
+            self.logger.write(f"  * variants: {self.variant_df.shape[0]}")
+            self.logger.write(f"  * cis-window: \u00B1{self.window:,}")
+            if self.maf_threshold and self.maf_threshold > 0:
+                self.logger.write(f"  * MAF filter: {self.maf_threshold:g}")
+            if hasattr(self.ig, "haplotypes") and self.ig.haplotypes is not None:
+                self.logger.write(f"  * local ancestry channels (K={int(self.ig.haplotypes.shape[2])})")
+
         if haplotypes is not None:
             self.ig = InputGeneratorCisWithHaps(
                 genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
