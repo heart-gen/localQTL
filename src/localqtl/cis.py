@@ -1213,28 +1213,28 @@ def map_independent(
     if ig.n_phenotypes == 0:
         raise ValueError("No valid phenotypes after generator preprocessing.")
 
-    # Build seed tables: ungrouped (index by phenotype_id) vs grouped (one per group_id)
-    if group_s is None:
-        if "phenotype_id" not in signif_df.columns:
-            raise ValueError("cis_df must contain 'phenotype_id' for ungrouped mapping.")
-        signif_seed_df = signif_df.set_index("phenotype_id", drop=False)
-        return _run_independent_core(
-            ig=ig, variant_df=variant_df, covariates_df=covariates_df,
-            signif_seed_df=signif_seed_df, signif_threshold=signif_threshold,
-            nperm=nperm, device=device, maf_threshold=maf_threshold,
-            random_tiebreak=random_tiebreak, missing=missing, beta_approx=beta_approx,
-        )
-    else:
-        if "group_id" not in signif_df.columns:
-            raise ValueError("cis_df must contain 'group_id' for grouped mapping.")
-        seed_by_group_df = (signif_df.sort_values(["group_id", "pval_beta"])
-                                      .groupby("group_id", sort=False).head(1))
-        return _run_independent_core_group(
-            ig=ig, variant_df=variant_df, covariates_df=covariates_df,
-            seed_by_group_df=seed_by_group_df, signif_threshold=signif_threshold,
-            nperm=nperm, device=device, maf_threshold=maf_threshold,
-            random_tiebreak=random_tiebreak, missing=missing, beta_approx=beta_approx,
-        )
+    with logger.time_block("Computing associations (independent: forward–backward)", sync=sync):
+        if group_s is None:
+            if "phenotype_id" not in signif_df.columns:
+                raise ValueError("cis_df must contain 'phenotype_id' for ungrouped mapping.")
+            signif_seed_df = signif_df.set_index("phenotype_id", drop=False)
+            return _run_independent_core(
+                ig=ig, variant_df=variant_df, covariates_df=covariates_df,
+                signif_seed_df=signif_seed_df, signif_threshold=signif_threshold,
+                nperm=nperm, device=device, maf_threshold=maf_threshold,
+                random_tiebreak=random_tiebreak, missing=missing, beta_approx=beta_approx,
+            )
+        else:
+            if "group_id" not in signif_df.columns:
+                raise ValueError("cis_df must contain 'group_id' for grouped mapping.")
+            seed_by_group_df = (signif_df.sort_values(["group_id", "pval_beta"])
+                                          .groupby("group_id", sort=False).head(1))
+            return _run_independent_core_group(
+                ig=ig, variant_df=variant_df, covariates_df=covariates_df,
+                seed_by_group_df=seed_by_group_df, signif_threshold=signif_threshold,
+                nperm=nperm, device=device, maf_threshold=maf_threshold,
+                random_tiebreak=random_tiebreak, missing=missing, beta_approx=beta_approx,
+            )
 
 
 class CisMapper:
