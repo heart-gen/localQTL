@@ -18,7 +18,6 @@ Usage:
       --device auto \
       --csv bench_haps_results.csv
 """
-
 import argparse
 import os
 import sys
@@ -34,7 +33,6 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from localqtl.cis import CisMapper, map_nominal
-
 
 def make_synthetic_data(
         m_variants: int, n_samples: int, n_pheno: int, n_covars: int,
@@ -171,11 +169,11 @@ def main():
                 print(f"\n=== Bench HAPS: m={m} variants, p={p} phenotypes, K={k} ancestries ===")
                 geno, var_df, pheno, pheno_pos, covs, window = make_synthetic_data(
                     m_variants=m, n_samples=args.samples, n_pheno=p,
-                    n_covars=args.covars, window=2_000_000, seed=42,
+                    n_covars=args.covars, window=1_000_000, seed=13,
                 )
                 H = make_synthetic_haplotypes(
                     m_variants=m, n_samples=args.samples, n_ancestries=k,
-                    seed=1234, frac_missing=0.02,
+                    seed=13, frac_missing=0.02,
                 )
 
                 # Functional API
