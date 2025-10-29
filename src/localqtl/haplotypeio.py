@@ -247,12 +247,6 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
         else:
             raise ValueError(f"Unexpected batch structure from base generator: len={len(batch)}")
 
-    @background(max_prefetch=6)
-    def generate_data(self, chrom=None, verbose=False):
-        """Delegate grouping decision to the base generator; append haplotypes accordingly."""
-        for batch in super().generate_data(chrom=chrom, verbose=verbose):
-            yield self._postprocess_batch(batch)
-
 
 # ----------------------------
 # Helpers functions

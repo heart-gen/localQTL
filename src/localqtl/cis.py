@@ -113,59 +113,51 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
     out_rows = []
     group_mode = getattr(ig, "group_s", None) is not None
     for batch in ig.generate_data():
-        H_block, grouped = None, False
-        if len(batch) == 4:
-            p, G_block, v_idx, pid = batch
-            P_list, id_list = [p], [pid]
-        elif len(batch) == 5:
-            if isinstance(batch[3], (list, tuple, np.ndarray, pd.Index)):
-                P, G_block, v_idx, H_block, pid = batch
-                grouped = True
-                if isinstance(P, (list, tuple)):
-                    P_list = list(P)
-                else:
-                    P = np.asarray(P)
-                    P_list = [P[i, :] for i in range(P.shape[0])] if P.ndim == 2 else [P]
-                id_list = list(ids)
-            else:
+        if not group_mode: # Ungrouped
+            if len(batch) == 4:
+                p, G_block, v_idx, pid = batch
+                H_block = None
+                P_list, id_list = [p], [pid]
+            elif len(batch) == 5:
                 p, G_block, v_idx, H_block, pid = batch
                 P_list, id_list = [p], [pid]
-
-        elif len(batch) == 6:
-            P, G_block, v_idx, H_block, ids, _group_id = batch
-            grouped = True
+            else:
+                raise ValueError(f"Unexpected ungrouped batch length: len={len(batch)}")
+        else: # Grouped
+            if len(batch) == 5:
+                P, G_block, v_idx, ids, _group_id = batch
+                H_block = None
+            elif len(batch) == 6:
+                P, G_block, v_idx, H_block, ids, _group_id = batch
+            else:
+                raise ValueError(f"Unexpected grouped batch shape: len={len(batch)}")
             if isinstance(P, (list, tuple)):
                 P_list = list(P)
             else:
                 P = np.asarray(P)
                 P_list = [P[i, :] for i in range(P.shape[0])] if P.ndim == 2 else [P]
             id_list = list(ids)
-            
-        else:
-            raise ValueError(f"Unexpected batch length: len={len(batch)}")
 
         # Tensors
         G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
         H_t = torch.tensor(H_block, dtype=torch.float32, device=device) if H_block is not None else None
 
-        # Impute and drop monomorphic
+        # Impute / filter
         G_t, keep_mask, _ = impute_mean_and_filter(G_t)
         if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
             continue
 
-        # Optional MAF filter
         if maf_threshold and maf_threshold > 0:
             keep_maf, _ = filter_by_maf(G_t, maf_threshold, ploidy=2)
             keep_mask = keep_mask & keep_maf
             if keep_mask.sum().item() == 0:
                 continue
 
-        # Mask G, H, and indices consistently
+        # Mask consistently
         G_t = G_t[keep_mask]
         v_idx = v_idx[keep_mask.detach().cpu().numpy()]
         if H_t is not None:
             H_t = H_t[keep_mask]
-            # Drop one ancestry channel (K -> K-1) to avoid rank deficiency
             if H_t.shape[2] > 1:
                 H_t = H_t[:, :, :-1] 
 
@@ -174,12 +166,12 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
  
         # Residualize in one call; returns y as list in group mode
         y_resid, G_resid, H_resid = _residualize_batch(
-            P_list if grouped else P_list[0], G_t, H_t, rez, center=True,
-            group=grouped
+            P_list if group_mode else P_list[0], G_t, H_t, rez, center=True,
+            group=group_mode
         )
-        y_iter = list(zip(y_resid, id_list)) if grouped else [(y_resid, id_list[0])]
+        y_iter = list(zip(y_resid, id_list)) if group_mode else [(y_resid, id_list[0])]
 
-        # Variant metadata for this window
+        # Variant metadata
         var_ids = variant_df.index.values[v_idx]
         var_pos = variant_df.iloc[v_idx]["pos"].values
         k_eff = rez.Q_t.shape[1] if rez is not None else 0
@@ -199,17 +191,15 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 )
                 r2_perm = perm_max_r2 = None
 
-            pid_key = _as_key(pid)
-
             # Distances to phenotype start/end
-            start_pos = ig.phenotype_start[pid_key]
-            end_pos = ig.phenotype_end[pid_key]
+            start_pos = ig.phenotype_start[pid]
+            end_pos = ig.phenotype_end[pid]
             start_distance = var_pos - start_pos
             end_distance = var_pos - end_pos
 
             # Assemble result rows
-            out = {
-                "phenotype_id": pid_key,
+            df = pd.DataFrame({
+                "phenotype_id": pid,
                 "variant_id": var_ids,
                 "pos": var_pos,
                 "start_distance": start_distance,
@@ -220,9 +210,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 "af": af_t.detach().cpu().numpy(),
                 "ma_samples": ma_samples_t.detach().cpu().numpy(),
                 "ma_count": ma_count_t.detach().cpu().numpy(),
-            }
-            df = pd.DataFrame(out)
-
+            })
             if perm_max_r2 is not None:
                 df["perm_max_r2"] = perm_max_r2 
             out_rows.append(df)
