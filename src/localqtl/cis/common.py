@@ -100,18 +100,3 @@ def residualize_batch(
         return [Y_resid[i, :] for i in range(Y_resid.shape[0])], G_resid, H_resid
     else:
         return Y_resid.squeeze(0), G_resid, H_resid
-
-
-def gpu_available():
-    import cupy as cp
-    try:
-        ndev = cp.cuda.runtime.getDeviceCount()
-        return ndev > 0
-    except cp.cuda.runtime.CUDARuntimeError:
-        return False
-
-
-def pick_device(prefer: str = "auto") -> str:
-    if prefer in {"cpu", "cuda"}:
-        return prefer if (prefer != "cuda" or gpu_available()) else "cpu"
-    return "cuda" if gpu_available() else "cpu"
