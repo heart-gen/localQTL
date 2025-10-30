@@ -60,3 +60,9 @@ def gpu_available():
         return ndev > 0
     except cp.cuda.runtime.CUDARuntimeError:
         return False
+
+
+def pick_device(prefer: str = "auto") -> str:
+    if prefer in {"cpu", "cuda"}:
+        return prefer if (prefer != "cuda" or gpu_available()) else "cpu"
+    return "cuda" if gpu_available() else "cpu"
