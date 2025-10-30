@@ -173,47 +173,91 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
 
     def __init__(self, *args, haplotypes=None, loci_df=None,
                  on_the_fly_impute=True, **kwargs):
+        self.nearest_tolerance = kwargs.pop("nearest_tolerance", None)
+
         super().__init__(*args, **kwargs)
+
         self.haplotypes = haplotypes
         self.loci_df = _to_pandas(loci_df).copy() if loci_df is not None else None
-        if self.loci_df is not None:
-            loci_reset = (
-                self.loci_df.reset_index()
-                .rename(columns={"index": "hap_index"})
-            )
-            variant_reset = (
-                self.variant_df[["chrom", "pos"]]
-                .reset_index()
-                .rename(columns={"index": "variant_id"})
-            )
-            m = variant_reset.merge(loci_reset, on=["chrom", "pos"], how="left", sort=False)
-            if m["hap_index"].isnull().any():
-                raise ValueError("Some variants not found in loci_df for hap mapping.")
+        self.on_the_fly_impute = on_the_fly_impute
 
-            # Multiple hap entries (one per ancestry) can map to the same variant.
-            # Keep the first occurrence for each variant_id to align with the
-            # haplotypes axis, which is ordered by variant.
-            hap_map = m.drop_duplicates("variant_id", keep="first")
-            if hap_map.shape[0] != self.variant_df.shape[0]:
-                raise ValueError("Variant to haplotype mapping has inconsistent length.")
-            self._geno2hap = hap_map["hap_index"].to_numpy(dtype=int)
+        # Build variant -> locus index map (nearest by chrom, pos)
+        if self.loci_df is not None:
+            loci_base = (self.loci_df.reset_index(drop=False)
+                         .rename(columns={"index": "maybe_hap_str"}))
+            if "index" not in loci_base.columns:
+                raise ValueError("loci_df must include a base 'index' (axis-0 of haplotypes).")
+
+            loci_base = (loci_base[["chrom", "pos", "index"]]
+                         .drop_duplicates(["chrom", "pos"], keep="first")
+                         .sort_values(["chrom", "pos"])
+                         .reset_index(drop=True))
+
+            vreset = (self.variant_df[["chrom", "pos"]]
+                      .assign(variant_id=np.arange(self.variant_df.shape[0], dtype=int))
+                      .sort_values(["chrom", "pos"])
+                      .reset_index(drop=True))
+
+            maps = []
+            for c, vgrp in vreset.groupby("chrom", sort=False):
+                lgrp = loci_base[loci_base["chrom"] == c]
+                if lgrp.empty:
+                    tmp = vgrp.copy()
+                    tmp["index"] = np.nan
+                    maps.append(tmp)
+                    continue
+
+                merged = pd.merge_asof(
+                    vgrp.sort_values("pos"),
+                    lgrp.sort_values("pos"),
+                    on="pos", direction="nearest", allow_exact_matches=True
+                )
+
+                if self.nearest_tolerance is not None:
+                    # recompute matched locus positions to get distance
+                    ref = pd.merge_asof(
+                        vgrp.sort_values("pos"),
+                        lgrp.sort_values("pos"),
+                        on="pos", direction="nearest", allow_exact_matches=True
+                    )
+                    dist = (merged["pos"] - ref["pos"]).abs()
+                    merged.loc[dist > self.nearest_tolerance, "index"] = np.nan
+
+                maps.append(merged)
+
+            m = (pd.concat(maps, axis=0)
+                   .sort_values("variant_id")
+                   .reset_index(drop=True))
+
+            if m["index"].isnull().any():
+                nmiss = int(m["index"].isnull().sum())
+                raise ValueError(
+                    f"Could not map {nmiss} variants to any local-ancestry locus; "
+                    f"check coords/labels or increase nearest_tolerance."
+                )
+
+            self._geno2hap = m["index"].to_numpy(dtype=int)
         else:
             self._geno2hap = None
-        self.on_the_fly_impute = on_the_fly_impute
 
         # Sanity check
         if self.haplotypes is None:
             raise ValueError("`haplotypes` array is required for InputGeneratorCisWithHaps.")
+
         try:
-            h_len = int(self.haplotypes.shape[0])
+            n_loci = int(self.haplotypes.shape[0])
         except Exception as e:
-            raise ValueError("`haplotypes` must be an array-like with shape "
-                             "(variants, samples, ancestries).") from e
-        if self._geno2hap is None and h_len != int(self.variant_df.shape[0]):
+            raise ValueError("`haplotypes` must be array-like with shape (loci, samples, ancestries).") from e
+
+        if self._geno2hap is None and n_loci != int(self.variant_df.shape[0]):
             raise ValueError(
-                f"haplotypes first dimension ({h_len}) does not match variant_df rows "
+                f"haplotypes first dimension ({n_loci}) does not match variant_df rows "
                 f"({self.variant_df.shape[0]}). Provide `loci_df` to map genotypes to hap indices."
             )
+
+        if self._geno2hap is not None:
+            if self._geno2hap.min() < 0 or self._geno2hap.max() >= n_loci:
+                raise ValueError("Mapped locus indices are out of bounds of the haplotypes first dimension.")
 
     @staticmethod
     def _interpolate_block(block):
@@ -245,17 +289,20 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
         return block_imputed.reshape(loci_dim, sample_dim, ancestry_dim).astype(np.float32, copy=False)
 
     def _fetch_hap_block(self, v_idx):
-        """Helper: index haplotypes with genotype variant indices (or mapped loci)."""
-        if self._geno2hap is None:
-            H_slice = self.haplotypes[v_idx, :, :]
-        else:
-            hap_idx = self._geno2hap[v_idx]
-            H_slice = self.haplotypes[hap_idx, :, :]
+        # Map variants in this batch to locus indices
+        hap_idx = v_idx if self._geno2hap is None else self._geno2hap[v_idx]
+        H_slice = self.haplotypes[hap_idx, :, :]
+        H_block = H_slice.compute() if hasattr(H_slice, "compute") else H_slice
+        mod = get_array_module(H_block)
         if self.on_the_fly_impute:
-            H_block = H_slice.compute() if hasattr(H_slice, "compute") else np.asarray(H_slice)
-            return self._interpolate_block(H_block)
-        else:
-            return H_slice.compute() if hasattr(H_slice, "compute") else np.asarray(H_slice)
+            if mod.isnan(mod.asarray(H_block)).any():
+                raise ValueError(
+                    "Detected NaNs in haplotype block. For biological correctness, "
+                    "please fix upstream or implement an index-based fill (ffill/bfill), "
+                    "not value interpolation."
+                )
+
+        return H_block
 
     def _postprocess_batch(self, batch):
         """Preserve grouping contract from `InputGeneratorCis` and just append H."""
