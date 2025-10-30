@@ -88,13 +88,13 @@ class CisMapper:
                 for chrom in self.ig.chrs:
                     out_path = os.path.join(self.out_dir, f"{self.out_prefix}.chr{chrom}.parquet")
                     with self.logger.time_block(f"chr{chrom}: map_nominal", sync=sync):
-                        with ParquetSink(out_path, compression=compression) as sink:
+                        with ParquetSink(out_path, compression=self.compression) as sink:
                             _run_nominal_core(
                                 self.ig, self.variant_df, self.rez, nperm, self.device,
                                 maf_threshold=mt, chrom=chrom, sink=sink,
                             )
                         self.logger.write(f"chr{chrom}: wrote {sink.rows:,} rows -> {out_path}")
-            return None if not return_df else pd.DataFrame([])
+                        return None if not return_df else pd.DataFrame([])
 
         with self.logger.time_block("Computing associations (nominal)", sync=sync):
             return _run_nominal_core(self.ig, self.variant_df, self.rez, nperm,
