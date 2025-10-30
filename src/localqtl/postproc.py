@@ -1,9 +1,8 @@
 from __future__ import annotations
-from typing import Mapping, Optional, Iterable, List, Union
 import os, glob
-import numpy as np
 import pandas as pd
-from datetime import datetime
+from typing import Mapping, Optional, List, Union
+
 from .utils import SimpleLogger
 
 def _chrom_sort_key(ch: str) -> tuple:
@@ -18,6 +17,7 @@ def _chrom_sort_key(ch: str) -> tuple:
         return (0, int(s))
     except ValueError:
         return (1, s)
+
 
 def get_significant_pairs(res_df: pd.DataFrame,
                           nominal_files: Union[str, Mapping[str, str]],
@@ -91,7 +91,8 @@ def get_significant_pairs(res_df: pd.DataFrame,
         raise ValueError("No nominal Parquet files found.")
 
     # Read & filter
-    wanted_cols = columns or ["phenotype_id", "variant_id", "pval_nominal", "start_distance", "end_distance", "pos"]
+    wanted_cols = columns or ["phenotype_id", "variant_id", "pval_nominal",
+                              "start_distance", "end_distance", "pos"]
     out = []
     chroms = sorted(paths.keys(), key=_chrom_sort_key)
     for i, chrom in enumerate(chroms, 1):

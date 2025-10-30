@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 from py_qvalue import qvalue, pi0est
-from typing import Optional, Sequence, Union, Tuple
+from typing import Optional, Sequence, Union
 
 def beta_approx_pval(r2_perm: np.ndarray, r2_true: float) -> tuple[float, float, float]:
     """
@@ -202,3 +202,5 @@ def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
                 logger.write(f"  * min p-value threshold @ FDR {fdr:.2f}: {p_star:.6g} (beta-quantile per phenotype)")
         else:
             logger.write("  * No beta parameters present; skipping nominal threshold computation.")
+
+    return res_df
