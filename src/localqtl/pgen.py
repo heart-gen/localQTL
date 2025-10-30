@@ -144,8 +144,15 @@ class PgenReader(object):
             return torch.as_tensor(arr, device=self.device)
         return arr
 
-    def read_range(self, start_idx, end_idx, impute_mean=True, dtype=np.float32,
-                   dosages=False):
+    def read_range(
+        self,
+        start_idx,
+        end_idx,
+        impute_mean=True,
+        dtype=None,
+        dosages=False,
+        to_torch=False,
+    ):
         """Read contiguous block of variants by index."""
         nvar = end_idx - start_idx + 1
         nsamp = len(self.sample_ids)
@@ -159,10 +166,11 @@ class PgenReader(object):
             else:
                 r.read_range(start_idx, end_idx + 1, arr)
 
-        if not dosages and self.impute:
+        if not dosages and self.impute and impute_mean:
             arr = _impute_mean(arr)
 
-        arr = arr.astype(self.dtype, copy=False)
+        target_dtype = dtype if dtype is not None else self.dtype
+        arr = arr.astype(target_dtype, copy=False)
 
         if to_torch or self.device == "cuda":
             return torch.as_tensor(arr, device=self.device)
