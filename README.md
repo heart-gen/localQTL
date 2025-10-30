@@ -1,11 +1,11 @@
 # localQTL
 
-localQTL is a Python library for cis-QTL mapping that keeps the familiar data model
-from [tensorQTL](https://github.com/broadinstitute/tensorqtl) while adding GPU-first
-execution paths, flexible genotype loaders, and support for local ancestry-aware
-analyses. It is designed for researchers who need an end-to-end toolkit for
-pre-processing, running nominal and permutation scans, and summarising independent
-cis signals on large cohorts.
+localQTL is a **pure-Python** library for local-ancestry-aware xQTL mapping that
+lets researchers run end-to-end analyses on large cohorts **without any R/rpy2
+dependencies**. It preserves the familiar 
+[tensorQTL](https://github.com/broadinstitute/tensorqtl) data model with **GPU-first
+execution paths**, flexible genotype loaders, and streaming outputs for large-scale
+workflows, while adding ancestry-aware use cases.
 
 ## Features
 
@@ -20,6 +20,7 @@ cis signals on large cohorts.
   produced by RFMix through `RFMixReader` and `InputGeneratorCisWithHaps`.
 - **Parquet streaming sinks** that make it easy to materialise association statistics
   without loading the entire result set in memory.
+- **Pure-Python statistics (no R/rpy2 required)**: tensorQTL's `rfunc` calls have been refactored to scipy.stats for p-values and q-values are computed with the Python port of Storey's `qvalue` (`py-qvalue`).
 
 ## Installation
 
@@ -45,8 +46,9 @@ pip install -e .
 
 Below is a minimal example that runs a nominal cis-QTL scan against PLINK-formatted
 genotypes and BED-formatted phenotypes. The example mirrors the data layout
-expected by tensorQTL, so existing preprocessing pipelines can be reused.
+expected by tensorQTL, so **existing preprocessing pipelines can be reused**.
 
+### Standard mapping (tensorQTL equivalent)
 ```python
 from localqtl import PlinkReader, read_phenotype_bed
 from localqtl.cis import map_nominal
@@ -97,18 +99,8 @@ perm_df = mapper.calculate_qvalues(perm_df, fdr=0.05)
 lead_df = mapper.map_independent(cis_df=perm_df, fdr=0.05)
 ```
 
-## Project structure
+### Local ancestry-aware mapping
 
-```
-src/localqtl/
-├── cis/                   # Nominal, permutation, and independent cis-QTL mappers
-├── genotypeio.py          # PLINK/PGEN readers and windowed input generators
-├── haplotypeio.py         # RFMix haplotype loader and ancestry-aware generators
-├── phenotypeio.py         # Utilities for tensorQTL-compatible BED phenotypes
-├── preproc.py             # Genotype imputation, filtering, and QC helpers
-├── regression_kernels.py  # Batched regression routines executed on CPU or GPU
-└── utils.py               # Logging helpers and device utilities
-```
 
 ## Testing
 
