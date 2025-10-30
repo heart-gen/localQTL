@@ -116,6 +116,7 @@ def _run_independent_core(
             t_g = tstats[:, 0]
             r2_nominal_vec = (t_g.double().pow(2) / (t_g.double().pow(2) + dof))
             r2_np = r2_nominal_vec.detach().cpu().numpy()
+            r2_max = np.nanmax(r2_np)
             if random_tiebreak:
                 ties = np.flatnonzero(np.isclose(r2_np, r2_max, atol=1e-12))
                 if gen is None:
@@ -213,6 +214,7 @@ def _run_independent_core(
                 dof = max(int(n) - int(k_eff) - int(p_pred), 1)
                 t_g = tstats[:, 0]
                 r2_np = (t_g.double().pow(2) / (t_g.double().pow(2) + dof)).detach().cpu().numpy()
+                r2_max = np.nanmax(r2_np)
                 if random_tiebreak:
                     ties = np.flatnonzero(np.isclose(r2_np, r2_max, atol=1e-12))
                     if gen is None:
