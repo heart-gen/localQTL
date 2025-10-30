@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 import pandas as pd
@@ -111,14 +112,16 @@ def _residualize_batch(
         return Y_resid.squeeze(0), G_resid, H_resid
 
 
-def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float = 0.0):
+def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float = 0.0,
+                      chrom: str | None = None, sink: "ParquetSink | None" = None):
     """
     Shared inner loop for nominal (and optional permutation) mapping.
     Handles both InputGeneratorCis (no haps) and InputGeneratorCisWithHaps (haps).
+    If sink is provided, stream out rows as Parquet and return None.
     """
     out_rows = []
     group_mode = getattr(ig, "group_s", None) is not None
-    for batch in ig.generate_data():
+    for batch in ig.generate_data(chrom=chrom):
         if not group_mode: # Ungrouped
             if len(batch) == 4:
                 p, G_block, v_idx, pid = batch
@@ -225,10 +228,17 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 "ma_count": ma_count_t.detach().cpu().numpy(),
             })
             if perm_max_r2 is not None:
-                df["perm_max_r2"] = perm_max_r2 
-            out_rows.append(df)
+                df["perm_max_r2"] = perm_max_r2
 
-    return pd.concat(out_rows, axis=0).reset_index(drop=True)
+            if sink is None:
+                out_rows.append(df)
+            else:
+                sink.write(df)
+
+    if sink is None:
+        return pd.concat(out_rows, axis=0).reset_index(drop=True)
+    else:
+        return None
 
 
 def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
@@ -1040,6 +1050,8 @@ def map_nominal(
         haplotypes: Optional[object] = None, loci_df: Optional[pd.DataFrame] = None,
         group_s: Optional[pd.Series] = None, maf_threshold: float = 0.0,
         window: int = 1_000_000, nperm: Optional[int] = None, device: str = "cuda",
+        out_dir: Optional[str] = None, out_prefix: str = "cis_nominal",
+        compression: str = "snappy", return_df: bool = True,
         logger: SimpleLogger | None = None, verbose: bool = True
 ) -> pd.DataFrame:
     """
@@ -1088,10 +1100,29 @@ def map_nominal(
         Y_resid.cpu().numpy(), index=ig.phenotype_df.index, columns=ig.phenotype_df.columns
     )
 
-    # Core compute
+    # Per-chromosome parquet streaming
+    if out_dir is not None:
+        os.makedirs(out_dir, exist_ok=True)
+        with logger.time_block("Nominal scan (per-chrom streaming)", sync=sync):
+            for chrom in ig.chrs:
+                out_path = os.path.join(out_dir, f"{out_prefix}.chr{chrom}.parquet")
+                sink = _ParquetSink(out_path, compression=compression)
+                try:
+                    with logger.time_block(f"chr{chrom}: map_nominal", sync=sync):
+                        _run_nominal_core(
+                            ig, variant_df, rez, nperm, device,
+                            maf_threshold=maf_threshold,
+                            chrom=chrom,
+                            sink=sink,
+                        )
+                finally:
+                    sink.close()
+        return None if not return_df else pd.DataFrame([])
+
     with logger.time_block("Computing associations (nominal)", sync=sync):
         return _run_nominal_core(ig, variant_df, rez, nperm, device,
-                                 maf_threshold=maf_threshold)
+                                 maf_threshold=maf_threshold,
+                                 chrom=None, sink=None)
 
 
 def map_permutations(
@@ -1250,6 +1281,8 @@ class CisMapper:
             loci_df: Optional[pd.DataFrame] = None,
             device: str = "auto", window: int = 1_000_000,
             maf_threshold: float = 0.0,
+            out_dir: Optional[str] = None, out_prefix: str = "cis_nominal",
+            compression: str = "snappy", return_df: bool = True,
             logger: SimpleLogger | None = None, verbose: bool = True
     ):
         self.device = ("cuda" if (device == "auto" and torch.cuda.is_available()) else
@@ -1258,6 +1291,10 @@ class CisMapper:
         self.variant_df = variant_df
         self.window = window
         self.maf_threshold = maf_threshold
+        self.out_dir = out_dir
+        self.out_prefix = out_prefix
+        self.compression = compression
+        self.return_df = return_df
 
         # Keep RAW phenotypes and covariates for independent mapping
         self.phenotype_df_raw = phenotype_df.copy()                 # keep RAW phenotypes
@@ -1300,6 +1337,23 @@ class CisMapper:
     def map_nominal(self, nperm: int | None = None, maf_threshold: float | None = None) -> pd.DataFrame:
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
         sync = (torch.cuda.synchronize if self.device == "cuda" else None)
+        # Per-chromosome parquet streaming
+        if self.out_dir is not None:
+            os.makedirs(self.out_dir, exist_ok=True)
+            with self.logger.time_block("Nominal scan (per-chrom streaming)", sync=sync):
+                for chrom in self.ig.chrs:
+                    out_path = os.path.join(self.out_dir, f"{self.out_prefix}.chr{chrom}.parquet")
+                    sink = _ParquetSink(out_path, compression=self.compression)
+                    try:
+                        with self.logger.time_block(f"chr{chrom}: map_nominal", sync=sync):
+                            _run_nominal_core(
+                                self.ig, self.variant_df, self.rez, nperm, self.device,
+                                maf_threshold=mt, chrom=chrom, sink=sink,
+                            )
+                    finally:
+                        sink.close()
+            return None if not return_df else pd.DataFrame([])
+
         with self.logger.time_block("Computing associations (nominal)", sync=sync):
             return _run_nominal_core(self.ig, self.variant_df, self.rez, nperm,
                                      self.device, maf_threshold=mt)
