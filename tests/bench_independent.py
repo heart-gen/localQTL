@@ -34,7 +34,6 @@ import numpy as np
 import pandas as pd
 import torch
 
-# --- Repo import path (adjust if needed) ---
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
@@ -294,7 +293,7 @@ def main():
     ind_class = mapper.map_independent(
         cis_df=cis, fdr=args.fdr, fdr_col="qval", nperm=args.nperm,
         maf_threshold=args.maf, random_tiebreak=args.random_tiebreak,
-        seed=args.seed, logp=False, missing_val=-9.0,
+        seed=args.seed, missing_val=-9.0,
     )
     t_class = time.perf_counter() - t0
     print(f"CisMapper.map_independent: {t_class:.3f} s, rows={len(ind_class):,}")
