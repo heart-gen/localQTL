@@ -40,5 +40,5 @@ def test_map_independent_identifies_forward_backward_hits(toy_data):
     assert {"phenotype_id", "variant_id", "rank", "pval_beta"}.issubset(result.columns)
     # ranks should start at 1 for each phenotype
     grouped = result.groupby("phenotype_id")["rank"]
-    for ranks in grouped:
+    for _, ranks in grouped:
         assert ranks.iloc[0] == 1
