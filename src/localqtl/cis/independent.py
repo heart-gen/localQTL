@@ -83,7 +83,7 @@ def _run_independent_core(
         forward_rows = [seed_row.to_frame().T]  # initialize with seed from cis_df
         dosage_dict: dict[str, np.ndarray] = {}
         seed_vid = str(seed_row["variant_id"])
-        if seed_vid in var_in_frame:
+        if seed_vid in var_in_frame and seed_vid in ig.genotype_df.index:
             dosage_dict[seed_vid] = dosage_vector_for_covariate(
                 genotype_df=ig.genotype_df,
                 variant_id=seed_vid,
@@ -137,10 +137,13 @@ def _run_independent_core(
             pval_perm = float((np.sum(r2_perm_np >= r2_nom) + 1) / (r2_perm_np.size + 1))
             pval_beta, a_hat, b_hat = (beta_approx_pval(r2_perm_np, r2_nom) if beta_approx
                                        else (np.nan, np.nan, np.nan))
+            stop_pval = float(pval_beta)
+            if not np.isfinite(stop_pval):
+                stop_pval = pval_perm
             pval_nominal = float(get_t_pval(tval, dof))
 
             # Stop if not significant under threshold
-            if pval_beta > signif_threshold:
+            if stop_pval > signif_threshold:
                 break
 
             var_id = variant_df.index.values[v_idx[ix]]
@@ -175,7 +178,7 @@ def _run_independent_core(
             forward_rows.append(row.to_frame().T)
 
             # add dosage covariate for next round
-            if var_id in var_in_frame and var_id not in dosage_dict:
+            if var_id in var_in_frame and var_id in ig.genotype_df.index and var_id not in dosage_dict:
                 dosage_dict[var_id] = dosage_vector_for_covariate(
                     genotype_df=ig.genotype_df,
                     variant_id=var_id,
@@ -234,8 +237,11 @@ def _run_independent_core(
                 pval_perm = float((np.sum(r2_perm_np >= r2_nom) + 1) / (r2_perm_np.size + 1))
                 pval_beta, a_hat, b_hat = (beta_approx_pval(r2_perm_np, r2_nom) if beta_approx
                                            else (np.nan, np.nan, np.nan))
+                stop_pval = float(pval_beta)
+                if not np.isfinite(stop_pval):
+                    stop_pval = pval_perm
 
-                if pval_beta <= signif_threshold:
+                if stop_pval <= signif_threshold:
                     var_id = variant_df.index.values[v_idx[ix]]
                     var_pos = int(variant_df.iloc[v_idx[ix]]["pos"])
                     start_pos = ig.phenotype_start[pid]
@@ -286,6 +292,8 @@ def _run_independent_core_group( ## TODO: Needs updating
 ) -> pd.DataFrame:
     """Forward–backward independent mapping for grouped phenotypes."""
     out_rows = []
+    var_in_frame = set(variant_df.index)
+    geno_has_variant = set(ig.genotype_df.index)
 
     if covariates_df is not None and not covariates_df.index.equals(ig.phenotype_df.columns):
         covariates_df = covariates_df.loc[ig.phenotype_df.columns]
@@ -329,15 +337,17 @@ def _run_independent_core_group( ## TODO: Needs updating
         gen = None
         if seed is not None:
             gen = torch.Generator(device=device)
-            gen.manual_seed(subseed(seed, pid))
+            gen.manual_seed(subseed(seed, f"group:{group_id}"))
         perms = torch.stack([torch.randperm(n, device=device, generator=gen) for _ in range(nperm)], dim=0)
 
-        dosage_dict = {seed_vid: dosage_vector_for_covariate(
-            genotype_df=ig.genotype_df,
-            variant_id=seed_vid,
-            sample_order=ig.phenotype_df.columns,
-            missing=missing,
-        )}
+        dosage_dict: dict[str, np.ndarray] = {}
+        if seed_vid in var_in_frame and seed_vid in geno_has_variant:
+            dosage_dict[seed_vid] = dosage_vector_for_covariate(
+                genotype_df=ig.genotype_df,
+                variant_id=seed_vid,
+                sample_order=ig.phenotype_df.columns,
+                missing=missing,
+            )
         forward_rows = [seed_row.to_frame().T]
 
         while True:
@@ -407,7 +417,10 @@ def _run_independent_core_group( ## TODO: Needs updating
             pval_perm = float((np.sum(r2_perm_max >= best["r2"]) + 1) / (r2_perm_max.size + 1))
             pval_beta, a_hat, b_hat = (beta_approx_pval(r2_perm_max, best["r2"]) if beta_approx
                                        else (np.nan, np.nan, np.nan))
-            if pval_beta > signif_threshold:
+            stop_pval = float(pval_beta)
+            if not np.isfinite(stop_pval):
+                stop_pval = pval_perm
+            if stop_pval > signif_threshold:
                 break
 
             pid_best = ids[best["ix_pheno"]]
@@ -438,7 +451,7 @@ def _run_independent_core_group( ## TODO: Needs updating
             })
             forward_rows.append(row.to_frame().T)
 
-            if var_id not in dosage_dict:
+            if var_id not in dosage_dict and var_id in var_in_frame and var_id in geno_has_variant:
                 dosage_dict[var_id] = dosage_vector_for_covariate(
                     genotype_df=ig.genotype_df,
                     variant_id=var_id,
@@ -517,8 +530,11 @@ def _run_independent_core_group( ## TODO: Needs updating
                 pval_perm = float((np.sum(r2_perm_max >= best["r2"]) + 1) / (r2_perm_max.size + 1))
                 pval_beta, a_hat, b_hat = (beta_approx_pval(r2_perm_max, best["r2"]) if beta_approx
                                            else (np.nan, np.nan, np.nan))
+                stop_pval = float(pval_beta)
+                if not np.isfinite(stop_pval):
+                    stop_pval = pval_perm
 
-                if pval_beta <= signif_threshold:
+                if stop_pval <= signif_threshold:
                     pid_best = ids[best["ix_pheno"]]
                     var_id = variant_df.index.values[v_idx[best["ix_var"]]]
                     var_pos = int(variant_df.iloc[v_idx[best["ix_var"]]]["pos"])
