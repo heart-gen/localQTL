@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "localqtl"
 version = "0.1.0"
-description = "GPU-accelerated cis-QTL mapping library with tensorQTL-compatible APIs"
+description = "GPU-accelerated ancestry-aware cis-QTL mapping library with tensorQTL-compatible APIs"
 authors = ["Kynon J Benjamin <kj.benjamin90@gmail.com>"]
 maintainers = ["Kynon J Benjamin <kj.benjamin90@gmail.com>"]
 readme = "README.md"
