@@ -107,7 +107,7 @@ def t_two_sided_pval_torch(t_abs: torch.Tensor, dof: int | torch.Tensor) -> torc
         z = t_abs[large] / torch.sqrt(torch.tensor(2.0, device=dev, dtype=dt))
         p_norm = torch.erfc(z)  # == 2 * Φ(-|t|) because erfc = 2*(1-Φ)
         p_out[large] = p_norm.clamp_min(torch.finfo(dt).tiny)
-        
+
     # CPU fallback (SciPy) for the rest
     rest = ~large
     if rest.any():
@@ -116,7 +116,7 @@ def t_two_sided_pval_torch(t_abs: torch.Tensor, dof: int | torch.Tensor) -> torc
         p_cpu   = get_t_pval(t_cpu, dof_cpu, log10=False)  # vectorized
         p_cpu   = np.maximum(p_cpu, np.finfo(float).tiny)
         p_out[rest] = torch.as_tensor(p_cpu, device=dev, dtype=dt)
-    
+
     return p_out
 
 
@@ -163,7 +163,7 @@ def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
     if res_df.empty:
         logger.write("Computing q-values: Input is empty, returning unchanged.")
         return res_df.copy()
-    
+
     # Choose p-value column
     use_beta = ("pval_beta" in res_df.columns) and (~res_df["pval_beta"].isna()).any()
     pcol = "pval_beta" if use_beta else "pval_perm"
