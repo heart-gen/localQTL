@@ -70,9 +70,10 @@ results = map_nominal(
     phenotype_df=phenotype_df,
     phenotype_pos_df=phenotype_pos_df,
     covariates_df=covariates_df,
-    window=1_000_000,      # ±1 Mb cis window
-    maf_threshold=0.01,    # filter on in-sample MAF
-    device="auto",         # picks CUDA when available, otherwise CPU
+    window=1_000_000,         # ±1 Mb cis window
+    maf_threshold=0.01,       # filter on in-sample MAF
+    device="auto",            # picks CUDA when available, otherwise CPU
+    out_prefix="cis_nominal", # default prefix
 )
 
 print(results.head())

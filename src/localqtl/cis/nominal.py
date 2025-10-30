@@ -152,8 +152,8 @@ def map_nominal(
         haplotypes: Optional[object] = None, loci_df: Optional[pd.DataFrame] = None,
         group_s: Optional[pd.Series] = None, maf_threshold: float = 0.0,
         window: int = 1_000_000, nperm: Optional[int] = None, device: str = "cuda",
-        out_dir: Optional[str] = None, out_prefix: str = "cis_nominal",
-        compression: str = "snappy", return_df: bool = True,
+        out_dir: str = "./", out_prefix: str = "cis_nominal",
+        compression: str = "snappy", return_df: bool = False,
         logger: SimpleLogger | None = None, verbose: bool = True
 ) -> pd.DataFrame:
     """

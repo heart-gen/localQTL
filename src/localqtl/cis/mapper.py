@@ -34,10 +34,10 @@ class CisMapper:
             device: str = "auto",
             window: int = 1_000_000,
             maf_threshold: float = 0.0,
-            out_dir: Optional[str] = None,
+            out_dir: str = "./",
             out_prefix: str = "cis_nominal",
             compression: str = "snappy",
-            return_df: bool = True,
+            return_df: bool = False,
             logger: Optional[SimpleLogger] = None,
             verbose: bool = True,
     ):
