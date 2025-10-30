@@ -4,7 +4,7 @@ import os, glob
 import pandas as pd
 from typing import Mapping, Optional, List, Union
 
-from .utils import SimpleLogger
+from ..utils import SimpleLogger
 
 def _chrom_sort_key(ch: str) -> tuple:
     """Robust chromosome sort: chr1..chr22, X=23, Y=24, MT/M=25, else lexicographic fallback."""
