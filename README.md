@@ -74,6 +74,7 @@ results = map_nominal(
     maf_threshold=0.01,       # filter on in-sample MAF
     device="auto",            # picks CUDA when available, otherwise CPU
     out_prefix="cis_nominal", # default prefix
+    return_df=True            # default is False, parquet streamed sink
 )
 
 print(results.head())
@@ -94,7 +95,7 @@ mapper = CisMapper(
     window=500_000,
 )
 
-nominal_df = mapper.map_nominal(nperm=1_000)
+mapper.map_nominal(nperm=1_000)
 perm_df = mapper.map_permutations(nperm=1_000, beta_approx=True)
 perm_df = mapper.calculate_qvalues(perm_df, fdr=0.05)
 lead_df = mapper.map_independent(cis_df=perm_df, fdr=0.05)
@@ -156,7 +157,7 @@ mapper = CisMapper(
 )
 
 # Run nominal scans and permutations as usual; ancestry-awareness is automatic
-nominal_df = mapper.map_nominal(nperm=0)
+mapper.map_nominal(nperm=0)
 perm_df = mapper.map_permutations(nperm=1_000, beta_approx=True)
 
 # FDR using the pure-Python q-value port (no R/rpy2 needed)
