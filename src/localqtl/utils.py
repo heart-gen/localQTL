@@ -51,18 +51,3 @@ class SimpleLogger:
 class NullLogger(SimpleLogger):
     def __init__(self): super().__init__(logfile=None, verbose=False)
     def write(self, message: str): pass
-
-
-def gpu_available():
-    import cupy as cp
-    try:
-        ndev = cp.cuda.runtime.getDeviceCount()
-        return ndev > 0
-    except cp.cuda.runtime.CUDARuntimeError:
-        return False
-
-
-def pick_device(prefer: str = "auto") -> str:
-    if prefer in {"cpu", "cuda"}:
-        return prefer if (prefer != "cuda" or gpu_available()) else "cpu"
-    return "cuda" if gpu_available() else "cpu"
