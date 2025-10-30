@@ -1,3 +1,4 @@
+## Adapted from tensorqtl: https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/post.py
 from __future__ import annotations
 import os, glob
 import pandas as pd
