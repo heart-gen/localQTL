@@ -237,8 +237,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
 
     if sink is None:
         return pd.concat(out_rows, axis=0).reset_index(drop=True)
-    else:
-        return None
+    return None
 
 
 def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
@@ -1106,17 +1105,15 @@ def map_nominal(
         with logger.time_block("Nominal scan (per-chrom streaming)", sync=sync):
             for chrom in ig.chrs:
                 out_path = os.path.join(out_dir, f"{out_prefix}.chr{chrom}.parquet")
-                sink = _ParquetSink(out_path, compression=compression)
-                try:
-                    with logger.time_block(f"chr{chrom}: map_nominal", sync=sync):
+                with logger.time_block(f"chr{chrom}: map_nominal", sync=sync):
+                    with ParquetSink(out_path, compression=compression) as sink:
                         _run_nominal_core(
                             ig, variant_df, rez, nperm, device,
                             maf_threshold=maf_threshold,
                             chrom=chrom,
                             sink=sink,
                         )
-                finally:
-                    sink.close()
+                    logger.write(f"chr{chrom}: wrote {sink.rows:,} rows -> {out_path}")
         return None if not return_df else pd.DataFrame([])
 
     with logger.time_block("Computing associations (nominal)", sync=sync):
@@ -1343,15 +1340,13 @@ class CisMapper:
             with self.logger.time_block("Nominal scan (per-chrom streaming)", sync=sync):
                 for chrom in self.ig.chrs:
                     out_path = os.path.join(self.out_dir, f"{self.out_prefix}.chr{chrom}.parquet")
-                    sink = _ParquetSink(out_path, compression=self.compression)
-                    try:
-                        with self.logger.time_block(f"chr{chrom}: map_nominal", sync=sync):
+                    with self.logger.time_block(f"chr{chrom}: map_nominal", sync=sync):
+                        with ParquetSink(out_path, compression=compression) as sink:
                             _run_nominal_core(
                                 self.ig, self.variant_df, self.rez, nperm, self.device,
                                 maf_threshold=mt, chrom=chrom, sink=sink,
                             )
-                    finally:
-                        sink.close()
+                        self.logger.write(f"chr{chrom}: wrote {sink.rows:,} rows -> {out_path}")
             return None if not return_df else pd.DataFrame([])
 
         with self.logger.time_block("Computing associations (nominal)", sync=sync):
