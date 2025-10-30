@@ -113,7 +113,7 @@ def t_two_sided_pval_torch(t_abs: torch.Tensor, dof: int | torch.Tensor) -> torc
     if rest.any():
         t_cpu   = t_abs[rest].detach().cpu().numpy()
         dof_cpu = nu[rest].detach().cpu().numpy()
-        p_cpu   = get_t_pval(t_cpu, dof_cpu, log=False)  # vectorized
+        p_cpu   = get_t_pval(t_cpu, dof_cpu, log10=False)  # vectorized
         p_cpu   = np.maximum(p_cpu, np.finfo(float).tiny)
         p_out[rest] = torch.as_tensor(p_cpu, device=dev, dtype=dt)
     
