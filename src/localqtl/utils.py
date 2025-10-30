@@ -1,7 +1,7 @@
 ## SimpleLogger adapted from tensorqtl:
 ## https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/core.py
 from __future__ import annotations
-import sys, time
+import sys, time, hashlib
 from typing import Optional
 from datetime import datetime
 from contextlib import contextmanager
@@ -66,3 +66,11 @@ def pick_device(prefer: str = "auto") -> str:
     if prefer in {"cpu", "cuda"}:
         return prefer if (prefer != "cuda" or gpu_available()) else "cpu"
     return "cuda" if gpu_available() else "cpu"
+
+
+def subseed(base: int, key: str | int) -> int:
+    """Deterministic 64-bit sub-seed from base seed and a stable key (pid/group)."""
+    h = int(hashlib.blake2b(str(key).encode(), digest_size=8).hexdigest(), 16)
+    return (h ^ int(base)) & ((1 << 63) - 1)
+
+
