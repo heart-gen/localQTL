@@ -2,6 +2,7 @@
 This script was adapted from tensorQTL `core.py`:
 https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/core.py
 """
+import sys
 import numpy as np
 import pandas as pd
 
@@ -11,6 +12,8 @@ if gpu_available():
     import cupy as cp
 else:
     cp = np
+
+sys.modules.setdefault("phenotypeio", sys.modules[__name__])
 
 __all__ = [
     "read_phenotype_bed",

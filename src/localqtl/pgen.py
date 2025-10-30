@@ -38,15 +38,27 @@ def read_psam(psam_path):
 
 
 def _impute_mean(genotypes, missing_code=-9):
-    """Impute missing genotypes (-9) with per-variant mean"""
-    m = genotypes == missing_code
-    if genotypes.ndim == 1:
-        if m.any():
-            genotypes[m] = genotypes[~m].mean()
-    else:  # genotypes.ndim == 2
-        row_means = np.where(m.any(1), genotypes.clip(min=0).mean(1), 0)
-        genotypes[m] = np.take(row_means, np.nonzero(m)[0])
-    return genotypes
+    """Impute missing genotypes (-9) with per-variant mean."""
+    arr = genotypes.astype(np.float32, copy=True)
+    mask = arr == float(missing_code)
+
+    if arr.ndim == 1:
+        if mask.all():
+            arr.fill(0.0)
+        elif mask.any():
+            arr[mask] = arr[~mask].mean(dtype=np.float32)
+    else:
+        # Compute per-row means excluding missing entries
+        valid = ~mask
+        counts = valid.sum(axis=1, keepdims=True)
+        sums = np.where(valid, arr, 0.0).sum(axis=1, keepdims=True)
+        means = np.divide(sums, counts, out=np.zeros_like(sums), where=counts > 0)
+        row_means = means.squeeze(1)
+        if row_means.ndim == 0:
+            row_means = np.array([row_means], dtype=arr.dtype)
+        arr[mask] = row_means[np.nonzero(mask)[0]]
+
+    return arr
 
 
 class PgenReader(object):

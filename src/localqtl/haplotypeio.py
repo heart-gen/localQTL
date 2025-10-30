@@ -100,9 +100,9 @@ class RFMixReader:
             )
 
         # Build loci table
-        self.loci = self.loci.rename(columns={"chromosome": "chrom",
-                                              "physical_position": "pos"})
-        self.loci["i"] = cudf.Series(range(len(self.loci)))
+        self.loci = _to_pandas(self.loci).rename(columns={"chromosome": "chrom",
+                                                          "physical_position": "pos"})
+        self.loci["i"] = np.arange(len(self.loci), dtype=int)
         self.loci["hap"] = self.loci["chrom"].astype(str) + "_" + self.loci["pos"].astype(str)
 
         # Subset samples
@@ -118,10 +118,11 @@ class RFMixReader:
 
         # Exclude chromosomes if requested
         if exclude_chrs is not None and len(exclude_chrs) > 0:
-            mask_pd = ~self.loci.to_pandas()["chrom"].isin(exclude_chrs).values
+            loci_pd = _to_pandas(self.loci)
+            mask_pd = ~loci_pd["chrom"].isin(exclude_chrs).values
             self.admix = self.admix[mask_pd, :, :]
             keep_idx = np.nonzero(mask_pd)[0]
-            self.loci = self.loci[keep_idx].reset_index(drop=True)
+            self.loci = loci_pd.iloc[keep_idx].reset_index(drop=True)
             self.loci["i"] = self.loci.index
 
         # Dimensions
@@ -132,7 +133,7 @@ class RFMixReader:
         if self.n_pops == 2:
             A0 = self.admix[:, :, [0]]
             loci_ids = (self.loci["chrom"].astype(str) + "_" + self.loci["pos"].astype(str) + "_A0")
-            loci_df = self.loci.to_pandas()[["chrom", "pos"]].copy()
+            loci_df = _to_pandas(self.loci)[["chrom", "pos"]].copy()
             loci_df["ancestry"] = 0
             loci_df["hap"] = _to_pandas(loci_ids)
             loci_df["index"] = np.arange(loci_df.shape[0])
@@ -142,8 +143,9 @@ class RFMixReader:
             self.haplotypes = A0
         else: # >2 ancestries
             loci_dfs = []
+            loci_pd = _to_pandas(self.loci)
             for anc in range(self.n_pops):
-                loci_df_anc = self.loci.to_pandas()[["chrom", "pos"]].copy()
+                loci_df_anc = loci_pd[["chrom", "pos"]].copy()
                 loci_df_anc["ancestry"] = anc
                 loci_df_anc["hap"] = (
                     loci_df_anc["chrom"].astype(str) + "_" + loci_df_anc["pos"].astype(str) + f"_A{anc}"
@@ -173,13 +175,17 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
                  on_the_fly_impute=True, **kwargs):
         super().__init__(*args, **kwargs)
         self.haplotypes = haplotypes
-        self.loci_df = loci_df.copy() if loci_df is not None else None
+        self.loci_df = _to_pandas(loci_df).copy() if loci_df is not None else None
         if self.loci_df is not None:
-            m = (self.variant_df.reset_index()
-                 .merge(self.loci_df.reset_index(), on=["chrom","pos"], how="left"))
-            if m["index"].isnull().any():
+            loci_reset = (self.loci_df.reset_index()
+                          .rename(columns={"index": "hap_index"}))
+            variant_reset = (self.variant_df[["chrom", "pos"]]
+                             .reset_index()
+                             .rename(columns={"index": "variant_id"}))
+            m = variant_reset.merge(loci_reset, on=["chrom", "pos"], how="left", sort=False)
+            if m["hap_index"].isnull().any():
                 raise ValueError("Some variants not found in loci_df for hap mapping.")
-            self._geno2hap = m["index"].to_numpy(dtype=int)
+            self._geno2hap = m["hap_index"].to_numpy(dtype=int)
         else:
             self._geno2hap = None
         self.on_the_fly_impute = on_the_fly_impute

@@ -183,11 +183,6 @@ def map_nominal(
     if nperm is not None:
         logger.write(f"  * computing tensorQTL-style nominal p-values and {nperm:,} permutations")
 
-    # Residualize once
-    Y = torch.tensor(phenotype_df.values, dtype=torch.float32, device=device)
-    with logger.time_block("Residualizing phenotypes", sync=sync):
-        Y_resid, rez = residualize_matrix_with_covariates(Y, covariates_df, device)
-        
     # Build the appropriate input generator
     ig = (
         InputGeneratorCisWithHaps(
@@ -198,6 +193,12 @@ def map_nominal(
             genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
             phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s)
     )
+
+    # Residualize once using the filtered phenotypes from the generator
+    Y = torch.tensor(ig.phenotype_df.values, dtype=torch.float32, device=device)
+    with logger.time_block("Residualizing phenotypes", sync=sync):
+        Y_resid, rez = residualize_matrix_with_covariates(Y, covariates_df, device)
+
     ig.phenotype_df = pd.DataFrame(
         Y_resid.cpu().numpy(), index=ig.phenotype_df.index, columns=ig.phenotype_df.columns
     )
