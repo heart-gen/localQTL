@@ -4,6 +4,7 @@ import pandas as pd
 from typing import Optional
 
 from ..utils import SimpleLogger, pick_device
+from ..stats import calculate_qvalues as _calculate_qvalues
 from .nominal import map_nominal as _map_nominal
 from .permutations import map_permutations as _map_permutations
 from .independent import map_independent as _map_independent
@@ -141,4 +142,16 @@ class CisMapper:
             seed=seed,
             logger=self.logger,
             verbose=getattr(self.logger, "verbose", True),
+        )
+
+    def calculate_qvalues(
+            self, perm_df: pd.DataFrame, fdr: float = 0.05,
+            qvalue_lambda: Optional[float] = None,
+    ) -> pd.DataFrame:
+        """Annotate permutation results with q-values via :func:`calculate_qvalues`."""
+        return _calculate_qvalues(
+            perm_df,
+            fdr=fdr,
+            qvalue_lambda=qvalue_lambda,
+            logger=self.logger,
         )

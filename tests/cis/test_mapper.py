@@ -76,3 +76,30 @@ def test_cis_mapper_delegates_independent(monkeypatch, toy_data):
     assert called["fdr"] == 0.1
     assert called["maf_threshold"] == 0.2
     assert called["cis_df"].equals(cis_df)
+
+
+def test_cis_mapper_calculates_qvalues(monkeypatch, toy_data):
+    mapper = _build_mapper(toy_data)
+    called = {}
+
+    def fake_calc(res_df, fdr, qvalue_lambda, logger):
+        called["res_df"] = res_df
+        called["fdr"] = fdr
+        called["qvalue_lambda"] = qvalue_lambda
+        called["logger"] = logger
+        return res_df.assign(qval=[0.02])
+
+    monkeypatch.setattr("src.localqtl.cis.mapper._calculate_qvalues", fake_calc)
+
+    perm_df = pd.DataFrame({
+        "phenotype_id": ["geneA"],
+        "pval_beta": [0.01],
+    })
+
+    result = mapper.calculate_qvalues(perm_df, fdr=0.1, qvalue_lambda=0.4)
+
+    assert not result.empty
+    assert called["res_df"].equals(perm_df)
+    assert called["fdr"] == 0.1
+    assert called["qvalue_lambda"] == 0.4
+    assert called["logger"] is mapper.logger
