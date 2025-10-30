@@ -101,6 +101,77 @@ lead_df = mapper.map_independent(cis_df=perm_df, fdr=0.05)
 
 ### Local ancestry-aware mapping
 
+localQTL can incorporate local ancestry (e.g., from RFMix) so that cis-xQTL tests are performed with ancestry-aware genotype inputs. To enable this, pass **`haplotypes`** (per-variant × per-sample × per-ancestry dosages) and **`loci_df`** (variant positions corresponding to the haplotype tensor) to `CisMapper`. When these are provided, `CisMapper` switches to the ancestry-aware input generator under the hood.
+
+```python
+from localqtl import PlinkReader, read_phenotype_bed
+from localqtl.haplotypeio import RFMixReader
+from localqtl.cis import CisMapper
+
+plink = PlinkReader("data/genotypes")
+genotype_df = plink.load_genotypes()  # samples as columns, variants as rows
+variant_df = plink.bim.set_index("snp")[["chrom", "pos"]]
+
+phenotype_df, phenotype_pos_df = read_phenotype_bed("data/phenotypes.bed")
+covariates_df = None  # optional
+
+# Local ancestry from RFMix
+rfmix = RFMixReader(
+    prefix_path="data/rfmix/prefix",   # directory with per-chrom outputs + fb.tsv
+    binary_path="data/rfmix",          # where prebuilt binaries live (if used)
+    verbose=True
+)
+
+# Materialize ancestry haplotypes into memory (NumPy array)
+# Shape: (variants, samples, ancestries) for >2 ancestries.
+# For 2 ancestries, the reader exposes the ancestry channel selected internally.
+H = rfmix.load_haplotypes()
+loci_df = rfmix.loci_df  # DataFrame with ['chrom','pos', 'ancestry', 'hap', 'index'] (indexed by 'hap')
+
+# Align samples to the RFMix order (recommended)
+# Keep only intersection and put everything in the same order as rfmix.sample_ids.
+keep = [sid for sid in rfmix.sample_ids if sid in genotype_df.columns]
+genotype_df = genotype_df[keep]
+phenotype_df = phenotype_df[keep]
+if covariates_df is not None:
+    covariates_df = covariates_df.loc[keep]
+
+# (Optional) Ensure chromosome dtype matches between variant_df and loci_df
+variant_df["chrom"] = variant_df["chrom"].astype(str)
+loci_df = loci_df.copy()
+loci_df["chrom"] = loci_df["chrom"].astype(str)
+
+# Ancestry-aware mapping
+mapper = CisMapper(
+    genotype_df=genotype_df,
+    variant_df=variant_df,
+    phenotype_df=phenotype_df,
+    phenotype_pos_df=phenotype_pos_df,
+    covariates_df=covariates_df,
+    haplotypes=H,          # <-- enable local ancestry-aware mode
+    loci_df=loci_df,       # <-- positions that align to H
+    window=1_000_000,
+    device="auto",
+)
+
+# Run nominal scans and permutations as usual; ancestry-awareness is automatic
+nominal_df = mapper.map_nominal(nperm=0)
+perm_df = mapper.map_permutations(nperm=1_000, beta_approx=True)
+
+# FDR using the pure-Python q-value port (no R/rpy2 needed)
+perm_df = mapper.calculate_qvalues(perm_df, fdr=0.05)
+
+# Identify conditionally independent signals
+lead_df = mapper.map_independent(cis_df=perm_df, fdr=0.05)
+
+print(lead_df.head())
+```
+
+**Input expectations**
+
+* `H` (from `RFMixReader.load_haplotypes()`) is ancestry dosages with shape `(variants, samples, ancestries)` for ≥3 ancestries; for 2 ancestries the reader exposes the configured channel.
+* `loci_df` rows correspond 1:1 to `H`'s and be joinable (by `chrom`/`pos`) to `variant_df` used for genotypes.
+* Sample order in `genotype_df`, `phenotype_df`, and `covariates_df` should match `rfmix.sample_ids` (reindex as shown).
 
 ## Testing
 
