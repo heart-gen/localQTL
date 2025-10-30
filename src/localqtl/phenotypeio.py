@@ -6,9 +6,9 @@ import sys
 import numpy as np
 import pandas as pd
 
-from .utils import gpu_available
+from .utils import gpu_available as _gpu_available_util
 
-if gpu_available():
+if _gpu_available_util():
     import cupy as cp
 else:
     cp = np
@@ -18,6 +18,17 @@ sys.modules.setdefault("phenotypeio", sys.modules[__name__])
 __all__ = [
     "read_phenotype_bed",
 ]
+
+
+def gpu_available():
+    """Return True if a GPU is available for phenotype IO operations."""
+    cp_mod = globals().get("cp")
+    if cp_mod is None or cp_mod is np:
+        return False
+    try:
+        return cp_mod.cuda.runtime.getDeviceCount() > 0
+    except Exception:
+        return False
 
 def read_phenotype_bed(path, as_tensor=False, device="cpu", dtype="float32"):
     """

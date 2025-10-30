@@ -177,15 +177,26 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
         self.haplotypes = haplotypes
         self.loci_df = _to_pandas(loci_df).copy() if loci_df is not None else None
         if self.loci_df is not None:
-            loci_reset = (self.loci_df.reset_index()
-                          .rename(columns={"index": "hap_index"}))
-            variant_reset = (self.variant_df[["chrom", "pos"]]
-                             .reset_index()
-                             .rename(columns={"index": "variant_id"}))
+            loci_reset = (
+                self.loci_df.reset_index()
+                .rename(columns={"index": "hap_index"})
+            )
+            variant_reset = (
+                self.variant_df[["chrom", "pos"]]
+                .reset_index()
+                .rename(columns={"index": "variant_id"})
+            )
             m = variant_reset.merge(loci_reset, on=["chrom", "pos"], how="left", sort=False)
             if m["hap_index"].isnull().any():
                 raise ValueError("Some variants not found in loci_df for hap mapping.")
-            self._geno2hap = m["hap_index"].to_numpy(dtype=int)
+
+            # Multiple hap entries (one per ancestry) can map to the same variant.
+            # Keep the first occurrence for each variant_id to align with the
+            # haplotypes axis, which is ordered by variant.
+            hap_map = m.drop_duplicates("variant_id", keep="first")
+            if hap_map.shape[0] != self.variant_df.shape[0]:
+                raise ValueError("Variant to haplotype mapping has inconsistent length.")
+            self._geno2hap = hap_map["hap_index"].to_numpy(dtype=int)
         else:
             self._geno2hap = None
         self.on_the_fly_impute = on_the_fly_impute
