@@ -13,6 +13,12 @@ import numpy as np
 import pandas as pd
 import pgenlib as pg
 
+__all__ = [
+    "read_pvar",
+    "read_psam",
+    "PgenReader",
+]
+
 
 def read_pvar(pvar_path):
     """Read pvar file as pd.DataFrame"""

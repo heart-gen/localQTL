@@ -12,6 +12,10 @@ if gpu_available():
 else:
     cp = np
 
+__all__ = [
+    "read_phenotype_bed",
+]
+
 def read_phenotype_bed(path, as_tensor=False, device="cpu", dtype="float32"):
     """
     Load phenotype BED file into phenotype and position DataFrames or arrays.

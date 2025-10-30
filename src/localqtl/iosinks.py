@@ -4,6 +4,10 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+__all__ = [
+    "ParquetSink",
+]
+
 class ParquetSink:
     """
     Minimal streaming Parquet writer with stable schema enforcement.

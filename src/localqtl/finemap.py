@@ -1,6 +1,11 @@
 import torch
 import numpy as np
 
+__all__ = [
+    "get_pairwise_ld",
+    "get_ld_matrix",
+]
+
 def get_pairwise_ld(pgr, id1, id2=None, r2=True, use_torch=False, dtype=np.float32):
     """
     Compute LD (r or r²) between one or more variants.

@@ -1,5 +1,11 @@
 import torch
 
+__all__ = [
+    "Residualizer",
+    "run_batch_regression",
+    "run_batch_regression_with_permutations",
+]
+
 class Residualizer(object):
     """
     Residualizer for regressing out covariates from genotype/phenotype matrices.

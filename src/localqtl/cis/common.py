@@ -5,6 +5,12 @@ from typing import Optional, Tuple, List
 
 from ..regression_kernels import Residualizer
 
+__all__ = [
+    "dosage_vector_for_covariate",
+    "residualize_matrix_with_covariates",
+    "residualize_batch",
+]
+
 def _make_gen(seed: int | None, device: str) -> torch.Generator | None:
     if seed is None:
         return None

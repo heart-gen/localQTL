@@ -33,6 +33,12 @@ else:
     def get_array_module(x):
         return np
 
+# Public exports
+__all__ = [
+    "RFMixReader",
+    "InputGeneratorCisWithHaps",
+]
+
 # ----------------------------
 # Local ancestry readers
 # ----------------------------

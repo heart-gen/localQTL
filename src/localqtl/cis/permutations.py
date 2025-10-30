@@ -13,6 +13,10 @@ from ..regression_kernels import (
 )
 from .common import residualize_matrix_with_covariates, residualize_batch
 
+__all__ = [
+    "map_permutations",
+]
+
 def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
                           beta_approx: bool = True, maf_threshold: float = 0.0,
                           seed: int | None = None) -> pd.DataFrame:
