@@ -4,6 +4,8 @@ import os, glob
 import pandas as pd
 from typing import Mapping, Optional, List, Union
 
+import pyarrow as pa
+
 from ..utils import SimpleLogger
 
 __all__ = [
@@ -96,13 +98,25 @@ def get_significant_pairs(res_df: pd.DataFrame,
         raise ValueError("No nominal Parquet files found.")
 
     # Read & filter
-    wanted_cols = columns or ["phenotype_id", "variant_id", "pval_nominal",
-                              "start_distance", "end_distance", "pos"]
+    default_cols = ["phenotype_id", "variant_id", "pval_nominal",
+                    "start_distance", "end_distance", "pos"]
+    wanted_cols = columns or default_cols
     out = []
     chroms = sorted(paths.keys(), key=_chrom_sort_key)
     for i, chrom in enumerate(chroms, 1):
         lg.write(f"  * reading {chrom} ({i}/{len(chroms)})")
-        df_nom = pd.read_parquet(paths[chrom], columns=wanted_cols, engine="pyarrow")
+        try:
+            df_nom = pd.read_parquet(paths[chrom], columns=wanted_cols, engine="pyarrow")
+        except pa.lib.ArrowInvalid:
+            if columns is not None:
+                raise
+            schema_cols = set(pa.parquet.ParquetFile(paths[chrom]).schema.names)
+            present = [c for c in default_cols if c in schema_cols]
+            missing_required = {c for c in ["phenotype_id", "variant_id", "pval_nominal"] if c not in schema_cols}
+            if missing_required:
+                missing = ", ".join(sorted(missing_required))
+                raise ValueError(f"Nominal file {paths[chrom]} is missing required columns: {missing}")
+            df_nom = pd.read_parquet(paths[chrom], columns=present, engine="pyarrow")
 
         # Early filter: keep only relevant phenotypes
         if grouped:

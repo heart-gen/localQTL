@@ -11,29 +11,53 @@ class Residualizer(object):
     Residualizer for regressing out covariates from genotype/phenotype matrices.
     """
     def __init__(self, C_t: torch.Tensor):
-        # Center and orthongonalize covariates
-        C_t = C_t - C_t.mean(0)
-        self.Q_t, _ = torch.linalg.qr(C_t, mode='reduced')
-        self.P = self.Q_t @ self.Q_t.T
-        self.dof = C_t.shape[0] - 2 - C_t.shape[1]
+        # Center covariates and drop columns with zero variance (e.g., intercept-only)
+        n_samples = C_t.shape[0]
+        C_centered = C_t - C_t.mean(0)
+        norms = torch.linalg.norm(C_centered, dim=0)
+        keep = norms > 0
+
+        if keep.any():
+            C_use = C_centered[:, keep]
+            self.Q_t, _ = torch.linalg.qr(C_use, mode='reduced')
+            self.P = self.Q_t @ self.Q_t.T
+            self.rank = int(self.Q_t.shape[1])
+        else:
+            # No informative covariates remain; act as identity residualizer.
+            self.Q_t = C_t.new_zeros((n_samples, 0))
+            self.P = None
+            self.rank = 0
+
+        self.dof = n_samples - 2 - self.rank
 
     def transform(self, *matrices: torch.Tensor, center: bool=True
                   ) -> tuple[torch.Tensor]:
         """
         Residualize one or more matrices in a single GPU pass.
         """
-        dev = self.Q_t.device
+        dev = self.Q_t.device if self.Q_t.numel() else matrices[0].device
         matrices = tuple(M.to(dev) for M in matrices)
         if len(matrices) == 1:
             M_t = matrices[0]
             if center:
                 M_t = M_t - M_t.mean(1, keepdim=True)
+            if self.rank == 0:
+                return (M_t,)
             return (M_t - M_t @ self.P,)
 
         # Concatenate features along rows
         M_cat = torch.cat(matrices, dim=0)
         if center:
             M_cat = M_cat - M_cat.mean(1, keepdim=True)
+
+        if self.rank == 0:
+            out = []
+            start = 0
+            for M in matrices:
+                end = start + M.shape[0]
+                out.append(M_cat[start:end])
+                start = end
+            return tuple(out)
 
         # Project once with cached P
         M_cat_resid = M_cat - M_cat @ self.P

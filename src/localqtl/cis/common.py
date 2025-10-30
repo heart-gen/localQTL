@@ -59,7 +59,10 @@ def residualize_batch(
     - If group=False: y is a single vector (n,), returns (y_resid 1D, G_resid, H_resid).
     - If group=True:  y is a stack (k x n) or list of length k, returns (list_of_k 1D tensors, G_resid, H_resid).
     """
-    dev = (rez.Q_t.device if (rez is not None and hasattr(rez, "Q_t")) else G.device)
+    if rez is not None and hasattr(rez, "Q_t") and getattr(rez.Q_t, "numel", lambda: 0)() > 0:
+        dev = rez.Q_t.device
+    else:
+        dev = G.device
     G = G.to(dev)
     if H is not None:
         H = H.to(dev)
