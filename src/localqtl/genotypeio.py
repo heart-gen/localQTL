@@ -16,6 +16,16 @@ try:
 except ImportError as e:
     pgen = None
 
+__all__ = [
+    "BackgroundGenerator",
+    "background",
+    "print_progress",
+    "PlinkReader",
+    "load_genotypes",
+    "get_cis_ranges",
+    "InputGeneratorCis",
+]
+
 class BackgroundGenerator(threading.Thread):
     def __init__(self, generator, max_prefetch=10):
         threading.Thread.__init__(self)

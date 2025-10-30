@@ -8,6 +8,10 @@ from .nominal import map_nominal as _map_nominal
 from .permutations import map_permutations as _map_permutations
 from .independent import map_independent as _map_independent
 
+__all__ = [
+    "CisMapper",
+]
+
 class CisMapper:
     """
     Thin convenience wrapper that delegates to the functional APIs:

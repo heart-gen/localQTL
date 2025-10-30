@@ -6,6 +6,10 @@ from typing import Mapping, Optional, List, Union
 
 from ..utils import SimpleLogger
 
+__all__ = [
+    "get_significant_pairs",
+]
+
 def _chrom_sort_key(ch: str) -> tuple:
     """Robust chromosome sort: chr1..chr22, X=23, Y=24, MT/M=25, else lexicographic fallback."""
     s = os.path.basename(ch)

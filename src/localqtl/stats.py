@@ -12,6 +12,14 @@ from scipy import stats
 from py_qvalue import qvalue, pi0est
 from typing import Optional, Sequence, Union
 
+__all__ = [
+    "beta_approx_pval",
+    "get_t_pval",
+    "t_two_sided_pval_torch",
+    "nominal_pvals_tensorqtl",
+    "calculate_qvalues",
+]
+
 def beta_approx_pval(r2_perm: np.ndarray, r2_true: float) -> tuple[float, float, float]:
     """
     Fit Beta(a,b) to permutation R^2 by method of moments and return:

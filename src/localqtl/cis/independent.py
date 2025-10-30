@@ -14,6 +14,10 @@ from ..regression_kernels import (
 )
 from .common import residualize_batch, dosage_vector_for_covariate
 
+__all__ = [
+    "map_independent",
+]
+
 def _run_independent_core(
         ig, variant_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame],
         signif_seed_df: pd.DataFrame, signif_threshold: float, nperm: int,

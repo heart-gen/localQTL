@@ -14,6 +14,10 @@ from ..regression_kernels import (
 )
 from .common import residualize_matrix_with_covariates, residualize_batch
 
+__all__ = [
+    "map_nominal",
+]
+
 def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float = 0.0,
                       chrom: str | None = None, sink: "ParquetSink | None" = None):
     """
