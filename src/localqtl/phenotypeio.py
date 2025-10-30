@@ -79,10 +79,11 @@ def read_phenotype_bed(path, as_tensor=False, device="cpu", dtype="float32"):
     pos_df = df[["chr", "start", "end"]].copy()
     df = df.drop(["chr", "start", "end"], axis=1)
 
-    # Sort check
-    sorted_pos = pos_df.sort_values(["chr", "start", "end"]).reset_index(drop=True)
-    if not pos_df.reset_index(drop=True).equals(sorted_pos):
-        raise ValueError("Positions in BED file must be sorted by chr/start/end")
+    # Ensure consistent ordering of phenotypes and positions
+    ordered_pos = pos_df.sort_values(["chr", "start", "end"])  # lexicographic
+    if not pos_df.index.equals(ordered_pos.index):
+        pos_df = ordered_pos
+        df = df.loc[pos_df.index]
 
     # Collapse start==end to pos
     if (pos_df["start"] == pos_df["end"]).all():
