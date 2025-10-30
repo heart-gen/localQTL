@@ -4,7 +4,10 @@ Statistical helpers (kept separate to avoid pulling SciPy into low-level kernels
 from __future__ import annotations
 import torch
 import numpy as np
+import pandas as pd
 from scipy import stats
+from py_qvalue import qvalue, pi0est
+from typing import Optional, Sequence, Union, Tuple
 
 def beta_approx_pval(r2_perm: np.ndarray, r2_true: float) -> tuple[float, float, float]:
     """
@@ -138,3 +141,64 @@ def nominal_pvals_tensorqtl(
         t_g = tstats[:, 0].abs()
         pvals = t_two_sided_pval_torch(t_g, dof)
         return pvals, dof
+
+
+def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
+                      qvalue_lambda: Optional[Union[float, Sequence[float]]] = None,
+                      logger: Optional[SimpleLogger] = None) -> pd.DataFrame:
+    """Annotate permutation results with q-values, p-value threshold"""
+    logger = logger or SimpleLogger()
+
+    if res_df.empty:
+        logger.write("Computing q-values: Input is empty, returning unchanged.")
+        return res_df.copy()
+    
+    # Choose p-value column
+    use_beta = ("pval_beta" in res_df.columns) and (~res_df["pval_beta"].isna()).any()
+    pcol = "pval_beta" if use_beta else "pval_perm"
+    logger.write(f"Computing q-values on '{pcol}' ({res_df.shape[0]} phenotypes).")
+
+    # Optional correlation report (only if we have >2 finite pairs)
+    if "pval_perm" in res_df.columns and "pval_beta" in res_df.columns:
+        mask = res_df["pval_perm"].notna() & res_df["pval_beta"].notna()
+        if mask.sum() >= 3:
+            r = stats.pearsonr(res_df.loc[mask, "pval_perm"], res_df.loc[mask, "pval_beta"])[0]
+            logger.write(f"  * Corr(p_perm, p_beta) = {r:.4f}")
+        else:
+            logger.write("  * Skipping corr(p_perm, p_beta): insufficient non-NaN values.")
+
+    # Compute q-values
+    p = res_df[pcol].to_numpy(dtype=float)
+    if not np.all(np.isfinite(p)):
+        logger.write("  * WARNING: non-finite p-values found; replacing with 1.0 for q-value calc.")
+        p = np.where(np.isfinite(p), p, 1.0)
+
+    if qvalue_lambda is not None:
+        logger.write(f'  * Calculating q-values with lambda = {qvalue_lambda:.3f}')
+
+    qvals_res = qvalue(p, lambda_qvalue=qvalue_lambda)
+    qvals, pi0 = qvals_res["qvalues"], qvals_res["pi0"]
+
+    res_df['qval'] = qvals
+    logger.write(f'  * Proportion of significant phenotypes (1-pi0): {1-pi0:.2f}')
+    logger.write(f"  * QTL phenotypes @ FDR {fdr:.2f}: {(res_df['qval'] <= fdr).sum()}")
+
+    # Nominal threshold per phenotype via Beta params
+    res_df["pval_nominal_threshold"] = np.nan
+    if use_beta:
+        have_params = res_df["beta_shape1"].notna() & res_df["beta_shape2"].notna()
+        if have_params.any():
+            lb = res_df.loc[(res_df["qval"] <= fdr) & have_params, "pval_beta"].sort_values()
+            ub = res_df.loc[(res_df["qval"] >  fdr) & have_params, "pval_beta"].sort_values()
+            if not lb.empty:
+                # global threshold p* between last sig and first non-sig (tensorQTL convention)
+                p_star = lb.iloc[-1] if ub.empty else 0.5 * (lb.iloc[-1] + ub.iloc[0])
+                # phenotype-wise nominal cutoff from Beta quantile
+                from scipy.stats import beta as beta_dist
+                idx = have_params[have_params].index
+                res_df.loc[idx, "pval_nominal_threshold"] = beta_dist.ppf(
+                    p_star, a=res_df.loc[idx, "beta_shape1"], b=res_df.loc[idx, "beta_shape2"]
+                )
+                logger.write(f"  * min p-value threshold @ FDR {fdr:.2f}: {p_star:.6g} (beta-quantile per phenotype)")
+        else:
+            logger.write("  * No beta parameters present; skipping nominal threshold computation.")
