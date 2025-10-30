@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional, List
 
-from ..utils import SimpleLogger
+from ..utils import SimpleLogger, subseed
 from ..stats import beta_approx_pval, get_t_pval
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from ..preproc import impute_mean_and_filter, allele_stats, filter_by_maf
@@ -14,7 +14,8 @@ from ..regression_kernels import (
 from .common import residualize_matrix_with_covariates, residualize_batch
 
 def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
-                          beta_approx: bool = True, maf_threshold: float = 0.0) -> pd.DataFrame:
+                          beta_approx: bool = True, maf_threshold: float = 0.0,
+                          seed: int | None = None) -> pd.DataFrame:
     """
     One top association per phenotype with empirical permutation p-value (no grouping).
     Compatible with InputGeneratorCis and InputGeneratorCisWithHaps (ungrouped only).
@@ -66,8 +67,14 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
         # Compute effective covariate rank for DoF
         k_eff = rez.Q_t.shape[1] if rez is not None else 0
 
+        # Build per-phenotype generator
+        gen = None
+        if seed is not None:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(subseed(seed, pid))
+
         # Build permuted phenotypes (n x nperm)
-        perms = [torch.randperm(y_t.shape[0], device=device) for _ in range(nperm)]
+        perms = [torch.randperm(y_t.shape[0], device=device, generator=gen) for _ in range(nperm)]
         y_perm = torch.stack([y_t[idxp] for idxp in perms], dim=1)
         
         # Run batched regression with permutations
@@ -139,7 +146,8 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
 
 
 def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
-                                beta_approx: bool = True, maf_threshold: float = 0.0) -> pd.DataFrame:
+                                beta_approx: bool = True, maf_threshold: float = 0.0,
+                                seed: int | None = None) -> pd.DataFrame:
     """
     Group-aware permutation mapping: returns one top association per *group* (best phenotype within group),
     with empirical p-values computed by taking the max R² across variants and phenotypes for each permutation.
@@ -221,8 +229,14 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
         r2_perm_list = []
         for j in range(Y_resid.shape[0]):
             y_t = Y_resid[j, :]
+            # Per-(group, phenotype) generator
+            gen = None
+            if seed is not None:
+                gen = torch.Generator(device=device)
+                gen.manual_seed(subseed(seed, f"{group_id}:{ids[j]}"))
+
             # Permutations for phenotype j
-            perms = [torch.randperm(n, device=device) for _ in range(nperm)]
+            perms = [torch.randperm(n, device=device, generator=gen) for _ in range(nperm)]
             y_perm = torch.stack([y_t[idxp] for idxp in perms], dim=1)  # (n x nperm)
 
             betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
@@ -296,8 +310,8 @@ def map_permutations(
         phenotype_pos_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame] = None,
         haplotypes: Optional[object] = None, loci_df: Optional[pd.DataFrame] = None,
         group_s: Optional[pd.Series] = None, maf_threshold: float = 0.0,
-        window: int = 1_000_000, nperm: int = 10_000,
-        device: str = "cuda", beta_approx: bool = True,
+        window: int = 1_000_000, nperm: int = 10_000, device: str = "cuda",
+        beta_approx: bool = True, seed: int | None = None,
         logger: SimpleLogger | None = None, verbose: bool = True
 ) -> pd.DataFrame:
     """
@@ -316,6 +330,7 @@ def map_permutations(
     logger.write(f"  * {variant_df.shape[0]} variants")
     logger.write(f"  * cis-window: \u00B1{window:,}")
     logger.write(f"  * nperm={nperm:,} (beta_approx={'on' if beta_approx else 'off'})")
+    logger.write(f"  * seed: {seed}")
     if maf_threshold and maf_threshold > 0:
         logger.write(f"  * applying in-sample {maf_threshold:g} MAF filter")
     if covariates_df is not None:
@@ -346,4 +361,5 @@ def map_permutations(
     with logger.time_block("Computing associations (permutations)", sync=sync):
         core = _run_permutation_core_group if getattr(ig, "group_s", None) is not None else _run_permutation_core
         return core(ig, variant_df, rez, nperm=nperm, device=device,
-                    beta_approx=beta_approx, maf_threshold=maf_threshold)
+                    beta_approx=beta_approx, maf_threshold=maf_threshold,
+                    seed=seed)

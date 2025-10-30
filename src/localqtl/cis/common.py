@@ -5,6 +5,13 @@ from typing import Optional, Tuple, List
 
 from ..regression_kernels import Residualizer
 
+def _make_gen(seed: int | None, device: str) -> torch.Generator | None:
+    if seed is None:
+        return None
+    g = torch.Generator(device=device)
+    g.manual_seed(int(seed) & ((1 << 63) - 1))
+    return g
+
 def dosage_vector_for_covariate(genotype_df: pd.DataFrame, variant_id: str,
                                 sample_order: pd.Index, missing: float | int | None) -> np.ndarray:
     """Fetch a dosage row aligned to samples; impute 'missing' to mean of observed."""

@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
-from ..utils import SimpleLogger
+from ..utils import SimpleLogger, subseed
 from ..stats import beta_approx_pval, get_t_pval
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from ..preproc import impute_mean_and_filter, allele_stats, filter_by_maf
@@ -18,7 +18,7 @@ def _run_independent_core(
         ig, variant_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame],
         signif_seed_df: pd.DataFrame, signif_threshold: float, nperm: int,
         device: str, maf_threshold: float = 0.0, random_tiebreak: bool = False,
-        missing: float = -9.0, beta_approx: bool = True,
+        missing: float = -9.0, beta_approx: bool = True, seed: int | None = None
 ) -> pd.DataFrame:
     """Forward–backward independent mapping for ungrouped phenotypes."""
     out_rows = []
@@ -69,9 +69,15 @@ def _run_independent_core(
         # Minor-allele stats (pre-residualization)
         af_t, ma_samples_t, ma_count_t = allele_stats(G_t, ploidy=2)
 
+        # Build per-phenotype generator
+        gen = None
+        if seed is not None:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(subseed(seed, pid))
+
         # Fixed permutations for this phenotype
         n = y_t.shape[0]
-        perms = torch.stack([torch.randperm(n, device=device) for _ in range(nperm)], dim=0)  # (nperm, n)
+        perms = torch.stack([torch.randperm(n, device=device, generator=gen) for _ in range(nperm)], dim=0)  # (nperm, n)
 
         # Forward pass
         forward_rows = [seed_row.to_frame().T]  # initialize with seed from cis_df
@@ -110,9 +116,14 @@ def _run_independent_core(
             t_g = tstats[:, 0]
             r2_nominal_vec = (t_g.double().pow(2) / (t_g.double().pow(2) + dof))
             r2_np = r2_nominal_vec.detach().cpu().numpy()
-            r2_max = np.nanmax(r2_np)
-            ix = (int(np.random.choice(np.flatnonzero(np.isclose(r2_np, r2_max, atol=1e-12)))))
-            if not random_tiebreak:
+            if random_tiebreak:
+                ties = np.flatnonzero(np.isclose(r2_np, r2_max, atol=1e-12))
+                if gen is None:
+                    choice = int(torch.randint(0, len(ties), (1,)).item())
+                else:
+                    choice = int(torch.randint(0, len(ties), (1,), generator=gen).item())
+                ix = int(ties[choice])
+            else:
                 ix = int(np.nanargmax(r2_np))
 
             # Stats for the selected variant
@@ -191,6 +202,7 @@ def _run_independent_core(
 
                 rez_aug = Residualizer(torch.tensor(C_aug, dtype=torch.float32, device=device)) if C_aug.shape[1] > 0 else None
                 y_resid, G_resid, H_resid = residualize_batch(y_t, G_t, H_t, rez_aug, center=True, group=False)
+                perms = [torch.randperm(n, device=device, generator=gen) for _ in range(nperm)]
                 y_perm = torch.stack([y_resid[idxp] for idxp in perms], dim=1)
 
                 k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
@@ -201,9 +213,14 @@ def _run_independent_core(
                 dof = max(int(n) - int(k_eff) - int(p_pred), 1)
                 t_g = tstats[:, 0]
                 r2_np = (t_g.double().pow(2) / (t_g.double().pow(2) + dof)).detach().cpu().numpy()
-                r2_max = np.nanmax(r2_np)
-                ix = (int(np.random.choice(np.flatnonzero(np.isclose(r2_np, r2_max, atol=1e-12)))))
-                if not random_tiebreak:
+                if random_tiebreak:
+                    ties = np.flatnonzero(np.isclose(r2_np, r2_max, atol=1e-12))
+                    if gen is None:
+                        choice = int(torch.randint(0, len(ties), (1,)).item())
+                    else:
+                        choice = int(torch.randint(0, len(ties), (1,), generator=gen).item())
+                    ix = int(ties[choice])
+                else:
                     ix = int(np.nanargmax(r2_np))
 
                 beta = float(betas[ix, 0].detach().cpu().numpy())
@@ -259,11 +276,11 @@ def _run_independent_core(
     return pd.concat(out_rows, axis=0, ignore_index=True)
 
 
-def _run_independent_core_group(
+def _run_independent_core_group( ## TODO: Needs updating
         ig, variant_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame],
         seed_by_group_df: pd.DataFrame, signif_threshold: float, nperm: int,
         device: str, maf_threshold: float = 0.0, random_tiebreak: bool = False,
-        missing: float = -9.0, beta_approx: bool = True,
+        missing: float = -9.0, beta_approx: bool = True, seed: int | None = None
 ) -> pd.DataFrame:
     """Forward–backward independent mapping for grouped phenotypes."""
     out_rows = []
@@ -307,7 +324,11 @@ def _run_independent_core_group(
                 H_t = H_t[:, :, :-1]
 
         n = ig.phenotype_df.shape[1]
-        perms = torch.stack([torch.randperm(n, device=device) for _ in range(nperm)], dim=0)
+        gen = None
+        if seed is not None:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(subseed(seed, pid))
+        perms = torch.stack([torch.randperm(n, device=device, generator=gen) for _ in range(nperm)], dim=0)
 
         dosage_dict = {seed_vid: dosage_vector_for_covariate(
             genotype_df=ig.genotype_df,
@@ -547,7 +568,7 @@ def map_independent(
         group_s: Optional[pd.Series] = None, maf_threshold: float = 0.0,
         fdr: float = 0.05, fdr_col: str = "qval", nperm: int = 10_000,
         window: int = 1_000_000, missing: float = -9.0, random_tiebreak: bool = False,
-        device: str = "auto", beta_approx: bool = True,
+        device: str = "auto", beta_approx: bool = True, seed: int | None = None,
         logger: SimpleLogger | None = None, verbose: bool = True,
 ) -> pd.DataFrame:
     """Entry point: build IG; derive seed/threshold from cis_df; dispatch to grouped/ungrouped core."""
@@ -609,7 +630,8 @@ def map_independent(
                 ig=ig, variant_df=variant_df, covariates_df=covariates_df,
                 signif_seed_df=signif_seed_df, signif_threshold=signif_threshold,
                 nperm=nperm, device=device, maf_threshold=maf_threshold,
-                random_tiebreak=random_tiebreak, missing=missing, beta_approx=beta_approx,
+                random_tiebreak=random_tiebreak, missing=missing,
+                beta_approx=beta_approx, seed=seed
             )
         else:
             if "group_id" not in signif_df.columns:
@@ -620,5 +642,6 @@ def map_independent(
                 ig=ig, variant_df=variant_df, covariates_df=covariates_df,
                 seed_by_group_df=seed_by_group_df, signif_threshold=signif_threshold,
                 nperm=nperm, device=device, maf_threshold=maf_threshold,
-                random_tiebreak=random_tiebreak, missing=missing, beta_approx=beta_approx,
+                random_tiebreak=random_tiebreak, missing=missing,
+                beta_approx=beta_approx, seed=seed
             )
