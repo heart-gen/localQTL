@@ -1,5 +1,8 @@
 """
 Statistical helpers (kept separate to avoid pulling SciPy into low-level kernels).
+Adapted from tensorqtl:
+  - https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/core.py
+  - https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/post.py
 """
 from __future__ import annotations
 import torch
