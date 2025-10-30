@@ -4,7 +4,7 @@ import pytest
 
 import sys
 sys.path.append("src")
-import pgen
+import localqtl.pgen as pgen
 
 def test_impute_mean_vector():
     arr = np.array([1, -9, 2], dtype=np.int32)

@@ -1,9 +1,8 @@
 import numpy as np
 import pandas as pd
 import pytest
-import sys
-sys.path.append("src")
-import phenotypeio as ph
+
+import src.localqtl.phenotypeio as ph
 
 def test_gpu_available_returns_bool(monkeypatch):
     monkeypatch.setattr("phenotypeio.cp", None)  # pretend no cupy

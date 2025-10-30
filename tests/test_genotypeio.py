@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from localqtl.genotypeio import (
+from src.localqtl.genotypeio import (
     _impute_mean,
     get_cis_ranges,
     InputGeneratorCis,
