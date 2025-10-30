@@ -93,6 +93,7 @@ mapper = CisMapper(
 
 nominal_df = mapper.map_nominal(nperm=1_000)
 perm_df = mapper.map_permutations(nperm=1_000, beta_approx=True)
+perm_df = mapper.calculate_qvalues(perm_df, fdr=0.05)
 lead_df = mapper.map_independent(cis_df=perm_df, fdr=0.05)
 ```
 
