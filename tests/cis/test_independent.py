@@ -2,7 +2,7 @@ import numpy as np
 import torch
 
 from src.localqtl.cis.independent import map_independent
-from src/localqtl.cis.permutations import map_permutations
+from src.localqtl.cis.permutations import map_permutations
 from src.localqtl.utils import SimpleLogger
 
 
