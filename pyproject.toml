@@ -20,6 +20,7 @@ pandas = "^2.3.3"
 pgenlib = "^0.93.0"
 rfmix-reader = "^0.2.0"
 pandas-plink = {git = "https://github.com/KrotosBenjamin/pandas-plink.git"}
+py-qvalue = "^0.1.0"
 
 [tool.poetry.urls]
 homepage = "https://github.com/heart-gen/localQTL"
@@ -34,3 +35,12 @@ dirty = true
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pytest (>=8.4.2,<9.0.0)",
+    "ruff (>=0.14.2,<0.15.0)",
+    "black (>=25.9.0,<26.0.0)",
+    "mypy (>=1.18.2,<2.0.0)",
+    "pytest-cov (>=7.0.0,<8.0.0)"
+]
