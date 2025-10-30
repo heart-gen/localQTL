@@ -24,6 +24,7 @@ py-qvalue = "^0.1"
 cupy-cuda12x = "^13.6"
 cudf-cu12 = "^25.10"
 pyarrow = "^22.0"
+dask-cudf-cu12 = "^25.10.0"
 
 [tool.poetry.urls]
 homepage = "https://github.com/heart-gen/localQTL"

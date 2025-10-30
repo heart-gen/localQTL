@@ -804,14 +804,14 @@ tests = ["pytest", "pytest-cov", "pytest-xdist"]
 
 [[package]]
 name = "dask"
-version = "2025.10.0"
+version = "2025.9.1"
 description = "Parallel PyData with Task Scheduling"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "dask-2025.10.0-py3-none-any.whl", hash = "sha256:86c0a4aecbed3eae938f13a52bcc3fdc35852cce34d7d701590c15850b92506e"},
-    {file = "dask-2025.10.0.tar.gz", hash = "sha256:fd3159c319c27cea39b891c0f22d60056a33575fb4906618eab0aeeb5dcd0cbc"},
+    {file = "dask-2025.9.1-py3-none-any.whl", hash = "sha256:2a8a7dc933caaea2f47745a65a6ec93d9e616e12aab53b4f03ee161d31939110"},
+    {file = "dask-2025.9.1.tar.gz", hash = "sha256:718df73e1fd3d7e2b8546e0f04ce08e1ed7f9aa3da1eecd0c1f44c8b6d52f7e0"},
 ]
 
 [package.dependencies]
@@ -832,8 +832,31 @@ array = ["numpy (>=1.24)"]
 complete = ["dask[array,dataframe,diagnostics,distributed]", "lz4 (>=4.3.2)", "pyarrow (>=14.0.1)"]
 dataframe = ["dask[array]", "pandas (>=2.0)", "pyarrow (>=14.0.1)"]
 diagnostics = ["bokeh (>=3.1.0)", "jinja2 (>=2.10.3)"]
-distributed = ["distributed (==2025.10.0)"]
+distributed = ["distributed (==2025.9.1)"]
 test = ["pandas[test]", "pre-commit", "pytest", "pytest-cov", "pytest-mock", "pytest-rerunfailures", "pytest-timeout", "pytest-xdist"]
+
+[[package]]
+name = "dask-cudf-cu12"
+version = "25.10.0"
+description = "Utilities for Dask and cuDF interactions"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "dask_cudf_cu12-25.10.0-py3-none-any.whl", hash = "sha256:701fe8a8c16e136f890598a4162f1064071d6ba8a65654694a7cc49397b34610"},
+]
+
+[package.dependencies]
+cudf-cu12 = "==25.10.*"
+cupy-cuda12x = ">=13.6.0"
+fsspec = ">=0.6.0"
+numpy = ">=1.23,<3.0a0"
+nvidia-ml-py = ">=12"
+pandas = ">=2.0,<2.4.0dev0"
+rapids-dask-dependency = "==25.10.*"
+
+[package.extras]
+test = ["dask-cuda (==25.10.*)", "pytest", "pytest-cov", "pytest-xdist"]
 
 [[package]]
 name = "defusedxml"
@@ -866,20 +889,20 @@ dev = ["PyTest", "PyTest-Cov", "bump2version (<1)", "setuptools ; python_version
 
 [[package]]
 name = "distributed"
-version = "2025.10.0"
+version = "2025.9.1"
 description = "Distributed scheduler for Dask"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "distributed-2025.10.0-py3-none-any.whl", hash = "sha256:613281c2796e4b3f349c9a1c0ef95b84a6b58f7a17d93206758a6902bd96913d"},
-    {file = "distributed-2025.10.0.tar.gz", hash = "sha256:b6aed021b246fa9e632d87922d6d1ed8d4671a47de2cf671ad9e2932108ace8c"},
+    {file = "distributed-2025.9.1-py3-none-any.whl", hash = "sha256:9453a2216cb9c686be12ad66b9c8698df3c3917565367de5797993a5f83f30ba"},
+    {file = "distributed-2025.9.1.tar.gz", hash = "sha256:285e0de86fd5e1b941f283f5fd661884645a6a28b06d2a2fdb18079b823aca58"},
 ]
 
 [package.dependencies]
 click = ">=8.0"
 cloudpickle = ">=3.0.0"
-dask = "2025.10.0"
+dask = "2025.9.1"
 jinja2 = ">=2.10.3"
 locket = ">=1.0.0"
 msgpack = ">=1.0.2"
@@ -2151,6 +2174,18 @@ files = [
 ]
 
 [[package]]
+name = "nvidia-ml-py"
+version = "13.580.82"
+description = "Python Bindings for the NVIDIA Management Library"
+optional = false
+python-versions = "*"
+groups = ["main"]
+files = [
+    {file = "nvidia_ml_py-13.580.82-py3-none-any.whl", hash = "sha256:4361db337b0c551e2d101936dae2e9a60f957af26818e8c0c3a1f32b8db8d0a7"},
+    {file = "nvidia_ml_py-13.580.82.tar.gz", hash = "sha256:0c028805dc53a0e2a6985ea801888197765ac2ef8f1c9e29a7bf0d3616a5efc7"},
+]
+
+[[package]]
 name = "nvidia-nccl-cu12"
 version = "2.27.5"
 description = "NVIDIA Collective Communication Library (NCCL) Runtime"
@@ -3158,6 +3193,24 @@ files = [
 ]
 
 [[package]]
+name = "rapids-dask-dependency"
+version = "25.10.0"
+description = "Dask and Distributed version pinning for RAPIDS"
+optional = false
+python-versions = "*"
+groups = ["main"]
+files = [
+    {file = "rapids_dask_dependency-25.10.0-py3-none-any.whl", hash = "sha256:0bbba995fb685a31e6c1b50800af47a4ccfdf8da6f37d7640b51289d9ce5a499"},
+]
+
+[package.dependencies]
+dask = "2025.9.1"
+distributed = "2025.9.1"
+
+[package.extras]
+test = ["pytest"]
+
+[[package]]
 name = "rapids-logger"
 version = "0.1.19"
 description = "Logging framework for RAPIDS built around spdlog"
@@ -4050,4 +4103,4 @@ cffi = ["cffi (>=1.11)"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.15"
-content-hash = "d4cce10a8eb3ca6c5fa4aedde245faba253d426c6359a7c9cecabc2cdeee88c3"
+content-hash = "f92fe486415991006ddcfbc72f095b1c48031934c08292aa7ba849cad0379c13"
