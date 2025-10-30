@@ -144,7 +144,8 @@ class PgenReader(object):
             return torch.as_tensor(arr, device=self.device)
         return arr
 
-    def read_range(self, start_idx, end_idx, impute_mean=True, dtype=np.float32):
+    def read_range(self, start_idx, end_idx, impute_mean=True, dtype=np.float32,
+                   dosage=False):
         """Read contiguous block of variants by index."""
         nvar = end_idx - start_idx + 1
         nsamp = len(self.sample_ids)
