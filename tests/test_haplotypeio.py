@@ -162,31 +162,33 @@ def test_inputgeneratorciswithhaps_batches_match_cis(toy_hap_data_2anc):
     # materialize generator to list so background wrapper fully runs
     batches = list(gen.generate_data(verbose=True))
 
-    # We expect exactly 1 phenotype ("g1") in toy_data
-    assert len(batches) == 1
+    # toy_hap_data_2anc contains three non-constant phenotypes (geneA/B/C)
+    # so we expect one batch per phenotype, matching InputGeneratorCis behavior.
+    assert len(batches) == 3
 
-    p, G, v_idx, H, pid = batches[0]
+    expected_pids = ["geneA", "geneB", "geneC"]
 
-    # pid should be the phenotype ID from toy data
-    assert pid == "g1"
+    for (p, G, v_idx, H, pid), expected_pid in zip(batches, expected_pids):
+        # pid should be the phenotype ID from toy data
+        assert pid == expected_pid
 
-    # p is (samples,), G is (variants_in_window x samples),
-    # v_idx is indices into variant_df/genotype_df,
-    # H is (variants_in_window x samples x ancestries)
-    assert p.shape[0] == geno_df.shape[1]            # samples
-    assert G.shape[1] == geno_df.shape[1]            # samples
-    assert H.shape[1] == geno_df.shape[1]            # samples
-    assert H.shape[2] == 2                           # ancestries in toy_hap_data_2anc
+        # p is (samples,), G is (variants_in_window x samples),
+        # v_idx is indices into variant_df/genotype_df,
+        # H is (variants_in_window x samples x ancestries)
+        assert p.shape[0] == geno_df.shape[1]            # samples
+        assert G.shape[1] == geno_df.shape[1]            # samples
+        assert H.shape[1] == geno_df.shape[1]            # samples
+        assert H.shape[2] == 2                           # ancestries in toy_hap_data_2anc
 
-    # v_idx should be increasing indices into variant_df/genotype_df rows
-    assert np.all(np.diff(v_idx) >= 0)
+        # v_idx should be increasing indices into variant_df/genotype_df rows
+        assert np.all(np.diff(v_idx) >= 0)
 
-    # H rows should correspond exactly to those v_idx rows from the input haplotype cube
-    # (after interpolation). So shape[0] should equal len(v_idx).
-    assert H.shape[0] == len(v_idx)
+        # H rows should correspond exactly to those v_idx rows from the input haplotype cube
+        # (after interpolation). So shape[0] should equal len(v_idx).
+        assert H.shape[0] == len(v_idx)
 
-    # After interpolation, NaNs in partially-missing columns should be filled
-    assert not np.isnan(H).any()
+        # After interpolation, NaNs in partially-missing columns should be filled
+        assert not np.isnan(H).any()
 
 
 def test_interpolate_block_handles_nans(toy_hap_data_3anc):
