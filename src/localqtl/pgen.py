@@ -145,7 +145,7 @@ class PgenReader(object):
         return arr
 
     def read_range(self, start_idx, end_idx, impute_mean=True, dtype=np.float32,
-                   dosage=False):
+                   dosages=False):
         """Read contiguous block of variants by index."""
         nvar = end_idx - start_idx + 1
         nsamp = len(self.sample_ids)
@@ -159,7 +159,7 @@ class PgenReader(object):
             else:
                 r.read_range(start_idx, end_idx + 1, arr)
 
-        if not dosage and self.impute:
+        if not dosages and self.impute:
             arr = _impute_mean(arr)
 
         arr = arr.astype(self.dtype, copy=False)
