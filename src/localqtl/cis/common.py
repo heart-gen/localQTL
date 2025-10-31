@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Tuple, List
 
+from .._torch_utils import move_to_device, resolve_device
 from ..regression_kernels import Residualizer
 
 __all__ = [
@@ -10,6 +11,13 @@ __all__ = [
     "residualize_matrix_with_covariates",
     "residualize_batch",
 ]
+
+
+def _coerce_tensor(value, device: torch.device) -> torch.Tensor:
+    return move_to_device(value, device) if torch.is_tensor(value) else torch.as_tensor(
+        value, dtype=torch.float32, device=device
+    )
+
 
 def _make_gen(seed: int | None, device: str) -> torch.Generator | None:
     if seed is None:
@@ -44,9 +52,10 @@ def residualize_matrix_with_covariates(
     """
     if C is None:
         return Y, None
-    C_t = torch.tensor(C.values, dtype=torch.float32, device=device)
+    dev = resolve_device(device)
+    C_t = torch.tensor(C.values, dtype=torch.float32, device=dev)
     rez = Residualizer(C_t)
-    (Y_resid,) = rez.transform(Y, center=True)
+    (Y_resid,) = rez.transform(move_to_device(Y, dev), center=True)
     return Y_resid, rez
 
 
@@ -60,12 +69,12 @@ def residualize_batch(
     - If group=True:  y is a stack (k x n) or list of length k, returns (list_of_k 1D tensors, G_resid, H_resid).
     """
     if rez is not None and hasattr(rez, "Q_t") and getattr(rez.Q_t, "numel", lambda: 0)() > 0:
-        dev = rez.Q_t.device
+        dev = resolve_device(rez.Q_t.device)
     else:
-        dev = G.device
-    G = G.to(dev)
+        dev = resolve_device(G.device)
+    G = move_to_device(G, dev)
     if H is not None:
-        H = H.to(dev)
+        H = move_to_device(H, dev)
 
     if rez is None:
         # Pass-through; normalize return type for group mode
@@ -82,18 +91,15 @@ def residualize_batch(
     # Build Y on the same device as G/rez
     if group:
         if isinstance(y, (list, tuple)):
-            Y = torch.stack([yi if torch.is_tensor(yi) else torch.as_tensor(yi, dtype=torch.float32, device=dev)
-                             for yi in y], dim=0).to(dev)
+            Y = torch.stack([_coerce_tensor(yi, dev) for yi in y], dim=0)
         else:
-            Y = (y if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32, device=dev))
+            Y = _coerce_tensor(y, dev)
             if Y.ndim == 1:
                 Y = Y.unsqueeze(0)
-            Y = Y.to(dev)
     else:
-        Y = (y if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32, device=dev))
+        Y = _coerce_tensor(y, dev)
         if Y.ndim == 1:
             Y = Y.unsqueeze(0)
-        Y = Y.to(dev)
     
     # Prepare matrices for one-pass residualization
     mats: List[torch.Tensor] = [G]
