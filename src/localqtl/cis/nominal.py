@@ -3,11 +3,10 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 from typing import Optional
-from collections import defaultdict
 
 from ..utils import SimpleLogger
 from ..stats import nominal_pvals_tensorqtl
-from ..iosinks import AsyncParquetSink, RowGroupBuffer
+from ..iosinks import AsyncParquetSink
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from ..preproc import impute_mean_and_filter, allele_stats, filter_by_maf
 from ..regression_kernels import (
@@ -42,8 +41,65 @@ def _nominal_parquet_schema(include_perm: bool) -> pa.Schema:
     return pa.schema(fields)
 
 
+def _count_cis_pairs(ig, chrom: str | None = None) -> int:
+    """Return the number of cis variant-phenotype pairs for a chromosome."""
+    total = 0
+    group_mode = getattr(ig, "group_s", None) is not None
+    for batch in ig.generate_data(chrom=chrom):
+        if not group_mode:
+            if len(batch) in (4, 5):
+                _, G_block, _, _ = batch
+                n_phen = 1
+            else:
+                raise ValueError(f"Unexpected batch length for cis count: {len(batch)}")
+        else:
+            if len(batch) == 5:
+                _, G_block, _, ids, _ = batch
+            elif len(batch) == 6:
+                _, G_block, _, _, ids, _ = batch
+            else:
+                raise ValueError(f"Unexpected grouped batch length for cis count: {len(batch)}")
+            n_phen = len(ids)
+        total += G_block.shape[0] * n_phen
+    return int(total)
+
+
+def _allocate_buffers(expected_columns, include_perm: bool, target_rows: int) -> dict[str, np.ndarray]:
+    target = max(int(target_rows), 0)
+    buffers: dict[str, np.ndarray] = {
+        "phenotype_id":   np.empty(target, dtype=object),
+        "variant_id":     np.empty(target, dtype=object),
+        "pos":            np.empty(target, dtype=np.int32),
+        "start_distance": np.empty(target, dtype=np.int32),
+        "end_distance":   np.empty(target, dtype=np.int32),
+        "beta":           np.empty(target, dtype=np.float32),
+        "se":             np.empty(target, dtype=np.float32),
+        "tstat":          np.empty(target, dtype=np.float32),
+        "pval_nominal":   np.empty(target, dtype=np.float32),
+        "af":             np.empty(target, dtype=np.float32),
+        "ma_samples":     np.empty(target, dtype=np.int32),
+        "ma_count":       np.empty(target, dtype=np.int32),
+    }
+    if include_perm:
+        buffers["perm_max_r2"] = np.empty(target, dtype=np.float32)
+    return buffers
+
+
+def _buffers_to_arrow(buffers: dict[str, np.ndarray], schema: pa.Schema, n_rows: int) -> pa.Table:
+    arrays = []
+    n = int(n_rows)
+    for field in schema:
+        data = buffers.get(field.name)
+        if data is None:
+            arrays.append(pa.nulls(n, type=field.type))
+        else:
+            arrays.append(pa.array(data[:n], type=field.type))
+    return pa.Table.from_arrays(arrays, schema=schema)
+
+
 def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float = 0.0,
-                      chrom: str | None = None, sink: "ParquetSink | None" = None):
+                      chrom: str | None = None, sink: "ParquetSink | None" = None,
+                      target_rows: int | None = None):
     """
     Shared inner loop for nominal (and optional permutation) mapping.
     Handles both InputGeneratorCis (no haps) and InputGeneratorCisWithHaps (haps).
@@ -62,11 +118,15 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
     if include_perm:
         expected_columns.append("perm_max_r2")
 
-    # Row-group buffer
-    rgbuf = RowGroupBuffer(expected_columns,
-                           target_rows=DEFAULT_ROW_GROUP_SIZE) if sink is not None else None
+    if target_rows is None:
+        if chrom is None:
+            target_rows = _count_cis_pairs(ig, chrom=None)
+        else:
+            target_rows = _count_cis_pairs(ig, chrom)
 
-    out_rows = []
+    buffers = _allocate_buffers(expected_columns, include_perm, target_rows)
+    cursor = 0
+    variant_cache: dict[bytes, tuple[np.ndarray, np.ndarray]] = {}
     group_mode = getattr(ig, "group_s", None) is not None
     for batch in ig.generate_data(chrom=chrom):
         if not group_mode: # Ungrouped
@@ -128,12 +188,16 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
         y_iter = list(zip(y_resid, id_list)) if group_mode else [(y_resid, id_list[0])]
 
         # Variant metadata
-        var_ids = idx_to_id[v_idx]
-        var_pos = pos_arr[v_idx]
+        cache_key = v_idx.tobytes()
+        if cache_key in variant_cache:
+            var_ids, var_pos = variant_cache[cache_key]
+        else:
+            var_ids = idx_to_id[v_idx]
+            var_pos = pos_arr[v_idx].astype(np.int32, copy=False)
+            variant_cache[cache_key] = (var_ids, var_pos)
         k_eff = rez.Q_t.shape[1] if rez is not None else 0
 
         # Per-phenotype regressions in this window
-        batch_columns = defaultdict(list) if sink is not None else None
         for y_t, pid in y_iter:
             if include_perm:
                 perms = [torch.randperm(y_t.shape[0], device=device) for _ in range(nperm)]
@@ -155,11 +219,6 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 r2_perm = perm_max_r2 = None
 
             # Distances to phenotype start/end
-            start_pos = ig.phenotype_start[pid]
-            end_pos = ig.phenotype_end[pid]
-            start_distance = var_pos - start_pos
-            end_distance = var_pos - end_pos
-
             n_variants = var_ids.shape[0]
 
             # Pack and one GPU -> CPU transfer
@@ -170,50 +229,44 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
             floats = floats_t.detach().to("cpu", non_blocking=True).numpy()
             ints   = ints_t.detach().to("cpu", non_blocking=True).numpy()
 
-            beta_np, se_np, tstat_np, pval_np, af_np = (floats[:,i] for i in range(5))
-            ma_samples_np, ma_count_np = ints[:,0], ints[:,1]
-            
-            result_block = {
-                "phenotype_id":   np.full(n_variants, str(pid), dtype=object),
-                "variant_id":     np.asarray(var_ids, dtype=str),
-                "pos":            np.asarray(var_pos, dtype=np.int32),
-                "start_distance": np.asarray(start_distance, dtype=np.int32),
-                "end_distance":   np.asarray(end_distance, dtype=np.int32),
-                "beta":           beta_np,
-                "se":             se_np,
-                "tstat":          tstat_np,
-                "pval_nominal":   pval_np,
-                "af":             af_np,
-                "ma_samples":     ma_samples_np,
-                "ma_count":       ma_count_np,
-            }
-            if include_perm and perm_max_r2 is not None:
-                result_block["perm_max_r2"] = np.full(n_variants, perm_max_r2, dtype=np.float32)
+            row_slice = slice(cursor, cursor + n_variants)
 
-            if sink is None:
-                out_rows.append(pd.DataFrame(result_block, columns=expected_columns))
-            else:
-                for key, value in result_block.items():
-                    batch_columns[key].append(value)
+            buffers["phenotype_id"][row_slice] = str(pid)
+            buffers["variant_id"][row_slice] = var_ids
+            buffers["pos"][row_slice] = var_pos
+            np.subtract(var_pos, ig.phenotype_start[pid],
+                        out=buffers["start_distance"][row_slice])
+            np.subtract(var_pos, ig.phenotype_end[pid],
+                        out=buffers["end_distance"][row_slice])
 
-        if sink is not None and batch_columns:
-            merged = {k: vs[0] if len(vs) == 1 else np.concatenate(vs)
-                      for k, vs in batch_columns.items()}
-            rgbuf.add(merged)
-            if rgbuf.ready():
-                sink.write(rgbuf.take(), column_order=expected_columns)
+            beta_np, se_np, tstat_np, pval_np, af_np = (floats[:, i] for i in range(5))
+            ma_samples_np, ma_count_np = ints[:, 0], ints[:, 1]
 
-    # Final flush
+            buffers["beta"][row_slice] = beta_np
+            buffers["se"][row_slice] = se_np
+            buffers["tstat"][row_slice] = tstat_np
+            buffers["pval_nominal"][row_slice] = pval_np
+            buffers["af"][row_slice] = af_np
+            buffers["ma_samples"][row_slice] = ma_samples_np
+            buffers["ma_count"][row_slice] = ma_count_np
+
+            if include_perm:
+                fill_value = np.nan if perm_max_r2 is None else perm_max_r2
+                buffers["perm_max_r2"][row_slice] = fill_value
+
+            cursor += n_variants
+
     if sink is not None:
-        rem = rgbuf.take()
-        if rem is not None:
-            sink.write(rem, column_order=expected_columns)
+        schema = _nominal_parquet_schema(include_perm)
+        table = _buffers_to_arrow(buffers, schema, cursor)
+        sink.write(table)
+        return None
 
-    if sink is None:
-        if not out_rows:
-            return pd.DataFrame(columns=expected_columns)
-        return pd.concat(out_rows, axis=0).reset_index(drop=True)
-    return None
+    if cursor == 0:
+        return pd.DataFrame(columns=expected_columns)
+
+    data = {col: buffers[col][:cursor] for col in expected_columns}
+    return pd.DataFrame(data, columns=expected_columns)
 
 
 def map_nominal(
@@ -278,11 +331,11 @@ def map_nominal(
         os.makedirs(out_dir, exist_ok=True)
         include_perm = nperm is not None and nperm > 0
         schema = _nominal_parquet_schema(include_perm)
-        col_order = list(schema.names)
         with logger.time_block("Nominal scan (per-chrom streaming)", sync=sync):
             for chrom in ig.chrs:
                 out_path = os.path.join(out_dir, f"{out_prefix}.{chrom}.parquet")
                 with logger.time_block(f"{chrom}: map_nominal", sync=sync):
+                    target_rows = _count_cis_pairs(ig, chrom)
                     with AsyncParquetSink(
                             out_path, schema=schema,
                             compression=compression,
@@ -296,6 +349,7 @@ def map_nominal(
                             ig, variant_df, rez, nperm, device,
                             maf_threshold=maf_threshold,
                             chrom=chrom, sink=sink,
+                            target_rows=target_rows,
                         )
                     logger.write(f"chr{chrom}: ~{sink.rows:,} rows written")
         return None if not return_df else pd.DataFrame([])
