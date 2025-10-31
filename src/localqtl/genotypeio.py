@@ -358,10 +358,10 @@ class InputGeneratorCis(object):
         else:
             phenotype_ids = self.phenotype_pos_df[self.phenotype_pos_df['chr'] == chrom].index
             if self.group_s is None:
-                offset_dict = {c: i for i, c in zip(*np.unique(self.phenotype_pos_df['chr'],
+                offset_dict = {c: i for c, i in zip(*np.unique(self.phenotype_pos_df['chr'],
                                                                return_index=True))}
             else:
-                offset_dict = {c: i for i, c in zip(
+                offset_dict = {c: i for c, i in zip(
                     *np.unique(self.phenotype_pos_df['chr'][self.group_s.drop_duplicates().index],
                                return_index=True))}
             chr_offset = offset_dict[chrom]
