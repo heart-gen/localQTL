@@ -1,24 +1,39 @@
 from __future__ import annotations
 import os
+from typing import Any, Iterable
+
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-__all__ = [
-    "ParquetSink",
-]
+__all__ = ["ParquetSink"]
 
 class ParquetSink:
     """
-    Minimal streaming Parquet writer with stable schema enforcement.
+    Streaming Parquet writer (Arrow-first) with stable schema, large row-groups,
+    and optional per-column dictionary encoding.
+
+    Fastest path: pass a dict[str, np.ndarray | pa.Array] or a pa.Table.
     """
-    def __init__(self, out_path: str, compression: str = "snappy",
-                 overwrite: bool = True, row_group_size: int | None = None,
-                 schema: pa.Schema | None = None, ensure_parent: bool = True):
+    def __init__(
+        self,
+        out_path: str,
+        compression: str = "snappy",
+        overwrite: bool = True,
+        row_group_size: int | None = 1_000_000,
+        schema: pa.Schema | None = None,
+        ensure_parent: bool = True,
+        use_dictionary: bool | Iterable[str] | None = None,
+        write_statistics: bool = False,
+    ):
         self.out_path = out_path
         self.compression = compression
         self.overwrite = overwrite
         self.row_group_size = row_group_size
+        self.use_dictionary = use_dictionary
+        self.write_statistics = write_statistics
+
         self._writer: pq.ParquetWriter | None = None
         self._schema: pa.Schema | None = schema
         self._rows: int = 0
@@ -38,43 +53,92 @@ class ParquetSink:
     def closed(self) -> bool:
         return self._closed
 
-    def _align_to_schema(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Reorder/add missing columns to match schema (fill with NA)
-        cols = [f.name for f in self._schema]
-        missing = [c for c in cols if c not in df.columns]
-        if missing:
-            for c in missing:
-                df[c] = pd.NA
-        # Drop extras (keep only schema columns) and reorder
-        return df[cols]
+    @staticmethod
+    def _table_from_any(data: Any, column_order: list[str] | None = None) -> pa.Table:
+        """Convert pd.DataFrame | dict | pa.Table into pa.Table without guessing."""
+        if isinstance(data, pa.Table):
+            return data
 
-    def write(self, df: pd.DataFrame) -> None:
-        if df is None or len(df) == 0:
+        if isinstance(data, dict):
+            names = column_order or list(data.keys())
+            arrays = []
+            for k in names:
+                v = data[k]
+                if isinstance(v, pa.Array):
+                    arrays.append(v)
+                else:
+                    arrays.append(pa.array(v))
+            return pa.Table.from_arrays(arrays, names=names)
+
+        if isinstance(data, pd.DataFrame):
+            # When DataFrame is unavoidable; still Arrow-ize once.
+            return pa.Table.from_pandas(data, preserve_index=False)
+
+        raise TypeError(f"Unsupported input type: {type(data)}")
+
+    def _ensure_writer(self, table: pa.Table) -> None:
+        if self._writer is not None:
             return
-
-        if self._schema is None: # First batch defines schema
-            table = pa.Table.from_pandas(df, preserve_index=False)
+        if self._schema is None:
             self._schema = table.schema
-            self._writer = pq.ParquetWriter(
-                self.out_path, self._schema, compression=self.compression
-            )
-            if self.row_group_size:
-                self._writer.write_table(table, row_group_size=self.row_group_size)
+        self._writer = pq.ParquetWriter(
+            self.out_path,
+            self._schema,
+            compression=self.compression,
+            use_dictionary=self.use_dictionary,
+            write_statistics=self.write_statistics,
+        )
+
+    def _align_and_cast(self, table: pa.Table) -> pa.Table:
+        """
+        Ensure columns exist, are ordered like self._schema, and cast to target types.
+        Missing columns are filled with nulls of the right type.
+        """
+        assert self._schema is not None
+        nrows = table.num_rows
+        cols: list[pa.Array] = []
+        for field in self._schema:
+            name, ty = field.name, field.type
+            if name in table.column_names:
+                col = table.column(name)
+                if col.type != ty:
+                    col = col.cast(ty)
+                cols.append(col)
             else:
-                self._writer.write_table(table)
-            self._rows += len(df)
+                cols.append(pa.nulls(nrows, type=ty))
+        return pa.Table.from_arrays(cols, schema=self._schema)
+
+    def write(self, data: Any, column_order: list[str] | None = None) -> None:
+        """
+        Write a batch. `data` can be pa.Table, dict[str, array], or pd.DataFrame.
+        If you pass dict/Arrow with numeric dtypes, this stays on the fast path.
+        """
+        if data is None:
             return
 
-        df2 = self._align_to_schema(df)
-        table = pa.Table.from_pandas(df2, schema=self._schema, preserve_index=False)
-        if not table.schema.equals(self._schema, check_metadata=False):
-            table = table.cast(self._schema)
+        table = self._table_from_any(data, column_order=column_order)
+        if table.num_rows == 0:
+            return
+
+        if self._writer is None:
+            # First batch defines (or validates) schema
+            if self._schema is None:
+                self._schema = table.schema
+            table = self._align_and_cast(table)
+            self._ensure_writer(table)
+        else:
+            table = self._align_and_cast(table)
 
         if self.row_group_size:
-            self._writer.write_table(table, row_group_size=self.row_group_size)
+            # Split into large row groups (fewer = faster)
+            n = table.num_rows
+            rgsz = int(self.row_group_size)
+            for off in range(0, n, rgsz):
+                self._writer.write_table(table.slice(off, rgsz))
+                self._rows += min(rgsz, n - off)
         else:
             self._writer.write_table(table)
-        self._rows += len(df)
+            self._rows += table.num_rows
 
     def close(self) -> None:
         if self._writer is not None and not self._closed:
