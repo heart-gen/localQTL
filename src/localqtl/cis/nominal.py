@@ -20,15 +20,15 @@ __all__ = [
     "map_nominal",
 ]
 
-DEFAULT_ROW_GROUP_SIZE = 1_000_000
+DEFAULT_ROW_GROUP_SIZE = 10_000_000
 
 def _nominal_parquet_schema(include_perm: bool) -> pa.Schema:
     fields = [
         pa.field("phenotype_id", pa.string()),
         pa.field("variant_id", pa.string()),
-        pa.field("pos", pa.int64()),
-        pa.field("start_distance", pa.int64()),
-        pa.field("end_distance", pa.int64()),
+        pa.field("pos", pa.int32()),
+        pa.field("start_distance", pa.int32()),
+        pa.field("end_distance", pa.int32()),
         pa.field("beta", pa.float32()),
         pa.field("se", pa.float32()),
         pa.field("tstat", pa.float32()),
@@ -51,7 +51,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
     """
     # Variant metadata
     idx_to_id = variant_df.index.to_numpy()
-    pos_arr   = variant_df["pos"].to_numpy(np.int64)
+    pos_arr   = variant_df["pos"].to_numpy(np.int32)
 
     include_perm = nperm is not None and nperm > 0
     expected_columns = [
@@ -176,9 +176,9 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
             result_block = {
                 "phenotype_id":   np.full(n_variants, str(pid), dtype=object),
                 "variant_id":     np.asarray(var_ids, dtype=str),
-                "pos":            np.asarray(var_pos, dtype=np.int64),
-                "start_distance": np.asarray(start_distance, dtype=np.int64),
-                "end_distance":   np.asarray(end_distance, dtype=np.int64),
+                "pos":            np.asarray(var_pos, dtype=np.int32),
+                "start_distance": np.asarray(start_distance, dtype=np.int32),
+                "end_distance":   np.asarray(end_distance, dtype=np.int32),
                 "beta":           beta_np,
                 "se":             se_np,
                 "tstat":          tstat_np,
