@@ -31,6 +31,8 @@ class ParquetSink:
         self.compression = compression
         self.overwrite = overwrite
         self.row_group_size = row_group_size
+        if isinstance(use_dictionary, Iterable) and not isinstance(use_dictionary, (bool, str)):
+            use_dictionary = list(use_dictionary)
         self.use_dictionary = use_dictionary
         self.write_statistics = write_statistics
 
@@ -116,6 +118,9 @@ class ParquetSink:
         if data is None:
             return
 
+        if self._closed:
+            raise RuntimeError("Cannot write to a closed ParquetSink")
+
         table = self._table_from_any(data, column_order=column_order)
         if table.num_rows == 0:
             return
@@ -144,7 +149,7 @@ class ParquetSink:
         if self._writer is not None and not self._closed:
             self._writer.close()
             self._writer = None
-            self._closed = True
+        self._closed = True
 
     def __enter__(self):
         return self
