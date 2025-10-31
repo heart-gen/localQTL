@@ -93,7 +93,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
 
         # Per-phenotype regressions in this window
         for y_t, pid in y_iter:
-            if nperm is not None:
+            if nperm is not None and nperm > 0:
                 perms = [torch.randperm(y_t.shape[0], device=device) for _ in range(nperm)]
                 y_perm = torch.stack([y_t[idxp] for idxp in perms], dim=1) # (n x nperm)
                 betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
@@ -208,14 +208,13 @@ def map_nominal(
         os.makedirs(out_dir, exist_ok=True)
         with logger.time_block("Nominal scan (per-chrom streaming)", sync=sync):
             for chrom in ig.chrs:
-                out_path = os.path.join(out_dir, f"{out_prefix}.chr{chrom}.parquet")
-                with logger.time_block(f"chr{chrom}: map_nominal", sync=sync):
+                out_path = os.path.join(out_dir, f"{out_prefix}.{chrom}.parquet")
+                with logger.time_block(f"{chrom}: map_nominal", sync=sync):
                     with ParquetSink(out_path, compression=compression) as sink:
                         _run_nominal_core(
                             ig, variant_df, rez, nperm, device,
                             maf_threshold=maf_threshold,
-                            chrom=chrom,
-                            sink=sink,
+                            chrom=chrom, sink=sink,
                         )
                     logger.write(f"chr{chrom}: wrote {sink.rows:,} rows -> {out_path}")
         return None if not return_df else pd.DataFrame([])
