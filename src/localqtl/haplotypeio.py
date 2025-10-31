@@ -173,10 +173,9 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
 
     def __init__(self, *args, haplotypes=None, loci_df=None,
                  on_the_fly_impute=True, **kwargs):
-        self.nearest_tolerance = kwargs.pop("nearest_tolerance", None)
+        self.nearest_tolerance = kwargs.pop("nearest_tolerance", None) # in bp
         super().__init__(*args, **kwargs)
 
-        # Hap array (Dask or NumPy/CuPy)
         if haplotypes is None:
             raise ValueError("`haplotypes` array is required for InputGeneratorCisWithHaps.")
         self.haplotypes = haplotypes
@@ -187,26 +186,41 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
 
         self.on_the_fly_impute = on_the_fly_impute
 
-        # Build variant -> locus index map via class method
+        # Build mapping and mask
         self.loci_df = _to_pandas(loci_df).copy() if loci_df is not None else None
         if self.loci_df is not None:
-            self._geno2hap = self.build_variant_to_locus_map(
+            geno2hap, vmask, dropped_n = self.build_variant_to_locus_map(
                 variant_df=self.variant_df, loci_df=self.loci_df,
                 n_loci=n_loci, nearest_tolerance=self.nearest_tolerance,
             )
+            self._geno2hap = geno2hap
+            self._vmask = vmask
+            self.n_unmapped_variants = int(dropped_n)
+
+            if self.n_unmapped_variants:
+                msg = (f"[LA map]   ** Dropping {self.n_unmapped_variants} "
+                       "variants with no locus match "
+                       f"(tolerance={self.nearest_tolerance}).")
+                # Try to use parent's logger if present
+                if hasattr(self, "logger") and getattr(self, "logger", None):
+                    self.logger.info(msg)
+                else:
+                    print(msg)
         else:
-            self._geno2hap = None
             if n_loci != int(self.variant_df.shape[0]):
                 raise ValueError(
                     f"haplotypes first dimension ({n_loci}) != variant_df rows "
                     f"({self.variant_df.shape[0]}). Provide `loci_df` to map."
                 )
-
+            self._geno2hap = np.arange(n_loci, dtype=int)
+            self._vmask = np.ones(self.variant_df.shape[0], dtype=bool)
+            self.n_unmapped_variants = 0
+            
     @classmethod
     def build_variant_to_locus_map(
             cls, variant_df: pd.DataFrame, loci_df: pd.DataFrame,
             n_loci: int, nearest_tolerance: Optional[int] = None,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray, int]:
         """
         Build a per-variant base locus index (0..n_loci-1) using per-chrom nearest join.
         """
@@ -245,32 +259,25 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
             lgrp = loci_base[loci_base["chrom"] == c].sort_values("pos")
             if lgrp.empty:
                 tmp = vgrp.copy(); tmp["index"] = np.nan; maps.append(tmp); continue
-            if nearest_tolerance is not None:
-                merged = pd.merge_asof(
-                    vgrp.sort_values("pos"), lgrp,
-                    on="pos", direction="nearest",
-                    allow_exact_matches=True, tolerance=nearest_tolerance
-                )
-            else:
-                merged = pd.merge_asof(
-                    vgrp.sort_values("pos"), lgrp,
-                    on="pos", direction="nearest",
-                    allow_exact_matches=True
-                )
+            merged = pd.merge_asof(
+                vgrp.sort_values("pos"), lgrp,
+                on="pos", direction="nearest", allow_exact_matches=True,
+                **({"tolerance": nearest_tolerance} if nearest_tolerance is not None else {})
+            )
             maps.append(merged)
 
         m = (pd.concat(maps, axis=0)
                .sort_values("variant_id")
                .reset_index(drop=True))
 
-        if m["index"].isnull().any():
-            nmiss = int(m["index"].isnull().sum())
-            raise ValueError(
-                f"Could not map {nmiss} variants to any local-ancestry locus; "
-                f"check coordinates/labels or set nearest_tolerance."
-            )
+        vmask     = ~m["index"].isna().to_numpy()
+        dropped_n = int((~vmask).sum())
 
-        return m["index"].to_numpy(dtype=int)
+        geno2hap = np.full(len(m), -1, dtype=int)
+        if vmask.any():
+            geno2hap[vmask] = m.loc[vmask, "index"].to_numpy(dtype=int)
+            
+        return geno2hap, vmask, dropped_n
 
     @staticmethod
     def _interpolate_block(block):
@@ -301,32 +308,52 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
 
         return block_imputed.reshape(loci_dim, sample_dim, ancestry_dim).astype(np.float32, copy=False)
 
-    def _fetch_hap_block(self, v_idx):
+    def _fetch_hap_block(self, v_idx: np.ndarray):
         # Map variants in this batch to locus indices
+        if v_idx.size == 0:
+            return self._empty_h_block()
+
         hap_idx = v_idx if self._geno2hap is None else self._geno2hap[v_idx]
         H_slice = self.haplotypes[hap_idx, :, :]
         H_block = H_slice.compute() if hasattr(H_slice, "compute") else H_slice
         mod = get_array_module(H_block)
-        if self.on_the_fly_impute:
-            if mod.isnan(mod.asarray(H_block)).any():
-                raise ValueError(
-                    "Detected NaNs in haplotype block. For biological correctness, "
-                    "please fix upstream or implement an index-based fill (ffill/bfill), "
-                    "not value interpolation."
-                )
-
+        if self.on_the_fly_impute and mod.isnan(mod.asarray(H_block)).any():
+            raise ValueError("Detected NaNs in haplotype block after filtering.")
         return H_block
+
+    def _empty_h_block(self):
+        """Return an empty H block with shape (0, samples, ancestries) and matching dtype."""
+        try:
+            n_samp = int(self.haplotypes.shape[1])
+            n_anc  = int(self.haplotypes.shape[2])
+        except Exception:
+            # Fall back safely if shapes are unknown (rare with Dask)
+            n_samp, n_anc = 0, 0
+        dtype = getattr(self.haplotypes, "dtype", np.float32)
+        return np.empty((0, n_samp, n_anc), dtype=dtype)
 
     def _postprocess_batch(self, batch):
         """Preserve grouping contract from `InputGeneratorCis` and just append H."""
         if len(batch) == 4:
             p, G, v_idx, pid = batch
-            H = self._fetch_hap_block(v_idx)
-            return p, G, v_idx, H, pid
+            vmask_local = self.vmask[v_idx]
+            if not vmask.any():
+                return p, G[vmask_local, :], v_idx[vmask_local], \
+                    self._empty_h_block(), pid
+            v_idx_f = v_idx[vmask_local]
+            G_f = G[vmask_local, :]
+            H = self._fetch_hap_block(v_idx_f)
+            return p, G_f, v_idx_f, H, pid
         elif len(batch) == 5:
             p, G, v_idx, ids, group_id = batch
-            H = self._fetch_hap_block(v_idx)
-            return p, G, v_idx, H, ids, group_id
+            vmask_local = self._vmask[v_idx]
+            if not vmask_local.any():
+                return p, G[vmask_local, :], v_idx[vmask_local], \
+                    self._empty_h_block(), ids, group_id
+            v_idx_f = v_idx[vmask_local]
+            G_f = G[vmask_local, :]
+            H = self._fetch_hap_block(v_idx_f)
+            return p, G_f, v_idx_f, H, ids, group_id
         else:
             raise ValueError(f"Unexpected batch structure from base generator: len={len(batch)}")
 
