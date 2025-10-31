@@ -6,8 +6,8 @@ from typing import Optional
 from collections import defaultdict
 
 from ..utils import SimpleLogger
-from ..iosinks import ParquetSink
 from ..stats import nominal_pvals_tensorqtl
+from ..iosinks import AsyncParquetSink, RowGroupBuffer
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from ..preproc import impute_mean_and_filter, allele_stats, filter_by_maf
 from ..regression_kernels import (
@@ -20,7 +20,7 @@ __all__ = [
     "map_nominal",
 ]
 
-DEFAULT_ROW_GROUP_SIZE = 262_144
+DEFAULT_ROW_GROUP_SIZE = 1_000_000
 
 def _nominal_parquet_schema(include_perm: bool) -> pa.Schema:
     fields = [
@@ -55,21 +55,16 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
 
     include_perm = nperm is not None and nperm > 0
     expected_columns = [
-        "phenotype_id",
-        "variant_id",
-        "pos",
-        "start_distance",
-        "end_distance",
-        "beta",
-        "se",
-        "tstat",
-        "pval_nominal",
-        "af",
-        "ma_samples",
-        "ma_count",
+        "phenotype_id", "variant_id", "pos", "start_distance",
+        "end_distance", "beta", "se", "tstat", "pval_nominal",
+        "af", "ma_samples", "ma_count",
     ]
     if include_perm:
         expected_columns.append("perm_max_r2")
+
+    # Row-group buffer
+    rgbuf = RowGroupBuffer(expected_columns,
+                           target_rows=DEFAULT_ROW_GROUP_SIZE) if sink is not None else None
 
     out_rows = []
     group_mode = getattr(ig, "group_s", None) is not None
@@ -166,19 +161,31 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
             end_distance = var_pos - end_pos
 
             n_variants = var_ids.shape[0]
+
+            # Pack and one GPU -> CPU transfer
+            floats_t = torch.stack([betas[:,0], ses[:,0], tstats[:,0],
+                                    pvals_t, af_t], dim=1).to(torch.float32)
+            ints_t   = torch.stack([ma_samples_t, ma_count_t], dim=1).to(torch.int32)
+
+            floats = floats_t.detach().to("cpu", non_blocking=True).numpy()
+            ints   = ints_t.detach().to("cpu", non_blocking=True).numpy()
+
+            beta_np, se_np, tstat_np, pval_np, af_np = (floats[:,i] for i in range(5))
+            ma_samples_np, ma_count_np = ints[:,0], ints[:,1]
+            
             result_block = {
-                "phenotype_id": np.full(n_variants, str(pid), dtype=object),
-                "variant_id": np.asarray(var_ids, dtype=str),
-                "pos": np.asarray(var_pos, dtype=np.int64),
+                "phenotype_id":   np.full(n_variants, str(pid), dtype=object),
+                "variant_id":     np.asarray(var_ids, dtype=str),
+                "pos":            np.asarray(var_pos, dtype=np.int64),
                 "start_distance": np.asarray(start_distance, dtype=np.int64),
-                "end_distance": np.asarray(end_distance, dtype=np.int64),
-                "beta": betas[:, 0].detach().cpu().numpy().astype(np.float32, copy=False),
-                "se": ses[:, 0].detach().cpu().numpy().astype(np.float32, copy=False),
-                "tstat": tstats[:, 0].detach().cpu().numpy().astype(np.float32, copy=False),
-                "pval_nominal": pvals_t.detach().cpu().numpy().astype(np.float32, copy=False),
-                "af": af_t.detach().cpu().numpy().astype(np.float32, copy=False),
-                "ma_samples": ma_samples_t.detach().cpu().numpy().astype(np.int32, copy=False),
-                "ma_count": ma_count_t.detach().cpu().numpy().astype(np.int32, copy=False),
+                "end_distance":   np.asarray(end_distance, dtype=np.int64),
+                "beta":           beta_np,
+                "se":             se_np,
+                "tstat":          tstat_np,
+                "pval_nominal":   pval_np,
+                "af":             af_np,
+                "ma_samples":     ma_samples_np,
+                "ma_count":       ma_count_np,
             }
             if include_perm and perm_max_r2 is not None:
                 result_block["perm_max_r2"] = np.full(n_variants, perm_max_r2, dtype=np.float32)
@@ -190,11 +197,17 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                     batch_columns[key].append(value)
 
         if sink is not None and batch_columns:
-            merged = {
-                key: values[0] if len(values) == 1 else np.concatenate(values)
-                for key, values in batch_columns.items()
-            }
-            sink.write(merged, column_order=expected_columns)
+            merged = {k: vs[0] if len(vs) == 1 else np.concatenate(vs)
+                      for k, vs in batch_columns.items()}
+            rgbuf.add(merged)
+            if rgbuf.ready():
+                sink.write(rgbuf.take(), column_order=expected_columns)
+
+    # Final flush
+    if sink is not None:
+        rem = rgbuf.take()
+        if rem is not None:
+            sink.write(rem, column_order=expected_columns)
 
     if sink is None:
         if not out_rows:
@@ -265,23 +278,26 @@ def map_nominal(
         os.makedirs(out_dir, exist_ok=True)
         include_perm = nperm is not None and nperm > 0
         schema = _nominal_parquet_schema(include_perm)
+        col_order = list(schema.names)
         with logger.time_block("Nominal scan (per-chrom streaming)", sync=sync):
             for chrom in ig.chrs:
                 out_path = os.path.join(out_dir, f"{out_prefix}.{chrom}.parquet")
                 with logger.time_block(f"{chrom}: map_nominal", sync=sync):
-                    with ParquetSink(
-                        out_path,
-                        compression=compression,
-                        row_group_size=DEFAULT_ROW_GROUP_SIZE,
-                        schema=schema,
-                        use_dictionary=("phenotype_id",),
+                    with AsyncParquetSink(
+                            out_path, schema=schema,
+                            compression=compression,
+                            row_group_size=DEFAULT_ROW_GROUP_SIZE,
+                            use_dictionary=("phenotype_id",),
+                            write_statistics=False,
+                            column_order=list(schema.names),
+                            max_queue_items=4,
                     ) as sink:
                         _run_nominal_core(
                             ig, variant_df, rez, nperm, device,
                             maf_threshold=maf_threshold,
                             chrom=chrom, sink=sink,
                         )
-                    logger.write(f"chr{chrom}: wrote {sink.rows:,} rows -> {out_path}")
+                    logger.write(f"chr{chrom}: ~{sink.rows:,} rows written")
         return None if not return_df else pd.DataFrame([])
 
     with logger.time_block("Computing associations (nominal)", sync=sync):
