@@ -174,90 +174,103 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
     def __init__(self, *args, haplotypes=None, loci_df=None,
                  on_the_fly_impute=True, **kwargs):
         self.nearest_tolerance = kwargs.pop("nearest_tolerance", None)
-
         super().__init__(*args, **kwargs)
 
-        self.haplotypes = haplotypes
-        self.loci_df = _to_pandas(loci_df).copy() if loci_df is not None else None
-        self.on_the_fly_impute = on_the_fly_impute
-
-        # Build variant -> locus index map (nearest by chrom, pos)
-        if self.loci_df is not None:
-            loci_base = (self.loci_df.reset_index(drop=False)
-                         .rename(columns={"index": "maybe_hap_str"}))
-            if "index" not in loci_base.columns:
-                raise ValueError("loci_df must include a base 'index' (axis-0 of haplotypes).")
-
-            loci_base = (loci_base[["chrom", "pos", "index"]]
-                         .drop_duplicates(["chrom", "pos"], keep="first")
-                         .sort_values(["chrom", "pos"])
-                         .reset_index(drop=True))
-
-            vreset = (self.variant_df[["chrom", "pos"]]
-                      .assign(variant_id=np.arange(self.variant_df.shape[0], dtype=int))
-                      .sort_values(["chrom", "pos"])
-                      .reset_index(drop=True))
-
-            maps = []
-            for c, vgrp in vreset.groupby("chrom", sort=False):
-                lgrp = loci_base[loci_base["chrom"] == c]
-                if lgrp.empty:
-                    tmp = vgrp.copy()
-                    tmp["index"] = np.nan
-                    maps.append(tmp)
-                    continue
-
-                merged = pd.merge_asof(
-                    vgrp.sort_values("pos"),
-                    lgrp.sort_values("pos"),
-                    on="pos", direction="nearest", allow_exact_matches=True
-                )
-
-                if self.nearest_tolerance is not None:
-                    # recompute matched locus positions to get distance
-                    ref = pd.merge_asof(
-                        vgrp.sort_values("pos"),
-                        lgrp.sort_values("pos"),
-                        on="pos", direction="nearest", allow_exact_matches=True
-                    )
-                    dist = (merged["pos"] - ref["pos"]).abs()
-                    merged.loc[dist > self.nearest_tolerance, "index"] = np.nan
-
-                maps.append(merged)
-
-            m = (pd.concat(maps, axis=0)
-                   .sort_values("variant_id")
-                   .reset_index(drop=True))
-
-            if m["index"].isnull().any():
-                nmiss = int(m["index"].isnull().sum())
-                raise ValueError(
-                    f"Could not map {nmiss} variants to any local-ancestry locus; "
-                    f"check coords/labels or increase nearest_tolerance."
-                )
-
-            self._geno2hap = m["index"].to_numpy(dtype=int)
-        else:
-            self._geno2hap = None
-
-        # Sanity check
-        if self.haplotypes is None:
+        # Hap array (Dask or NumPy/CuPy)
+        if haplotypes is None:
             raise ValueError("`haplotypes` array is required for InputGeneratorCisWithHaps.")
-
+        self.haplotypes = haplotypes
         try:
             n_loci = int(self.haplotypes.shape[0])
         except Exception as e:
-            raise ValueError("`haplotypes` must be array-like with shape (loci, samples, ancestries).") from e
+            raise ValueError("`haplotypes` must have shape (loci, samples, ancestries).") from e
 
-        if self._geno2hap is None and n_loci != int(self.variant_df.shape[0]):
+        self.on_the_fly_impute = on_the_fly_impute
+
+        # Build variant -> locus index map via class method
+        self.loci_df = _to_pandas(loci_df).copy() if loci_df is not None else None
+        if self.loci_df is not None:
+            self._geno2hap = self.build_variant_to_locus_map(
+                variant_df=self.variant_df, loci_df=self.loci_df,
+                n_loci=n_loci, nearest_tolerance=self.nearest_tolerance,
+            )
+        else:
+            self._geno2hap = None
+            if n_loci != int(self.variant_df.shape[0]):
+                raise ValueError(
+                    f"haplotypes first dimension ({n_loci}) != variant_df rows "
+                    f"({self.variant_df.shape[0]}). Provide `loci_df` to map."
+                )
+
+    @classmethod
+    def build_variant_to_locus_map(
+            cls, variant_df: pd.DataFrame, loci_df: pd.DataFrame,
+            n_loci: int, nearest_tolerance: Optional[int] = None,
+    ) -> np.ndarray:
+        """
+        Build a per-variant base locus index (0..n_loci-1) using per-chrom nearest join.
+        """
+        lb = loci_df.reset_index(drop=False)
+
+        # Find an index-like column; normalize ancestry-flattened indices if present
+        idx_col = next((c for c in ("index", "i", "locus_index") if c in lb.columns), None)
+        if idx_col is None:
+            raise ValueError("loci_df must include one of ['index','i','locus_index'].")
+
+        idx = lb[idx_col].to_numpy()
+        base_idx = (idx % n_loci).astype(int) if idx.max() >= n_loci else idx.astype(int)
+        lb = lb.assign(index=base_idx)
+
+        if not {"chrom", "pos"}.issubset(lb.columns):
+            raise ValueError("loci_df must include 'chrom' and 'pos' columns.")
+
+        loci_base = (lb[["chrom", "pos", "index"]]
+                     .drop_duplicates(["chrom", "pos"], keep="first")
+                     .reset_index(drop=True))
+
+        if loci_base["index"].min() < 0 or loci_base["index"].max() >= n_loci:
+            raise ValueError("Base 'index' out of bounds for haplotypes axis.")
+
+        # Coerce chrom dtype and prep variants
+        loci_base["chrom"] = loci_base["chrom"].astype(str)
+        vreset = variant_df[["chrom", "pos"]].copy()
+        vreset["chrom"] = vreset["chrom"].astype(str)
+        vreset = (vreset.assign(variant_id=np.arange(len(vreset), dtype=int))
+                         .sort_values(["chrom", "pos"])
+                         .reset_index(drop=True))
+
+        # Per-chrom nearest join (with optional tolerance)
+        maps = []
+        for c, vgrp in vreset.groupby("chrom", sort=False):
+            lgrp = loci_base[loci_base["chrom"] == c].sort_values("pos")
+            if lgrp.empty:
+                tmp = vgrp.copy(); tmp["index"] = np.nan; maps.append(tmp); continue
+            if nearest_tolerance is not None:
+                merged = pd.merge_asof(
+                    vgrp.sort_values("pos"), lgrp,
+                    on="pos", direction="nearest",
+                    allow_exact_matches=True, tolerance=nearest_tolerance
+                )
+            else:
+                merged = pd.merge_asof(
+                    vgrp.sort_values("pos"), lgrp,
+                    on="pos", direction="nearest",
+                    allow_exact_matches=True
+                )
+            maps.append(merged)
+
+        m = (pd.concat(maps, axis=0)
+               .sort_values("variant_id")
+               .reset_index(drop=True))
+
+        if m["index"].isnull().any():
+            nmiss = int(m["index"].isnull().sum())
             raise ValueError(
-                f"haplotypes first dimension ({n_loci}) does not match variant_df rows "
-                f"({self.variant_df.shape[0]}). Provide `loci_df` to map genotypes to hap indices."
+                f"Could not map {nmiss} variants to any local-ancestry locus; "
+                f"check coordinates/labels or set nearest_tolerance."
             )
 
-        if self._geno2hap is not None:
-            if self._geno2hap.min() < 0 or self._geno2hap.max() >= n_loci:
-                raise ValueError("Mapped locus indices are out of bounds of the haplotypes first dimension.")
+        return m["index"].to_numpy(dtype=int)
 
     @staticmethod
     def _interpolate_block(block):
