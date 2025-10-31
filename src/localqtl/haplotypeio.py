@@ -335,8 +335,8 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
         """Preserve grouping contract from `InputGeneratorCis` and just append H."""
         if len(batch) == 4:
             p, G, v_idx, pid = batch
-            vmask_local = self.vmask[v_idx]
-            if not vmask.any():
+            vmask_local = self._vmask[v_idx]
+            if not vmask_local.any():
                 return p, G[vmask_local, :], v_idx[vmask_local], \
                     self._empty_h_block(), pid
             v_idx_f = v_idx[vmask_local]
