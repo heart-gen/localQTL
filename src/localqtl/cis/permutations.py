@@ -28,6 +28,9 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
     if nperm is None or nperm <= 0:
         raise ValueError("nperm must be a positive integer for map_permutations.")
 
+    idx_to_id = variant_df.index.to_numpy()
+    pos_arr = variant_df["pos"].to_numpy(np.int64, copy=False)
+
     for batch in ig.generate_data():
         # Accept shapes: (p, G, v_idx, pid) or (p, G, v_idx, H, pid)
         if len(batch) == 4:
@@ -116,8 +119,8 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
             pval_beta, a_hat, b_hat = np.nan, np.nan, np.nan
 
         # Metadata
-        var_id = variant_df.index.values[v_idx[ix]]
-        var_pos = int(variant_df.iloc[v_idx[ix]]["pos"])
+        var_id = idx_to_id[v_idx[ix]]
+        var_pos = int(pos_arr[v_idx[ix]])
         start_pos = ig.phenotype_start[pid]
         end_pos = ig.phenotype_end[pid]
         start_distance = int(var_pos - start_pos)
@@ -161,6 +164,8 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
         raise ValueError("nperm must be a positive integer for map_permutations.")
 
     out_rows = []
+    idx_to_id = variant_df.index.to_numpy()
+    pos_arr = variant_df["pos"].to_numpy(np.int64, copy=False)
     for batch in ig.generate_data():
         # Accept shapes: (P, G, v_idx, ids, group_id) or (P, G, v_idx, H, ids, group_id)
         if len(batch) == 5:
@@ -224,8 +229,8 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
         n = Y_resid.shape[1]
         p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
         dof = max(n - p_pred, 1)
-        var_ids = variant_df.index.values[v_idx]
-        var_pos = variant_df.iloc[v_idx]["pos"].values
+        var_ids = idx_to_id[v_idx]
+        var_pos = pos_arr[v_idx]
         k_eff = rez.Q_t.shape[1] if rez is not None else 0
 
         # Evaluate each phenotype: t-stats -> partial R²; keep the global best (variant, phenotype)
