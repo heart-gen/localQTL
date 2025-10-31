@@ -49,6 +49,10 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
     Handles both InputGeneratorCis (no haps) and InputGeneratorCisWithHaps (haps).
     If sink is provided, stream out rows as Parquet and return None.
     """
+    # Variant metadata
+    idx_to_id = variant_df.index.to_numpy()
+    pos_arr   = variant_df["pos"].to_numpy(np.int32)
+
     out_rows = []
     group_mode = getattr(ig, "group_s", None) is not None
     for batch in ig.generate_data(chrom=chrom):
@@ -111,8 +115,8 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
         y_iter = list(zip(y_resid, id_list)) if group_mode else [(y_resid, id_list[0])]
 
         # Variant metadata
-        var_ids = variant_df.index.values[v_idx]
-        var_pos = variant_df.iloc[v_idx]["pos"].values
+        var_ids = idx_to_id[v_idx]
+        var_pos = pos_arr[v_idx]
         k_eff = rez.Q_t.shape[1] if rez is not None else 0
 
         # Per-phenotype regressions in this window
