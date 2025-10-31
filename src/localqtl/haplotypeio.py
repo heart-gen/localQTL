@@ -199,7 +199,7 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
 
             if self.n_unmapped_variants:
                 msg = (f"    ** dropping {self.n_unmapped_variants} "
-                       "variants with no locus match.")
+                       "variants with no locus match")
                 # Try to use parent's logger if present
                 if hasattr(self, "logger") and getattr(self, "logger", None):
                     self.logger.info(msg)
