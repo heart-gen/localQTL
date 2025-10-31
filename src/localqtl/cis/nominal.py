@@ -51,7 +51,25 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
     """
     # Variant metadata
     idx_to_id = variant_df.index.to_numpy()
-    pos_arr   = variant_df["pos"].to_numpy(np.int32)
+    pos_arr   = variant_df["pos"].to_numpy(np.int64)
+
+    include_perm = nperm is not None and nperm > 0
+    expected_columns = [
+        "phenotype_id",
+        "variant_id",
+        "pos",
+        "start_distance",
+        "end_distance",
+        "beta",
+        "se",
+        "tstat",
+        "pval_nominal",
+        "af",
+        "ma_samples",
+        "ma_count",
+    ]
+    if include_perm:
+        expected_columns.append("perm_max_r2")
 
     out_rows = []
     group_mode = getattr(ig, "group_s", None) is not None
@@ -122,7 +140,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
         # Per-phenotype regressions in this window
         batch_columns = defaultdict(list) if sink is not None else None
         for y_t, pid in y_iter:
-            if nperm is not None and nperm > 0:
+            if include_perm:
                 perms = [torch.randperm(y_t.shape[0], device=device) for _ in range(nperm)]
                 y_perm = torch.stack([y_t[idxp] for idxp in perms], dim=1) # (n x nperm)
                 betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
@@ -162,11 +180,11 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 "ma_samples": ma_samples_t.detach().cpu().numpy().astype(np.int32, copy=False),
                 "ma_count": ma_count_t.detach().cpu().numpy().astype(np.int32, copy=False),
             }
-            if perm_max_r2 is not None:
+            if include_perm and perm_max_r2 is not None:
                 result_block["perm_max_r2"] = np.full(n_variants, perm_max_r2, dtype=np.float32)
 
             if sink is None:
-                out_rows.append(pd.DataFrame(result_block))
+                out_rows.append(pd.DataFrame(result_block, columns=expected_columns))
             else:
                 for key, value in result_block.items():
                     batch_columns[key].append(value)
@@ -176,9 +194,11 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 key: values[0] if len(values) == 1 else np.concatenate(values)
                 for key, values in batch_columns.items()
             }
-            sink.write(merged)
+            sink.write(merged, column_order=expected_columns)
 
     if sink is None:
+        if not out_rows:
+            return pd.DataFrame(columns=expected_columns)
         return pd.concat(out_rows, axis=0).reset_index(drop=True)
     return None
 
