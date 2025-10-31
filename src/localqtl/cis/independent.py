@@ -27,6 +27,10 @@ def _run_independent_core(
     """Forward–backward independent mapping for ungrouped phenotypes."""
     out_rows = []
 
+    # Variant metadata
+    idx_to_id = variant_df.index.to_numpy()
+    pos_arr   = variant_df["pos"].to_numpy(np.int32)
+
     # Basic alignment checks
     if covariates_df is not None and not covariates_df.index.equals(ig.phenotype_df.columns):
         covariates_df = covariates_df.loc[ig.phenotype_df.columns]
@@ -150,8 +154,8 @@ def _run_independent_core(
             if stop_pval > signif_threshold:
                 break
 
-            var_id = variant_df.index.values[v_idx[ix]]
-            var_pos = int(variant_df.iloc[v_idx[ix]]["pos"])
+            var_id = idx_to_id[v_idx[ix]]
+            var_pos = int(pos_arr[v_idx[ix]])
             start_pos = ig.phenotype_start[pid]
             end_pos = ig.phenotype_end[pid]
             start_distance = int(var_pos - start_pos)
