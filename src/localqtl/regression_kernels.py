@@ -1,5 +1,7 @@
 import torch
 
+from ._torch_utils import move_to_device, resolve_device
+
 __all__ = [
     "Residualizer",
     "run_batch_regression",
@@ -35,8 +37,8 @@ class Residualizer(object):
         """
         Residualize one or more matrices in a single GPU pass.
         """
-        dev = self.Q_t.device if self.Q_t.numel() else matrices[0].device
-        matrices = tuple(M.to(dev) for M in matrices)
+        dev = resolve_device(self.Q_t.device if self.Q_t.numel() else matrices[0].device)
+        matrices = tuple(move_to_device(M, dev) for M in matrices)
         if len(matrices) == 1:
             M_t = matrices[0]
             if center:
@@ -113,8 +115,10 @@ def run_batch_regression(y, G, H=None, k_eff: int = 0, device="cuda"):
     tstats : torch.Tensor
         (m × p) t-statistics
     """
-    y = y.to(device)
-    G = G.to(device)
+    device = resolve_device(device)
+
+    y = move_to_device(y, device)
+    G = move_to_device(G, device)
 
     n = y.shape[0]
 
@@ -126,7 +130,7 @@ def run_batch_regression(y, G, H=None, k_eff: int = 0, device="cuda"):
     G_exp = G.unsqueeze(-1)
 
     if H is not None:
-        H = H.to(device)  # (m × n × (k-1))
+        H = move_to_device(H, device)  # (m × n × (k-1))
         X = torch.cat([G_exp, H], dim=2)  # (m × n × p)
     else:
         X = G_exp  # (m × n × 1)
@@ -188,10 +192,12 @@ def run_batch_regression_with_permutations(y, G, H=None, y_perm=None, k_eff: int
     r2_perm : torch.Tensor, optional
         (nperm,) max R² across variants for each permutation
     """
-    y = y.to(device)
-    G = G.to(device)
+    device = resolve_device(device)
+
+    y = move_to_device(y, device)
+    G = move_to_device(G, device)
     if y_perm is not None:
-        y_perm = y_perm.to(device)
+        y_perm = move_to_device(y_perm, device)
 
     n = y.shape[0]
 
@@ -201,7 +207,7 @@ def run_batch_regression_with_permutations(y, G, H=None, y_perm=None, k_eff: int
     # Build design matrix
     G_exp = G.unsqueeze(-1)  # (m × n × 1)
     if H is not None:
-        H = H.to(device)  # (m × n × (k-1))
+        H = move_to_device(H, device)  # (m × n × (k-1))
         X = torch.cat([G_exp, H], dim=2)  # (m × n × p)
     else:
         X = G_exp
