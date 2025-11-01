@@ -19,12 +19,12 @@ scipy = "^1.16"
 pandas = "^2.2"
 pgenlib = "^0.93"
 rfmix-reader = "^0.2"
-pandas-plink = {git = "https://github.com/KrotosBenjamin/pandas-plink.git"}
 py-qvalue = "^0.1"
 cupy-cuda12x = "^13.6"
 cudf-cu12 = "^25.10"
 pyarrow = "^22.0"
 dask-cudf-cu12 = "^25.10.0"
+pandas-plink-ng = "^2.3.2.post1"
 
 [tool.poetry.urls]
 homepage = "https://github.com/heart-gen/localQTL"

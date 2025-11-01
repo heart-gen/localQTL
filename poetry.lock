@@ -2383,31 +2383,27 @@ test = ["hypothesis (>=6.46.1)", "pytest (>=7.3.2)", "pytest-xdist (>=2.2.0)"]
 xml = ["lxml (>=4.9.2)"]
 
 [[package]]
-name = "pandas-plink"
-version = "2.3.2"
-description = "Read PLINK files into Pandas data frames"
+name = "pandas-plink-ng"
+version = "2.3.2.post1"
+description = "Fork of pandas-plink with NumPy >=2.0 support and modern Python/GPU-stack compatibility"
 optional = false
-python-versions = "^3.10"
+python-versions = "<3.15,>=3.11"
 groups = ["main"]
-files = []
-develop = false
+files = [
+    {file = "pandas_plink_ng-2.3.2.post1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:a0a06157779cc8b25a709f20803897dec583b3c5228ed3e500397b3396a78bc3"},
+    {file = "pandas_plink_ng-2.3.2.post1.tar.gz", hash = "sha256:a87333dfd58563d923435bbc0fbfe832409f3a70d24328887b51d7c24b10cb22"},
+]
 
 [package.dependencies]
 cffi = ">=1.17"
 dask = {version = "*", extras = ["dataframe"]}
-deprecated = "^1.2"
-numpy = "^2.0"
-pandas = "^2.0"
+deprecated = ">=1.2,<2.0"
+numpy = ">=2.0"
+pandas = ">=2.2,<3.0"
 pandera = {version = "*", extras = ["dask", "mypy"]}
-tqdm = "^4.67"
+tqdm = ">=4.67,<5.0"
 xarray = "*"
-zstandard = "^0.23"
-
-[package.source]
-type = "git"
-url = "https://github.com/KrotosBenjamin/pandas-plink.git"
-reference = "HEAD"
-resolved_reference = "0af07e67a5e8d74acb658c2fb22877f7e75d52f7"
+zstandard = ">=0.23,<0.24"
 
 [[package]]
 name = "pandas-stubs"
@@ -4103,4 +4099,4 @@ cffi = ["cffi (>=1.11)"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.15"
-content-hash = "f92fe486415991006ddcfbc72f095b1c48031934c08292aa7ba849cad0379c13"
+content-hash = "046e36fa65dd67e74f3131c188f87953780e05c1b6b6477ab41b2664974266f2"
