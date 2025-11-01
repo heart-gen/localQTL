@@ -13,6 +13,7 @@ Notes
 """
 import numpy as np
 import pandas as pd
+import torch
 from typing import List, Optional, Union
 
 from rfmix_reader import read_rfmix
@@ -172,7 +173,9 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
     """
 
     def __init__(self, *args, haplotypes=None, loci_df=None,
-                 on_the_fly_impute=True, **kwargs):
+                 on_the_fly_impute=True, preload_to_torch: bool = False,
+                 torch_device: Union[str, torch.device, None] = None,
+                 **kwargs):
         self.nearest_tolerance = kwargs.pop("nearest_tolerance", None) # in bp
         super().__init__(*args, **kwargs)
 
@@ -185,6 +188,34 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
             raise ValueError("`haplotypes` must have shape (loci, samples, ancestries).") from e
 
         self.on_the_fly_impute = on_the_fly_impute
+        self._preload_to_torch = bool(preload_to_torch)
+        self._hap_torch_cache: Optional[torch.Tensor] = None
+        self._hap_torch_device: Optional[torch.device] = None
+        self._hap_preloaded_is_gpu: bool = False
+        try:
+            self._hap_n_samples = int(self.haplotypes.shape[1])
+            self._hap_n_ancestries = int(self.haplotypes.shape[2])
+        except Exception:
+            self._hap_n_samples, self._hap_n_ancestries = 0, 0
+
+        if self._preload_to_torch:
+            if torch_device is None:
+                torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self._hap_torch_device = torch.device(torch_device)
+            base = haplotypes
+            if hasattr(base, "compute"):
+                base = base.compute()
+            if isinstance(base, torch.Tensor):
+                hap_tensor = base.to(device=self._hap_torch_device, dtype=torch.float32)
+            else:
+                if hasattr(base, "get"):
+                    base = base.get()
+                base_np = np.asarray(base, dtype=np.float32)
+                hap_tensor = torch.as_tensor(base_np, dtype=torch.float32, device=self._hap_torch_device)
+            self._hap_torch_cache = hap_tensor.contiguous()
+            self._hap_preloaded_is_gpu = self._hap_torch_cache.is_cuda
+            self._hap_n_samples = int(self._hap_torch_cache.shape[1])
+            self._hap_n_ancestries = int(self._hap_torch_cache.shape[2])
 
         # Build mapping and mask
         self.loci_df = _to_pandas(loci_df).copy() if loci_df is not None else None
@@ -313,21 +344,37 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
             return self._empty_h_block()
 
         hap_idx = v_idx if self._geno2hap is None else self._geno2hap[v_idx]
+        hap_idx = np.asarray(hap_idx, dtype=int)
+        if self._preload_to_torch and self._hap_torch_cache is not None:
+            index = torch.as_tensor(hap_idx, dtype=torch.long, device=self._hap_torch_cache.device)
+            H_block = torch.index_select(self._hap_torch_cache, 0, index)
+            if H_block.dtype != torch.float32:
+                H_block = H_block.to(dtype=torch.float32)
+            if self.on_the_fly_impute and torch.isnan(H_block).any():
+                H_np = self._interpolate_block(H_block.detach().cpu().numpy())
+                H_block = torch.as_tensor(H_np, dtype=torch.float32, device=self._hap_torch_cache.device).contiguous()
+            if self.on_the_fly_impute and torch.isnan(H_block).any():
+                raise ValueError("Detected NaNs in haplotype block after filtering.")
+            return H_block
+
         H_slice = self.haplotypes[hap_idx, :, :]
         H_block = H_slice.compute() if hasattr(H_slice, "compute") else H_slice
-        mod = get_array_module(H_block)
-        if self.on_the_fly_impute and mod.isnan(mod.asarray(H_block)).any():
+        if hasattr(H_block, "get"):
+            H_block = H_block.get()
+        H_block = np.asarray(H_block, dtype=np.float32)
+        if self.on_the_fly_impute and np.isnan(H_block).any():
+            H_block = self._interpolate_block(H_block)
+        if self.on_the_fly_impute and np.isnan(H_block).any():
             raise ValueError("Detected NaNs in haplotype block after filtering.")
         return H_block
 
     def _empty_h_block(self):
         """Return an empty H block with shape (0, samples, ancestries) and matching dtype."""
-        try:
-            n_samp = int(self.haplotypes.shape[1])
-            n_anc  = int(self.haplotypes.shape[2])
-        except Exception:
-            # Fall back safely if shapes are unknown (rare with Dask)
-            n_samp, n_anc = 0, 0
+        n_samp = self._hap_n_samples if self._hap_n_samples is not None else 0
+        n_anc = self._hap_n_ancestries if self._hap_n_ancestries is not None else 0
+        if self._preload_to_torch and self._hap_torch_cache is not None:
+            return torch.empty((0, n_samp, n_anc), dtype=self._hap_torch_cache.dtype,
+                               device=self._hap_torch_cache.device)
         dtype = getattr(self.haplotypes, "dtype", np.float32)
         return np.empty((0, n_samp, n_anc), dtype=dtype)
 

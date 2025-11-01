@@ -64,7 +64,10 @@ class NullLogger(SimpleLogger):
 def gpu_available():
     try:
         import cupy as cp
-        ndev = cp.cuda.runtime.getDeviceCount()
+        try:
+            ndev = cp.cuda.runtime.getDeviceCount()
+        except cp.cuda.runtime.CUDARuntimeError:
+            return False
         return ndev > 0
     except ModuleNotFoundError:
         return False

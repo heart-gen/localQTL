@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import sys
+import torch
 
 # ensure we import from the local package
 sys.path.append("src")
@@ -220,3 +221,39 @@ def test_interpolate_block_handles_nans(toy_hap_data_3anc):
     # entries that were not NaN should remain the same
     assert imputed[0,0,1] == 10.0
     assert imputed[2,1,2] == 301.0
+
+
+def test_preload_to_torch_returns_tensor_blocks(toy_hap_data_2anc):
+    """When preloading, batches should yield torch tensors on the requested device."""
+    geno_df = toy_hap_data_2anc["genotype_df"]
+    var_df = toy_hap_data_2anc["variant_df"]
+    pheno_df = toy_hap_data_2anc["phenotype_df"]
+    pheno_pos_df = toy_hap_data_2anc["phenotype_pos_df"]
+    hap = toy_hap_data_2anc["haplotypes"]
+    loci_df = toy_hap_data_2anc["loci_df"]
+
+    gen = InputGeneratorCisWithHaps(
+        geno_df,
+        var_df,
+        pheno_df,
+        pheno_pos_df,
+        haplotypes=hap,
+        loci_df=loci_df,
+        on_the_fly_impute=True,
+        window=200,
+        preload_to_torch=True,
+        torch_device=torch.device("cpu"),
+    )
+
+    batches = list(gen.generate_data())
+    assert batches, "Generator should yield at least one batch"
+    for batch in batches:
+        assert len(batch) == 5
+        H_block = batch[3]
+        assert isinstance(H_block, torch.Tensor)
+        assert H_block.device.type == "cpu"
+        assert H_block.dtype == torch.float32
+
+    empty = gen._empty_h_block()
+    assert isinstance(empty, torch.Tensor)
+    assert empty.device.type == "cpu"
