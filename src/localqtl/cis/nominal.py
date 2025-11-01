@@ -49,15 +49,17 @@ def _count_cis_pairs(ig, chrom: str | None = None) -> int:
     for batch in ig.generate_data(chrom=chrom):
         if not group_mode:
             if len(batch) in (4, 5):
-                _, G_block, _, _ = batch
+                G_block = batch[1]
                 n_phen = 1
             else:
                 raise ValueError(f"Unexpected batch length for cis count: {len(batch)}")
         else:
             if len(batch) == 5:
-                _, G_block, _, ids, _ = batch
+                G_block = batch[1]
+                ids = batch[3]
             elif len(batch) == 6:
-                _, G_block, _, _, ids, _ = batch
+                G_block = batch[1]
+                ids = batch[4]
             else:
                 raise ValueError(f"Unexpected grouped batch length for cis count: {len(batch)}")
             n_phen = len(ids)
@@ -379,8 +381,7 @@ def map_nominal(
                             logger=logger,
                             total_phenotypes=chrom_total,
                         )
-                    logger.write(f"chr{chrom}: ~{sink.rows:,} rows written")
-                logger.write(f"chr{chrom}: ~{sink.rows:,} rows written")
+                        logger.write(f"chr{chrom}: ~{sink.rows:,} rows written")
                 if logger.verbose:
                     elapsed = time.time() - chrom_start
                     logger.write(f"    Chromosome {chrom} completed in {elapsed:.2f}s")
@@ -398,5 +399,5 @@ def map_nominal(
     if logger.verbose:
         elapsed = time.time() - overall_start
         logger.write(f"    Completed nominal scan in {elapsed:.2f}s")
-    return result
+    return results
     
