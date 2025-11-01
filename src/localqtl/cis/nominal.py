@@ -400,4 +400,3 @@ def map_nominal(
         elapsed = time.time() - overall_start
         logger.write(f"    Completed nominal scan in {elapsed:.2f}s")
     return results
-    
