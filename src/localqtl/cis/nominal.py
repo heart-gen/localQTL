@@ -49,15 +49,17 @@ def _count_cis_pairs(ig, chrom: str | None = None) -> int:
     for batch in ig.generate_data(chrom=chrom):
         if not group_mode:
             if len(batch) in (4, 5):
-                _, G_block, _, _ = batch
+                G_block = batch[1]
                 n_phen = 1
             else:
                 raise ValueError(f"Unexpected batch length for cis count: {len(batch)}")
         else:
             if len(batch) == 5:
-                _, G_block, _, ids, _ = batch
+                G_block = batch[1]
+                ids = batch[3]
             elif len(batch) == 6:
-                _, G_block, _, _, ids, _ = batch
+                G_block = batch[1]
+                ids = batch[4]
             else:
                 raise ValueError(f"Unexpected grouped batch length for cis count: {len(batch)}")
             n_phen = len(ids)
