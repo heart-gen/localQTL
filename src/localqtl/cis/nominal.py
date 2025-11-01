@@ -1,3 +1,4 @@
+import time
 import os, torch
 import numpy as np
 import pandas as pd
@@ -99,7 +100,8 @@ def _buffers_to_arrow(buffers: dict[str, np.ndarray], schema: pa.Schema, n_rows:
 
 def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float = 0.0,
                       chrom: str | None = None, sink: "ParquetSink | None" = None,
-                      target_rows: int | None = None):
+                      target_rows: int | None = None, logger: SimpleLogger | None = None,
+                      total_phenotypes: int | None = None):
     """
     Shared inner loop for nominal (and optional permutation) mapping.
     Handles both InputGeneratorCis (no haps) and InputGeneratorCisWithHaps (haps).
@@ -125,9 +127,17 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
             target_rows = _count_cis_pairs(ig, chrom)
 
     buffers = _allocate_buffers(expected_columns, include_perm, target_rows)
-    cursor = 0
+    cursor = processed = 0
     variant_cache: dict[bytes, tuple[np.ndarray, np.ndarray]] = {}
+
     group_mode = getattr(ig, "group_s", None) is not None
+    if total_phenotypes is None:
+        total_phenotypes = ig.phenotype_df.shape[0]
+    if logger is None:
+        logger = SimpleLogger(verbose=True, timestamps=True)
+
+    progress_interval = max(1, total_phenotypes // 10) if total_phenotypes else 0
+    chrom_label = f"chr{chrom}" if chrom is not None else "all chromosomes"
     for batch in ig.generate_data(chrom=chrom):
         if not group_mode: # Ungrouped
             if len(batch) == 4:
@@ -255,6 +265,15 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 buffers["perm_max_r2"][row_slice] = fill_value
 
             cursor += n_variants
+            processed += 1
+            if (
+                    logger.verbose and total_phenotypes and progress_interval
+                    and (processed % progress_interval == 0
+                         or processed == total_phenotypes)
+            ):
+                logger.write(
+                    f"      processed {processed}/{total_phenotypes} phenotypes on {chrom_label}"
+                )
 
     if sink is not None:
         schema = _nominal_parquet_schema(include_perm)
@@ -326,6 +345,9 @@ def map_nominal(
         Y_resid.cpu().numpy(), index=ig.phenotype_df.index, columns=ig.phenotype_df.columns
     )
 
+    # Pre-compute per-chromosome phenotype counts for logging
+    phenotype_counts = ig.phenotype_pos_df['chr'].value_counts().to_dict()
+
     # Per-chromosome parquet streaming
     if out_dir is not None:
         os.makedirs(out_dir, exist_ok=True)
@@ -334,6 +356,10 @@ def map_nominal(
         with logger.time_block("Nominal scan (per-chrom streaming)", sync=sync):
             for chrom in ig.chrs:
                 out_path = os.path.join(out_dir, f"{out_prefix}.{chrom}.parquet")
+                chrom_total = int(phenotype_counts.get(chrom, 0))
+                if logger.verbose:
+                    logger.write(f"    Mapping chromosome {chrom} ({chrom_total} phenotypes)")
+                chrom_start = time.time()
                 with logger.time_block(f"{chrom}: map_nominal", sync=sync):
                     target_rows = _count_cis_pairs(ig, chrom)
                     with AsyncParquetSink(
@@ -350,12 +376,27 @@ def map_nominal(
                             maf_threshold=maf_threshold,
                             chrom=chrom, sink=sink,
                             target_rows=target_rows,
+                            logger=logger,
+                            total_phenotypes=chrom_total,
                         )
                     logger.write(f"chr{chrom}: ~{sink.rows:,} rows written")
+                logger.write(f"chr{chrom}: ~{sink.rows:,} rows written")
+                if logger.verbose:
+                    elapsed = time.time() - chrom_start
+                    logger.write(f"    Chromosome {chrom} completed in {elapsed:.2f}s")
         return None if not return_df else pd.DataFrame([])
 
+    total_phenotypes = int(ig.phenotype_df.shape[0])
+    if logger.verbose:
+        logger.write(f"    Mapping all chromosomes ({total_phenotypes} phenotypes)")
+    overall_start = time.time()
     with logger.time_block("Computing associations (nominal)", sync=sync):
-        return _run_nominal_core(ig, variant_df, rez, nperm, device,
-                                 maf_threshold=maf_threshold,
-                                 chrom=None, sink=None)
+        results = _run_nominal_core(ig, variant_df, rez, nperm, device,
+                                    maf_threshold=maf_threshold,
+                                    chrom=None, sink=None, logger=logger,
+                                    total_phenotypes=total_phenotypes)
+    if logger.verbose:
+        elapsed = time.time() - overall_start
+        logger.write(f"    Completed nominal scan in {elapsed:.2f}s")
+    return result
     
