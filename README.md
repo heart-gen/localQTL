@@ -24,6 +24,12 @@ workflows, while adding ancestry-aware use cases.
 
 ## Installation
 
+Install the latest release from PyPI:
+
+```bash
+pip install localqtl
+```
+
 The project uses [Poetry](https://python-poetry.org/) for dependency management.
 Clone the repository and install the package into a virtual environment:
 
