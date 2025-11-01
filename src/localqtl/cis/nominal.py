@@ -379,8 +379,7 @@ def map_nominal(
                             logger=logger,
                             total_phenotypes=chrom_total,
                         )
-                    logger.write(f"chr{chrom}: ~{sink.rows:,} rows written")
-                logger.write(f"chr{chrom}: ~{sink.rows:,} rows written")
+                        logger.write(f"chr{chrom}: ~{sink.rows:,} rows written")
                 if logger.verbose:
                     elapsed = time.time() - chrom_start
                     logger.write(f"    Chromosome {chrom} completed in {elapsed:.2f}s")
@@ -398,5 +397,5 @@ def map_nominal(
     if logger.verbose:
         elapsed = time.time() - overall_start
         logger.write(f"    Completed nominal scan in {elapsed:.2f}s")
-    return result
+    return results
     
