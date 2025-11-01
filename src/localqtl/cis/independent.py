@@ -1,3 +1,5 @@
+import time
+
 import torch
 import numpy as np
 import pandas as pd
@@ -22,7 +24,8 @@ def _run_independent_core(
         ig, variant_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame],
         signif_seed_df: pd.DataFrame, signif_threshold: float, nperm: int,
         device: str, maf_threshold: float = 0.0, random_tiebreak: bool = False,
-        missing: float = -9.0, beta_approx: bool = True, seed: int | None = None
+        missing: float = -9.0, beta_approx: bool = True, seed: int | None = None,
+        chrom: str | None = None
 ) -> pd.DataFrame:
     """Forward–backward independent mapping for ungrouped phenotypes."""
     out_rows = []
@@ -38,7 +41,7 @@ def _run_independent_core(
     # Precompute variant index lookup for dosages
     var_in_frame = set(variant_df.index)
 
-    for batch in ig.generate_data():
+    for batch in ig.generate_data(chrom=chrom):
         if len(batch) == 4:
             p, G_block, v_idx, pid = batch
             H_block = None
@@ -296,7 +299,8 @@ def _run_independent_core_group( ## TODO: Needs updating
         ig, variant_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame],
         seed_by_group_df: pd.DataFrame, signif_threshold: float, nperm: int,
         device: str, maf_threshold: float = 0.0, random_tiebreak: bool = False,
-        missing: float = -9.0, beta_approx: bool = True, seed: int | None = None
+        missing: float = -9.0, beta_approx: bool = True, seed: int | None = None,
+        chrom: str | None = None
 ) -> pd.DataFrame:
     """Forward–backward independent mapping for grouped phenotypes."""
     out_rows = []
@@ -308,7 +312,7 @@ def _run_independent_core_group( ## TODO: Needs updating
     if covariates_df is not None and not covariates_df.index.equals(ig.phenotype_df.columns):
         covariates_df = covariates_df.loc[ig.phenotype_df.columns]
 
-    for batch in ig.generate_data():
+    for batch in ig.generate_data(chrom=chrom):
         if len(batch) == 5:
             P, G_block, v_idx, ids, group_id = batch
             H_block = None
@@ -649,27 +653,71 @@ def map_independent(
     if ig.n_phenotypes == 0:
         raise ValueError("No valid phenotypes after generator preprocessing.")
 
-    with logger.time_block("Computing associations (independent: forward–backward)", sync=sync):
-        if group_s is None:
-            if "phenotype_id" not in signif_df.columns:
-                raise ValueError("cis_df must contain 'phenotype_id' for ungrouped mapping.")
-            signif_seed_df = signif_df.set_index("phenotype_id", drop=False)
+    if group_s is None:
+        if "phenotype_id" not in signif_df.columns:
+            raise ValueError("cis_df must contain 'phenotype_id' for ungrouped mapping.")
+        signif_seed_df = signif_df.set_index("phenotype_id", drop=False)
+        valid_ids = ig.phenotype_pos_df.index.intersection(signif_seed_df.index)
+        phenotype_counts = ig.phenotype_pos_df.loc[valid_ids, "chr"].value_counts().to_dict()
+        total_items = int(valid_ids.shape[0])
+        item_label = "phenotypes"
+
+        def run_core(chrom: str | None) -> pd.DataFrame:
             return _run_independent_core(
                 ig=ig, variant_df=variant_df, covariates_df=covariates_df,
                 signif_seed_df=signif_seed_df, signif_threshold=signif_threshold,
                 nperm=nperm, device=device, maf_threshold=maf_threshold,
                 random_tiebreak=random_tiebreak, missing=missing,
-                beta_approx=beta_approx, seed=seed
+                beta_approx=beta_approx, seed=seed, chrom=chrom,
             )
-        else:
-            if "group_id" not in signif_df.columns:
-                raise ValueError("cis_df must contain 'group_id' for grouped mapping.")
-            seed_by_group_df = (signif_df.sort_values(["group_id", "pval_beta"])
-                                          .groupby("group_id", sort=False).head(1))
+    else:
+        if "group_id" not in signif_df.columns:
+            raise ValueError("cis_df must contain 'group_id' for grouped mapping.")
+        seed_by_group_df = (signif_df.sort_values(["group_id", "pval_beta"])
+                                      .groupby("group_id", sort=False).head(1))
+        group_counts: dict[str, int] = {}
+        total_items = 0
+        for _, row in seed_by_group_df.iterrows():
+            pid = row.get("phenotype_id")
+            if pd.isna(pid) or pid not in ig.phenotype_pos_df.index:
+                continue
+            chrom = ig.phenotype_pos_df.at[pid, "chr"]
+            group_counts[chrom] = group_counts.get(chrom, 0) + 1
+            total_items += 1
+        phenotype_counts = group_counts
+        item_label = "phenotype groups"
+
+        def run_core(chrom: str | None) -> pd.DataFrame:
             return _run_independent_core_group(
                 ig=ig, variant_df=variant_df, covariates_df=covariates_df,
                 seed_by_group_df=seed_by_group_df, signif_threshold=signif_threshold,
                 nperm=nperm, device=device, maf_threshold=maf_threshold,
                 random_tiebreak=random_tiebreak, missing=missing,
-                beta_approx=beta_approx, seed=seed
+                beta_approx=beta_approx, seed=seed, chrom=chrom,
             )
+
+    if logger.verbose:
+        logger.write(f"    Mapping all chromosomes ({total_items} {item_label})")
+
+    overall_start = time.time()
+    results: list[pd.DataFrame] = []
+    with logger.time_block("Computing associations (independent: forward–backward)", sync=sync):
+        for chrom in ig.chrs:
+            chrom_total = int(phenotype_counts.get(chrom, 0))
+            if logger.verbose:
+                logger.write(f"    Mapping chromosome {chrom} ({chrom_total} {item_label})")
+            chrom_start = time.time()
+            with logger.time_block(f"{chrom}: map_independent", sync=sync):
+                chrom_df = run_core(chrom)
+            results.append(chrom_df)
+            if logger.verbose:
+                elapsed = time.time() - chrom_start
+                logger.write(f"    Chromosome {chrom} completed in {elapsed:.2f}s")
+
+    if logger.verbose:
+        elapsed = time.time() - overall_start
+        logger.write(f"    Completed independent scan in {elapsed:.2f}s")
+
+    if results:
+        return pd.concat(results, axis=0, ignore_index=True)
+    return pd.DataFrame()
