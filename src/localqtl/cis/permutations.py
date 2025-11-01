@@ -1,7 +1,9 @@
+import time
+
 import torch
 import numpy as np
 import pandas as pd
-from typing import Optional, List
+from typing import Optional
 
 from ..utils import SimpleLogger, subseed
 from ..stats import beta_approx_pval, get_t_pval
@@ -19,7 +21,7 @@ __all__ = [
 
 def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
                           beta_approx: bool = True, maf_threshold: float = 0.0,
-                          seed: int | None = None) -> pd.DataFrame:
+                          seed: int | None = None, chrom: str | None = None) -> pd.DataFrame:
     """
     One top association per phenotype with empirical permutation p-value (no grouping).
     Compatible with InputGeneratorCis and InputGeneratorCisWithHaps (ungrouped only).
@@ -31,7 +33,7 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
     idx_to_id = variant_df.index.to_numpy()
     pos_arr = variant_df["pos"].to_numpy(np.int64, copy=False)
 
-    for batch in ig.generate_data():
+    for batch in ig.generate_data(chrom=chrom):
         # Accept shapes: (p, G, v_idx, pid) or (p, G, v_idx, H, pid)
         if len(batch) == 4:
             p, G_block, v_idx, pid = batch
@@ -154,7 +156,7 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
 
 def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
                                 beta_approx: bool = True, maf_threshold: float = 0.0,
-                                seed: int | None = None) -> pd.DataFrame:
+                                seed: int | None = None, chrom: str | None = None) -> pd.DataFrame:
     """
     Group-aware permutation mapping: returns one top association per *group* (best phenotype within group),
     with empirical p-values computed by taking the max R² across variants and phenotypes for each permutation.
@@ -166,7 +168,7 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
     out_rows = []
     idx_to_id = variant_df.index.to_numpy()
     pos_arr = variant_df["pos"].to_numpy(np.int64, copy=False)
-    for batch in ig.generate_data():
+    for batch in ig.generate_data(chrom=chrom):
         # Accept shapes: (P, G, v_idx, ids, group_id) or (P, G, v_idx, H, ids, group_id)
         if len(batch) == 5:
             P, G_block, v_idx, ids, group_id = batch
@@ -210,7 +212,7 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
         # Build a stacked Y for residualization
         Y_stack = torch.stack([torch.tensor(pi, dtype=torch.float32, device=device) for pi in P_list], dim=0)  # (k x n)
         # Use shared routine to residualize matrices with the same Residualizer
-        mats: List[torch.Tensor] = [G_t]
+        mats: list[torch.Tensor] = [G_t]
         H_shape = None
         if H_t is not None:
             m, n, pH = H_t.shape
@@ -368,8 +370,36 @@ def map_permutations(
                                    columns=ig.phenotype_df.columns)
 
     # Core either grouped or single-phenotype
+    phenotype_counts = ig.phenotype_pos_df['chr'].value_counts().to_dict()
+    total_phenotypes = int(ig.phenotype_df.shape[0])
+    if logger.verbose:
+        logger.write(f"    Mapping all chromosomes ({total_phenotypes} phenotypes)")
+
+    core = _run_permutation_core_group if getattr(ig, "group_s", None) is not None else _run_permutation_core
+
+    overall_start = time.time()
+    results: list[pd.DataFrame] = []
     with logger.time_block("Computing associations (permutations)", sync=sync):
-        core = _run_permutation_core_group if getattr(ig, "group_s", None) is not None else _run_permutation_core
-        return core(ig, variant_df, rez, nperm=nperm, device=device,
+        for chrom in ig.chrs:
+            chrom_total = int(phenotype_counts.get(chrom, 0))
+            if logger.verbose:
+                logger.write(f"    Mapping chromosome {chrom} ({chrom_total} phenotypes)")
+            chrom_start = time.time()
+            with logger.time_block(f"{chrom}: map_permutations", sync=sync):
+                chrom_df = core(
+                    ig, variant_df, rez, nperm=nperm, device=device,
                     beta_approx=beta_approx, maf_threshold=maf_threshold,
-                    seed=seed)
+                    seed=seed, chrom=chrom,
+                )
+            results.append(chrom_df)
+            if logger.verbose:
+                elapsed = time.time() - chrom_start
+                logger.write(f"    Chromosome {chrom} completed in {elapsed:.2f}s")
+
+    if logger.verbose:
+        elapsed = time.time() - overall_start
+        logger.write(f"    Completed permutation scan in {elapsed:.2f}s")
+
+    if results:
+        return pd.concat(results, axis=0, ignore_index=True)
+    return pd.DataFrame()
