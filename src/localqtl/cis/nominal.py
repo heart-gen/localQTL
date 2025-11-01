@@ -139,7 +139,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
         logger = SimpleLogger(verbose=True, timestamps=True)
 
     progress_interval = max(1, total_phenotypes // 10) if total_phenotypes else 0
-    chrom_label = f"chr{chrom}" if chrom is not None else "all chromosomes"
+    chrom_label = f"{chrom}" if chrom is not None else "all chromosomes"
     for batch in ig.generate_data(chrom=chrom):
         if not group_mode: # Ungrouped
             if len(batch) == 4:
@@ -340,7 +340,7 @@ def map_nominal(
 
     # Residualize once using the filtered phenotypes from the generator
     Y = torch.tensor(ig.phenotype_df.values, dtype=torch.float32, device=device)
-    with logger.time_block("Residualizing phenotypes", sync=sync):
+    with logger.time_block("    Residualizing phenotypes", sync=sync):
         Y_resid, rez = residualize_matrix_with_covariates(Y, covariates_df, device)
 
     ig.phenotype_df = pd.DataFrame(
@@ -381,7 +381,7 @@ def map_nominal(
                             logger=logger,
                             total_phenotypes=chrom_total,
                         )
-                        logger.write(f"chr{chrom}: ~{sink.rows:,} rows written")
+                        # logger.write(f"{chrom}: ~{sink.rows:,} rows written")
                 if logger.verbose:
                     elapsed = time.time() - chrom_start
                     logger.write(f"    Chromosome {chrom} completed in {elapsed:.2f}s")
