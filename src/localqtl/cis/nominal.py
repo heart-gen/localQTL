@@ -362,7 +362,7 @@ def map_nominal(
 
     # Residualize once using the filtered phenotypes from the generator
     Y = torch.tensor(ig.phenotype_df.values, dtype=torch.float32, device=device)
-    with logger.time_block("    Residualizing phenotypes", sync=sync):
+    with logger.time_block(" Residualizing phenotypes", sync=sync):
         Y_resid, rez = residualize_matrix_with_covariates(Y, covariates_df, device)
 
     ig.phenotype_df = pd.DataFrame(
