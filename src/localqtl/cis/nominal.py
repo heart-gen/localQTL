@@ -168,7 +168,18 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
 
         # Tensors
         G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
-        H_t = torch.tensor(H_block, dtype=torch.float32, device=device) if H_block is not None else None
+        if H_block is not None:
+            if isinstance(H_block, torch.Tensor):
+                if H_block.device.type != device:
+                    H_t = H_block.to(device=device, dtype=torch.float32)
+                elif H_block.dtype != torch.float32:
+                    H_t = H_block.to(dtype=torch.float32)
+                else:
+                    H_t = H_block
+            else:
+                H_t = torch.tensor(H_block, dtype=torch.float32, device=device)
+        else:
+            H_t = None
 
         # Impute / filter
         G_t, keep_mask, _ = impute_mean_and_filter(G_t)
@@ -298,15 +309,23 @@ def map_nominal(
         window: int = 1_000_000, nperm: Optional[int] = None, device: str = "cuda",
         out_dir: str = "./", out_prefix: str = "cis_nominal",
         compression: str = "snappy", return_df: bool = False,
-        logger: SimpleLogger | None = None, verbose: bool = True
-) -> pd.DataFrame:
+        logger: SimpleLogger | None = None, verbose: bool = True,
+        preload_haplotypes: bool = True,
+    ) -> pd.DataFrame:
     """
     Nominal cis-QTL scan with optional permutations and local ancestry.
 
     Adjusts for covariates by residualizing y, G, and H across samples using the
     same Residualizer (projection onto the orthogonal complement of C).
+
+    Parameters
+    ----------
+    preload_haplotypes : bool, default True
+        When haplotypes are provided, pre-load them into a contiguous torch.Tensor
+        on the requested device to avoid per-batch host<->device transfers.
     """
     device = device if device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
+    torch_device = torch.device(device)
     logger = logger or SimpleLogger(verbose=verbose, timestamps=True)
     sync = (torch.cuda.synchronize if device == "cuda" else None)
 
@@ -332,7 +351,10 @@ def map_nominal(
         InputGeneratorCisWithHaps(
             genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
             phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes,
-            loci_df=loci_df, group_s=group_s) if haplotypes is not None else
+            loci_df=loci_df, group_s=group_s,
+            preload_to_torch=(preload_haplotypes and haplotypes is not None),
+            torch_device=torch_device,
+        ) if haplotypes is not None else
         InputGeneratorCis(
             genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
             phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s)
