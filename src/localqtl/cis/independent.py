@@ -35,8 +35,15 @@ def _run_independent_core(
     pos_arr   = variant_df["pos"].to_numpy(np.int32)
 
     # Basic alignment checks
-    if covariates_df is not None and not covariates_df.index.equals(ig.phenotype_df.columns):
-        covariates_df = covariates_df.loc[ig.phenotype_df.columns]
+    covariates_base_t: torch.Tensor | None = None
+    if covariates_df is not None:
+        if not covariates_df.index.equals(ig.phenotype_df.columns):
+            covariates_df = covariates_df.loc[ig.phenotype_df.columns]
+        covariates_base_t = torch.as_tensor(
+            covariates_df.to_numpy(np.float32, copy=False),
+            dtype=torch.float32,
+            device=device,
+        )
 
     # Precompute variant index lookup for dosages
     var_in_frame = set(variant_df.index)
@@ -88,34 +95,41 @@ def _run_independent_core(
 
         # Fixed permutations for this phenotype
         n = y_t.shape[0]
-        perms = torch.stack([torch.randperm(n, device=device, generator=gen) for _ in range(nperm)], dim=0)  # (nperm, n)
+        perms = torch.stack(
+            [torch.randperm(n, device=device, generator=gen) for _ in range(nperm)],
+            dim=1,
+        )  # (n, nperm)
 
         # Forward pass
         forward_rows = [seed_row.to_frame().T]  # initialize with seed from cis_df
-        dosage_dict: dict[str, np.ndarray] = {}
+        dosage_dict: dict[str, torch.Tensor] = {}
         seed_vid = str(seed_row["variant_id"])
         if seed_vid in var_in_frame and seed_vid in ig.genotype_df.index:
-            dosage_dict[seed_vid] = dosage_vector_for_covariate(
-                genotype_df=ig.genotype_df,
-                variant_id=seed_vid,
-                sample_order=ig.phenotype_df.columns,
-                missing=missing,
+            dosage_dict[seed_vid] = torch.as_tensor(
+                dosage_vector_for_covariate(
+                    genotype_df=ig.genotype_df,
+                    variant_id=seed_vid,
+                    sample_order=ig.phenotype_df.columns,
+                    missing=missing,
+                ),
+                dtype=torch.float32,
+                device=device,
             )
 
         while True:
             # Build augmented covariates = [C | selected dosages]
-            if covariates_df is not None:
-                C_base = covariates_df.values.astype(np.float32, copy=False)
-                C_sel = (np.column_stack([dosage_dict[v] for v in dosage_dict])
-                         if dosage_dict else np.zeros((n, 0), np.float32))
-                C_aug = np.hstack([C_base, C_sel]).astype(np.float32, copy=False)
-            else:
-                C_aug = (np.column_stack([dosage_dict[v] for v in dosage_dict]) if dosage_dict
-                         else np.zeros((n, 0), np.float32)).astype(np.float32, copy=False)
-
-            rez_aug = Residualizer(torch.tensor(C_aug, dtype=torch.float32, device=device)) if C_aug.shape[1] > 0 else None
+            rez_aug = None
+            extras = [dosage_dict[v] for v in dosage_dict]
+            if covariates_base_t is not None or extras:
+                components = []
+                if covariates_base_t is not None:
+                    components.append(covariates_base_t)
+                if extras:
+                    components.append(torch.stack(extras, dim=1))
+                C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
+                rez_aug = Residualizer(C_aug_t)
             y_resid, G_resid, H_resid = residualize_batch(y_t, G_t, H_t, rez_aug, center=True, group=False)
-            y_perm = torch.stack([y_resid[idxp] for idxp in perms], dim=1)  # (n x nperm)
+            y_perm = y_resid[perms]
 
             k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
             betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
@@ -190,11 +204,15 @@ def _run_independent_core(
 
             # add dosage covariate for next round
             if var_id in var_in_frame and var_id in ig.genotype_df.index and var_id not in dosage_dict:
-                dosage_dict[var_id] = dosage_vector_for_covariate(
-                    genotype_df=ig.genotype_df,
-                    variant_id=var_id,
-                    sample_order=ig.phenotype_df.columns,
-                    missing=missing,
+                dosage_dict[var_id] = torch.as_tensor(
+                    dosage_vector_for_covariate(
+                        genotype_df=ig.genotype_df,
+                        variant_id=var_id,
+                        sample_order=ig.phenotype_df.columns,
+                        missing=missing,
+                    ),
+                    dtype=torch.float32,
+                    device=device,
                 )
 
         forward_df = pd.concat(forward_rows, axis=0, ignore_index=True)
@@ -206,19 +224,18 @@ def _run_independent_core(
             selected = forward_df["variant_id"].tolist()
             for rk, drop_vid in enumerate(selected, start=1):
                 kept = [v for v in selected if v != drop_vid]
-                if covariates_df is not None:
-                    C_base = covariates_df.values.astype(np.float32, copy=False)
-                    C_sel = (np.column_stack([dosage_dict[v] for v in kept]) if kept
-                             else np.zeros((n, 0), np.float32))
-                    C_aug = np.hstack([C_base, C_sel]).astype(np.float32, copy=False)
-                else:
-                    C_aug = (np.column_stack([dosage_dict[v] for v in kept]) if kept
-                             else np.zeros((n, 0), np.float32)).astype(np.float32, copy=False)
-
-                rez_aug = Residualizer(torch.tensor(C_aug, dtype=torch.float32, device=device)) if C_aug.shape[1] > 0 else None
+                rez_aug = None
+                extras = [dosage_dict[v] for v in kept]
+                if covariates_base_t is not None or extras:
+                    components = []
+                    if covariates_base_t is not None:
+                        components.append(covariates_base_t)
+                    if extras:
+                        components.append(torch.stack(extras, dim=1))
+                    C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
+                    rez_aug = Residualizer(C_aug_t)
                 y_resid, G_resid, H_resid = residualize_batch(y_t, G_t, H_t, rez_aug, center=True, group=False)
-                perms = [torch.randperm(n, device=device, generator=gen) for _ in range(nperm)]
-                y_perm = torch.stack([y_resid[idxp] for idxp in perms], dim=1)
+                y_perm = y_resid[perms]
 
                 k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
                 betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
@@ -309,8 +326,15 @@ def _run_independent_core_group( ## TODO: Needs updating
     idx_to_id = variant_df.index.to_numpy()
     pos_arr = variant_df["pos"].to_numpy(np.int64, copy=False)
 
-    if covariates_df is not None and not covariates_df.index.equals(ig.phenotype_df.columns):
-        covariates_df = covariates_df.loc[ig.phenotype_df.columns]
+    covariates_base_t: torch.Tensor | None = None
+    if covariates_df is not None:
+        if not covariates_df.index.equals(ig.phenotype_df.columns):
+            covariates_df = covariates_df.loc[ig.phenotype_df.columns]
+        covariates_base_t = torch.as_tensor(
+            covariates_df.to_numpy(np.float32, copy=False),
+            dtype=torch.float32,
+            device=device,
+        )
 
     for batch in ig.generate_data(chrom=chrom):
         if len(batch) == 5:
@@ -352,29 +376,37 @@ def _run_independent_core_group( ## TODO: Needs updating
         if seed is not None:
             gen = torch.Generator(device=device)
             gen.manual_seed(subseed(seed, f"group:{group_id}"))
-        perms = torch.stack([torch.randperm(n, device=device, generator=gen) for _ in range(nperm)], dim=0)
+        perms = torch.stack(
+            [torch.randperm(n, device=device, generator=gen) for _ in range(nperm)],
+            dim=1,
+        )
 
-        dosage_dict: dict[str, np.ndarray] = {}
+        dosage_dict: dict[str, torch.Tensor] = {}
         if seed_vid in var_in_frame and seed_vid in geno_has_variant:
-            dosage_dict[seed_vid] = dosage_vector_for_covariate(
-                genotype_df=ig.genotype_df,
-                variant_id=seed_vid,
-                sample_order=ig.phenotype_df.columns,
-                missing=missing,
+            dosage_dict[seed_vid] = torch.as_tensor(
+                dosage_vector_for_covariate(
+                    genotype_df=ig.genotype_df,
+                    variant_id=seed_vid,
+                    sample_order=ig.phenotype_df.columns,
+                    missing=missing,
+                ),
+                dtype=torch.float32,
+                device=device,
             )
         forward_rows = [seed_row.to_frame().T]
 
         while True:
             # augmented covariates for this forward step
-            if covariates_df is not None:
-                C_base = covariates_df.values.astype(np.float32, copy=False)
-                C_sel = (np.column_stack([dosage_dict[v] for v in dosage_dict])
-                         if dosage_dict else np.zeros((n, 0), np.float32))
-                C_aug = np.hstack([C_base, C_sel]).astype(np.float32, copy=False)
-            else:
-                C_aug = (np.column_stack([dosage_dict[v] for v in dosage_dict]) if dosage_dict
-                         else np.zeros((n, 0), np.float32)).astype(np.float32, copy=False)
-            rez_aug = Residualizer(torch.tensor(C_aug, dtype=torch.float32, device=device)) if C_aug.shape[1] > 0 else None
+            rez_aug = None
+            extras = [dosage_dict[v] for v in dosage_dict]
+            if covariates_base_t is not None or extras:
+                components = []
+                if covariates_base_t is not None:
+                    components.append(covariates_base_t)
+                if extras:
+                    components.append(torch.stack(extras, dim=1))
+                C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
+                rez_aug = Residualizer(C_aug_t)
 
             # Evaluate all phenotypes in this group; keep the global best
             best = dict(r2=-np.inf, ix_var=-1, ix_pheno=-1, beta=None, se=None, t=None, dof=None)
@@ -404,7 +436,7 @@ def _run_independent_core_group( ## TODO: Needs updating
                     idx += 1
                 y_resid = mats_resid[idx].squeeze(0)
 
-                y_perm = torch.stack([y_resid[idxp] for idxp in perms], dim=1)
+                y_perm = y_resid[perms]
                 k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
                 betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
                     y=y_resid, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
@@ -466,11 +498,15 @@ def _run_independent_core_group( ## TODO: Needs updating
             forward_rows.append(row.to_frame().T)
 
             if var_id not in dosage_dict and var_id in var_in_frame and var_id in geno_has_variant:
-                dosage_dict[var_id] = dosage_vector_for_covariate(
-                    genotype_df=ig.genotype_df,
-                    variant_id=var_id,
-                    sample_order=ig.phenotype_df.columns,
-                    missing=missing,
+                dosage_dict[var_id] = torch.as_tensor(
+                    dosage_vector_for_covariate(
+                        genotype_df=ig.genotype_df,
+                        variant_id=var_id,
+                        sample_order=ig.phenotype_df.columns,
+                        missing=missing,
+                    ),
+                    dtype=torch.float32,
+                    device=device,
                 )
 
         forward_df = pd.concat(forward_rows, axis=0, ignore_index=True)
@@ -484,15 +520,16 @@ def _run_independent_core_group( ## TODO: Needs updating
             for rk, drop_vid in enumerate(selected, start=1):
                 kept = [v for v in selected if v != drop_vid]
 
-                if covariates_df is not None:
-                    C_base = covariates_df.values.astype(np.float32, copy=False)
-                    C_sel = (np.column_stack([dosage_dict[v] for v in kept]) if kept
-                             else np.zeros((n, 0), np.float32))
-                    C_aug = np.hstack([C_base, C_sel]).astype(np.float32, copy=False)
-                else:
-                    C_aug = (np.column_stack([dosage_dict[v] for v in kept]) if kept
-                             else np.zeros((n, 0), np.float32)).astype(np.float32, copy=False)
-                rez_aug = Residualizer(torch.tensor(C_aug, dtype=torch.float32, device=device)) if C_aug.shape[1] > 0 else None
+                rez_aug = None
+                extras = [dosage_dict[v] for v in kept]
+                if covariates_base_t is not None or extras:
+                    components = []
+                    if covariates_base_t is not None:
+                        components.append(covariates_base_t)
+                    if extras:
+                        components.append(torch.stack(extras, dim=1))
+                    C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
+                    rez_aug = Residualizer(C_aug_t)
 
                 best = dict(r2=-np.inf, ix_var=-1, ix_pheno=-1, beta=None, se=None, t=None, dof=None)
                 r2_perm_list = []
@@ -518,7 +555,7 @@ def _run_independent_core_group( ## TODO: Needs updating
                         idx += 1
                     y_resid = mats_resid[idx].squeeze(0)
 
-                    y_perm = torch.stack([y_resid[idxp] for idxp in perms], dim=1)
+                    y_perm = y_resid[perms]
                     k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
                     betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
                         y=y_resid, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
