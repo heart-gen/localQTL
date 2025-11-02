@@ -19,6 +19,58 @@ __all__ = [
     "map_permutations",
 ]
 
+
+def _allocate_result_buffers(
+        columns: list[str], dtype_map: dict[str, type | np.dtype], target_rows: int) -> dict[str, np.ndarray]:
+    target = max(int(target_rows), 1)
+    buffers: dict[str, np.ndarray] = {}
+    for name in columns:
+        dtype = dtype_map.get(name, np.float32)
+        buffers[name] = np.empty(target, dtype=dtype)
+    return buffers
+
+
+def _ensure_capacity(buffers: dict[str, np.ndarray], cursor: int, additional: int) -> dict[str, np.ndarray]:
+    required = cursor + int(additional)
+    current = next(iter(buffers.values())).shape[0] if buffers else 0
+    if required <= current:
+        return buffers
+    new_size = max(required, current * 2 if current else 1)
+    for key, arr in buffers.items():
+        new_arr = np.empty(new_size, dtype=arr.dtype)
+        new_arr[:cursor] = arr[:cursor]
+        buffers[key] = new_arr
+    return buffers
+
+
+def _write_row(buffers: dict[str, np.ndarray], idx: int, row: dict[str, object]) -> None:
+    for key, arr in buffers.items():
+        value = row.get(key)
+        if arr.dtype == object:
+            arr[idx] = None if value is None else value
+        elif np.issubdtype(arr.dtype, np.integer):
+            arr[idx] = int(value) if value is not None else 0
+        else:
+            arr[idx] = np.nan if value is None else float(value)
+
+
+def _buffers_to_dataframe(columns: list[str], buffers: dict[str, np.ndarray], n_rows: int) -> pd.DataFrame:
+    n = int(n_rows)
+    data = {col: buffers[col][:n] for col in columns if col in buffers}
+    return pd.DataFrame(data, columns=columns)
+
+
+def _estimate_rows(ig, chrom: str | None, grouped: bool = False) -> int:
+    if chrom is None:
+        if grouped and getattr(ig, "group_s", None) is not None:
+            return int(pd.Index(ig.group_s.dropna().unique()).shape[0])
+        return int(ig.phenotype_df.shape[0])
+    mask = ig.phenotype_pos_df["chr"] == chrom
+    if grouped and getattr(ig, "group_s", None) is not None:
+        group_s = ig.group_s.loc[ig.phenotype_pos_df.index]
+        return int(pd.Index(group_s[mask].dropna().unique()).shape[0])
+    return int(mask.sum())
+
 def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
                           beta_approx: bool = True, maf_threshold: float = 0.0,
                           seed: int | None = None, chrom: str | None = None) -> pd.DataFrame:
@@ -26,7 +78,35 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
     One top association per phenotype with empirical permutation p-value (no grouping).
     Compatible with InputGeneratorCis and InputGeneratorCisWithHaps (ungrouped only).
     """
-    out_rows = []
+    expected_columns = [
+        "phenotype_id", "variant_id", "pos", "start_distance", "end_distance",
+        "num_var", "beta", "se", "tstat", "r2_nominal", "pval_nominal",
+        "pval_perm", "pval_beta", "beta_shape1", "beta_shape2", "af",
+        "ma_samples", "ma_count", "dof",
+    ]
+    dtype_map = {
+        "phenotype_id": object,
+        "variant_id": object,
+        "pos": np.int32,
+        "start_distance": np.int32,
+        "end_distance": np.int32,
+        "num_var": np.int32,
+        "beta": np.float32,
+        "se": np.float32,
+        "tstat": np.float32,
+        "r2_nominal": np.float32,
+        "pval_nominal": np.float32,
+        "pval_perm": np.float32,
+        "pval_beta": np.float32,
+        "beta_shape1": np.float32,
+        "beta_shape2": np.float32,
+        "af": np.float32,
+        "ma_samples": np.int32,
+        "ma_count": np.float32,
+        "dof": np.int32,
+    }
+    buffers = _allocate_result_buffers(expected_columns, dtype_map, _estimate_rows(ig, chrom))
+    cursor = 0
     if nperm is None or nperm <= 0:
         raise ValueError("nperm must be a positive integer for map_permutations.")
 
@@ -129,29 +209,34 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
         end_distance = int(var_pos - end_pos)
         num_var = int(G_t.shape[0])
 
-        out_rows.append(pd.Series({
-            "phenotype_id": pid,
-            "variant_id": var_id,
-            "pos": var_pos,
-            "start_distance": start_distance,
-            "end_distance": end_distance,
-            "num_var": num_var,
-            "beta": beta,
-            "se": se,
-            "tstat": tval,
-            "r2_nominal": r2_nominal,
-            "pval_nominal": pval_nominal,
-            "pval_perm": pval_perm,
-            "pval_beta": pval_beta,
-            "beta_shape1": a_hat,
-            "beta_shape2": b_hat,
-            "af": float(af_t[ix].detach().cpu().numpy()),
-            "ma_samples": int(ma_samples_t[ix].detach().cpu().numpy()),
-            "ma_count": float(ma_count_t[ix].detach().cpu().numpy()),
-            "dof": dof,
-        }))
+        buffers = _ensure_capacity(buffers, cursor, 1)
+        _write_row(
+            buffers, cursor,
+            {
+                "phenotype_id": pid,
+                "variant_id": var_id,
+                "pos": var_pos,
+                "start_distance": start_distance,
+                "end_distance": end_distance,
+                "num_var": num_var,
+                "beta": beta,
+                "se": se,
+                "tstat": tval,
+                "r2_nominal": r2_nominal,
+                "pval_nominal": pval_nominal,
+                "pval_perm": pval_perm,
+                "pval_beta": pval_beta,
+                "beta_shape1": a_hat,
+                "beta_shape2": b_hat,
+                "af": float(af_t[ix].detach().cpu().numpy()),
+                "ma_samples": int(ma_samples_t[ix].detach().cpu().numpy()),
+                "ma_count": float(ma_count_t[ix].detach().cpu().numpy()),
+                "dof": dof,
+            },
+        )
+        cursor += 1
 
-    return pd.DataFrame(out_rows).reset_index(drop=True)
+    return _buffers_to_dataframe(expected_columns, buffers, cursor)
 
 
 def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
@@ -165,16 +250,46 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
     if nperm is None or nperm <= 0:
         raise ValueError("nperm must be a positive integer for map_permutations.")
 
-    out_rows = []
+    expected_columns = [
+        "group_id", "group_size", "phenotype_id", "variant_id", "pos",
+        "start_distance", "end_distance", "num_var", "beta", "se",
+        "tstat", "r2_nominal", "pval_nominal", "pval_perm", "pval_beta",
+        "beta_shape1", "beta_shape2", "af", "ma_samples", "ma_count", "dof",
+    ]
+    dtype_map = {
+        "group_id": object,
+        "group_size": np.int32,
+        "phenotype_id": object,
+        "variant_id": object,
+        "pos": np.int32,
+        "start_distance": np.int32,
+        "end_distance": np.int32,
+        "num_var": np.int32,
+        "beta": np.float32,
+        "se": np.float32,
+        "tstat": np.float32,
+        "r2_nominal": np.float32,
+        "pval_nominal": np.float32,
+        "pval_perm": np.float32,
+        "pval_beta": np.float32,
+        "beta_shape1": np.float32,
+        "beta_shape2": np.float32,
+        "af": np.float32,
+        "ma_samples": np.int32,
+        "ma_count": np.float32,
+        "dof": np.int32,
+    }
+    buffers = _allocate_result_buffers(expected_columns, dtype_map, _estimate_rows(ig, chrom, grouped=True))
+    cursor = 0
     idx_to_id = variant_df.index.to_numpy()
     pos_arr = variant_df["pos"].to_numpy(np.int64, copy=False)
     for batch in ig.generate_data(chrom=chrom):
         # Accept shapes: (P, G, v_idx, ids, group_id) or (P, G, v_idx, H, ids, group_id)
         if len(batch) == 5:
-            P, G_block, v_idx, ids, group_id = batch
+            _, G_block, v_idx, ids, group_id = batch
             H_block = None
         elif len(batch) == 6:
-            P, G_block, v_idx, H_block, ids, group_id = batch
+            _, G_block, v_idx, H_block, ids, group_id = batch
         else:
             raise ValueError("Unexpected grouped batch shape.")
 
@@ -289,31 +404,36 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
         else:
             pval_beta, a_hat, b_hat = np.nan, np.nan, np.nan
 
-        out_rows.append(pd.Series({
-            "group_id": group_id,
-            "group_size": len(ids),
-            "phenotype_id": pid,
-            "variant_id": var_id,
-            "pos": pos,
-            "start_distance": start_distance,
-            "end_distance": end_distance,
-            "num_var": num_var,
-            "beta": best["beta"],
-            "se": best["se"],
-            "tstat": best["t"],
-            "r2_nominal": best["r2"],
-            "pval_nominal": pval_nominal,
-            "pval_perm": pval_perm,
-            "pval_beta": pval_beta,
-            "beta_shape1": a_hat,
-            "beta_shape2": b_hat,
-            "af": float(af_t[best["ix_var"]].detach().cpu().numpy()),
-            "ma_samples": int(ma_samples_t[best["ix_var"]].detach().cpu().numpy()),
-            "ma_count": float(ma_count_t[best["ix_var"]].detach().cpu().numpy()),
-            "dof": dof,
-        }))
+        buffers = _ensure_capacity(buffers, cursor, 1)
+        _write_row(
+            buffers, cursor,
+            {
+                "group_id": group_id,
+                "group_size": len(ids),
+                "phenotype_id": pid,
+                "variant_id": var_id,
+                "pos": pos,
+                "start_distance": start_distance,
+                "end_distance": end_distance,
+                "num_var": num_var,
+                "beta": best["beta"],
+                "se": best["se"],
+                "tstat": best["t"],
+                "r2_nominal": best["r2"],
+                "pval_nominal": pval_nominal,
+                "pval_perm": pval_perm,
+                "pval_beta": pval_beta,
+                "beta_shape1": a_hat,
+                "beta_shape2": b_hat,
+                "af": float(af_t[best["ix_var"]].detach().cpu().numpy()),
+                "ma_samples": int(ma_samples_t[best["ix_var"]].detach().cpu().numpy()),
+                "ma_count": float(ma_count_t[best["ix_var"]].detach().cpu().numpy()),
+                "dof": dof,
+            },
+        )
+        cursor += 1
 
-    return pd.DataFrame(out_rows).reset_index(drop=True)
+    return _buffers_to_dataframe(expected_columns, buffers, cursor)
 
 
 def map_permutations(

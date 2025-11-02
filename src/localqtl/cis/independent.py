@@ -20,6 +20,46 @@ __all__ = [
     "map_independent",
 ]
 
+
+def _allocate_result_buffers(
+        columns: list[str], dtype_map: dict[str, type | np.dtype], target_rows: int) -> dict[str, np.ndarray]:
+    target = max(int(target_rows), 1)
+    buffers: dict[str, np.ndarray] = {}
+    for name in columns:
+        dtype = dtype_map.get(name, np.float32)
+        buffers[name] = np.empty(target, dtype=dtype)
+    return buffers
+
+
+def _ensure_capacity(buffers: dict[str, np.ndarray], cursor: int, additional: int) -> dict[str, np.ndarray]:
+    required = cursor + int(additional)
+    current = next(iter(buffers.values())).shape[0] if buffers else 0
+    if required <= current:
+        return buffers
+    new_size = max(required, current * 2 if current else 1)
+    for key, arr in buffers.items():
+        new_arr = np.empty(new_size, dtype=arr.dtype)
+        new_arr[:cursor] = arr[:cursor]
+        buffers[key] = new_arr
+    return buffers
+
+
+def _write_row(buffers: dict[str, np.ndarray], idx: int, row: dict[str, object]) -> None:
+    for key, arr in buffers.items():
+        value = row.get(key)
+        if arr.dtype == object:
+            arr[idx] = None if value is None else value
+        elif np.issubdtype(arr.dtype, np.integer):
+            arr[idx] = int(value) if value is not None else 0
+        else:
+            arr[idx] = np.nan if value is None else float(value)
+
+
+def _buffers_to_dataframe(columns: list[str], buffers: dict[str, np.ndarray], n_rows: int) -> pd.DataFrame:
+    n = int(n_rows)
+    data = {col: buffers[col][:n] for col in columns if col in buffers}
+    return pd.DataFrame(data, columns=columns)
+
 def _run_independent_core(
         ig, variant_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame],
         signif_seed_df: pd.DataFrame, signif_threshold: float, nperm: int,
@@ -28,17 +68,43 @@ def _run_independent_core(
         chrom: str | None = None
 ) -> pd.DataFrame:
     """Forward–backward independent mapping for ungrouped phenotypes."""
-    out_rows = []
+    expected_columns = [
+        "phenotype_id", "variant_id", "pos", "start_distance", "end_distance",
+        "num_var", "beta", "se", "tstat", "r2_nominal", "pval_nominal",
+        "pval_perm", "pval_beta", "beta_shape1", "beta_shape2", "af",
+        "ma_samples", "ma_count", "dof", "rank",
+    ]
+    dtype_map = {
+        "phenotype_id": object,
+        "variant_id": object,
+        "pos": np.int32,
+        "start_distance": np.int32,
+        "end_distance": np.int32,
+        "num_var": np.int32,
+        "beta": np.float32,
+        "se": np.float32,
+        "tstat": np.float32,
+        "r2_nominal": np.float32,
+        "pval_nominal": np.float32,
+        "pval_perm": np.float32,
+        "pval_beta": np.float32,
+        "beta_shape1": np.float32,
+        "beta_shape2": np.float32,
+        "af": np.float32,
+        "ma_samples": np.int32,
+        "ma_count": np.float32,
+        "dof": np.int32,
+        "rank": np.int32,
+    }
+    buffers = _allocate_result_buffers(expected_columns, dtype_map, signif_seed_df.shape[0])
+    cursor = 0
 
-    # Variant metadata
     idx_to_id = variant_df.index.to_numpy()
-    pos_arr   = variant_df["pos"].to_numpy(np.int32)
+    pos_arr = variant_df["pos"].to_numpy(np.int32)
 
-    # Basic alignment checks
     if covariates_df is not None and not covariates_df.index.equals(ig.phenotype_df.columns):
         covariates_df = covariates_df.loc[ig.phenotype_df.columns]
 
-    # Precompute variant index lookup for dosages
     var_in_frame = set(variant_df.index)
 
     for batch in ig.generate_data(chrom=chrom):
@@ -91,7 +157,9 @@ def _run_independent_core(
         perms = torch.stack([torch.randperm(n, device=device, generator=gen) for _ in range(nperm)], dim=0)  # (nperm, n)
 
         # Forward pass
-        forward_rows = [seed_row.to_frame().T]  # initialize with seed from cis_df
+        forward_records: list[dict[str, object]] = []
+        seed_record = {col: seed_row.get(col) for col in expected_columns if col != "rank"}
+        forward_records.append(seed_record)
         dosage_dict: dict[str, np.ndarray] = {}
         seed_vid = str(seed_row["variant_id"])
         if seed_vid in var_in_frame and seed_vid in ig.genotype_df.index:
@@ -164,8 +232,7 @@ def _run_independent_core(
             start_distance = int(var_pos - start_pos)
             end_distance = int(var_pos - end_pos)
             num_var = int(G_resid.shape[0])
-
-            row = pd.Series({
+            forward_records.append({
                 "phenotype_id": pid,
                 "variant_id": var_id,
                 "pos": var_pos,
@@ -186,7 +253,6 @@ def _run_independent_core(
                 "ma_count": float(ma_count_t[ix].detach().cpu().numpy()),
                 "dof": int(dof),
             })
-            forward_rows.append(row.to_frame().T)
 
             # add dosage covariate for next round
             if var_id in var_in_frame and var_id in ig.genotype_df.index and var_id not in dosage_dict:
@@ -197,13 +263,15 @@ def _run_independent_core(
                     missing=missing,
                 )
 
-        forward_df = pd.concat(forward_rows, axis=0, ignore_index=True)
-        forward_df["rank"] = np.arange(1, forward_df.shape[0] + 1, dtype=int)
+        if not forward_records:
+            continue
+        for rk, rec in enumerate(forward_records, start=1):
+            rec["rank"] = rk
 
         # Backward pass
-        if forward_df.shape[0] > 1:
-            kept_rows = []
-            selected = forward_df["variant_id"].tolist()
+        if len(forward_records) > 1:
+            kept_records: list[dict[str, object]] = []
+            selected = [rec["variant_id"] for rec in forward_records]
             for rk, drop_vid in enumerate(selected, start=1):
                 kept = [v for v in selected if v != drop_vid]
                 if covariates_df is not None:
@@ -257,7 +325,7 @@ def _run_independent_core(
                     var_pos = int(pos_arr[v_idx[ix]])
                     start_pos = ig.phenotype_start[pid]
                     end_pos = ig.phenotype_end[pid]
-                    row = pd.Series({
+                    kept_records.append({
                         "phenotype_id": pid,
                         "variant_id": var_id,
                         "pos": var_pos,
@@ -279,20 +347,20 @@ def _run_independent_core(
                         "dof": int(dof),
                         "rank": int(rk),
                     })
-                    kept_rows.append(row.to_frame().T)
 
-            if kept_rows:
-                out_rows.append(pd.concat(kept_rows, axis=0, ignore_index=True))
+            if not kept_records:
+                continue
+            records_to_write = kept_records
         else:
-            out_rows.append(forward_df)
+            records_to_write = forward_records
 
-    if not out_rows:
-        return pd.DataFrame(columns=[
-            "phenotype_id","variant_id","pos","start_distance","end_distance","num_var",
-            "beta","se","tstat","r2_nominal","pval_nominal","pval_perm","pval_beta",
-            "beta_shape1","beta_shape2","af","ma_samples","ma_count","dof","rank"
-        ])
-    return pd.concat(out_rows, axis=0, ignore_index=True)
+        for rec in records_to_write:
+            buffers = _ensure_capacity(buffers, cursor, 1)
+            _write_row(buffers, cursor, rec)
+            cursor += 1
+
+    return _buffers_to_dataframe(expected_columns, buffers, cursor)
+
 
 
 def _run_independent_core_group( ## TODO: Needs updating
@@ -303,7 +371,36 @@ def _run_independent_core_group( ## TODO: Needs updating
         chrom: str | None = None
 ) -> pd.DataFrame:
     """Forward–backward independent mapping for grouped phenotypes."""
-    out_rows = []
+    expected_columns = [
+        "group_id", "group_size", "phenotype_id", "variant_id", "pos",
+        "start_distance", "end_distance", "num_var", "beta", "se", "tstat",
+        "r2_nominal", "pval_nominal", "pval_perm", "pval_beta", "beta_shape1",
+        "beta_shape2", "dof", "rank",
+    ]
+    dtype_map = {
+        "group_id": object,
+        "group_size": np.int32,
+        "phenotype_id": object,
+        "variant_id": object,
+        "pos": np.int32,
+        "start_distance": np.int32,
+        "end_distance": np.int32,
+        "num_var": np.int32,
+        "beta": np.float32,
+        "se": np.float32,
+        "tstat": np.float32,
+        "r2_nominal": np.float32,
+        "pval_nominal": np.float32,
+        "pval_perm": np.float32,
+        "pval_beta": np.float32,
+        "beta_shape1": np.float32,
+        "beta_shape2": np.float32,
+        "dof": np.int32,
+        "rank": np.int32,
+    }
+    buffers = _allocate_result_buffers(expected_columns, dtype_map, seed_by_group_df.shape[0])
+    cursor = 0
+
     var_in_frame = set(variant_df.index)
     geno_has_variant = set(ig.genotype_df.index)
     idx_to_id = variant_df.index.to_numpy()
@@ -314,14 +411,13 @@ def _run_independent_core_group( ## TODO: Needs updating
 
     for batch in ig.generate_data(chrom=chrom):
         if len(batch) == 5:
-            P, G_block, v_idx, ids, group_id = batch
+            _, G_block, v_idx, ids, group_id = batch
             H_block = None
         elif len(batch) == 6:
-            P, G_block, v_idx, H_block, ids, group_id = batch
+            _, G_block, v_idx, H_block, ids, group_id = batch
         else:
             raise ValueError("Unexpected grouped batch shape in _run_independent_core_group.")
 
-        # find seed for this group
         seed_rows = seed_by_group_df[seed_by_group_df["group_id"] == group_id]
         if seed_rows.empty:
             continue
@@ -331,7 +427,6 @@ def _run_independent_core_group( ## TODO: Needs updating
         G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
         H_t = None if H_block is None else torch.tensor(H_block, dtype=torch.float32, device=device)
 
-        # Impute/MAF filter once per window
         G_t, keep_mask, _ = impute_mean_and_filter(G_t)
         if keep_mask.sum().item() == 0:
             continue
@@ -362,10 +457,13 @@ def _run_independent_core_group( ## TODO: Needs updating
                 sample_order=ig.phenotype_df.columns,
                 missing=missing,
             )
-        forward_rows = [seed_row.to_frame().T]
+        forward_records: list[dict[str, object]] = []
+        base_record = {col: seed_row.get(col) for col in expected_columns if col not in ("rank", "group_size")}
+        base_record["group_size"] = len(ids)
+        base_record["group_id"] = group_id
+        forward_records.append(base_record)
 
         while True:
-            # augmented covariates for this forward step
             if covariates_df is not None:
                 C_base = covariates_df.values.astype(np.float32, copy=False)
                 C_sel = (np.column_stack([dosage_dict[v] for v in dosage_dict])
@@ -376,11 +474,9 @@ def _run_independent_core_group( ## TODO: Needs updating
                          else np.zeros((n, 0), np.float32)).astype(np.float32, copy=False)
             rez_aug = Residualizer(torch.tensor(C_aug, dtype=torch.float32, device=device)) if C_aug.shape[1] > 0 else None
 
-            # Evaluate all phenotypes in this group; keep the global best
             best = dict(r2=-np.inf, ix_var=-1, ix_pheno=-1, beta=None, se=None, t=None, dof=None)
             r2_perm_list = []
 
-            # For speed, pre-flatten H if present
             mats = [G_t]
             H_shape = None
             if H_t is not None:
@@ -426,7 +522,6 @@ def _run_independent_core_group( ## TODO: Needs updating
                     )
                 r2_perm_list.append(r2_perm)
 
-            # combine permutations across phenotypes (elementwise max)
             r2_perm_max = torch.stack(r2_perm_list, dim=0).max(dim=0).values.detach().cpu().numpy()
             pval_perm = float((np.sum(r2_perm_max >= best["r2"]) + 1) / (r2_perm_max.size + 1))
             pval_beta, a_hat, b_hat = (beta_approx_pval(r2_perm_max, best["r2"]) if beta_approx
@@ -443,7 +538,7 @@ def _run_independent_core_group( ## TODO: Needs updating
             start_pos = ig.phenotype_start[pid_best]
             end_pos = ig.phenotype_end[pid_best]
 
-            row = pd.Series({
+            forward_records.append({
                 "group_id": group_id,
                 "group_size": len(ids),
                 "phenotype_id": pid_best,
@@ -463,7 +558,6 @@ def _run_independent_core_group( ## TODO: Needs updating
                 "beta_shape2": float(b_hat),
                 "dof": int(best["dof"]),
             })
-            forward_rows.append(row.to_frame().T)
 
             if var_id not in dosage_dict and var_id in var_in_frame and var_id in geno_has_variant:
                 dosage_dict[var_id] = dosage_vector_for_covariate(
@@ -473,13 +567,14 @@ def _run_independent_core_group( ## TODO: Needs updating
                     missing=missing,
                 )
 
-        forward_df = pd.concat(forward_rows, axis=0, ignore_index=True)
-        forward_df["rank"] = np.arange(1, forward_df.shape[0] + 1, dtype=int)
+        if not forward_records:
+            continue
+        for rk, rec in enumerate(forward_records, start=1):
+            rec["rank"] = rk
 
-        # Backward pass (group)
-        if forward_df.shape[0] > 1:
-            kept_rows = []
-            selected = forward_df["variant_id"].tolist()
+        if len(forward_records) > 1:
+            kept_records: list[dict[str, object]] = []
+            selected = [rec["variant_id"] for rec in forward_records]
 
             for rk, drop_vid in enumerate(selected, start=1):
                 kept = [v for v in selected if v != drop_vid]
@@ -555,7 +650,7 @@ def _run_independent_core_group( ## TODO: Needs updating
                     start_pos = ig.phenotype_start[pid_best]
                     end_pos = ig.phenotype_end[pid_best]
 
-                    row = pd.Series({
+                    kept_records.append({
                         "group_id": group_id,
                         "group_size": len(ids),
                         "phenotype_id": pid_best,
@@ -576,22 +671,19 @@ def _run_independent_core_group( ## TODO: Needs updating
                         "dof": int(best["dof"]),
                         "rank": int(rk),
                     })
-                    out_rows.append(row.to_frame().T)
 
-        if not forward_rows:
-            continue
-        if forward_df.shape[0] == 1:
-            out_rows.append(forward_df)
+            if not kept_records:
+                continue
+            records_to_write = kept_records
+        else:
+            records_to_write = forward_records
 
-    if not out_rows:
-        return pd.DataFrame(columns=[
-            "group_id","group_size","phenotype_id","variant_id","pos","start_distance","end_distance",
-            "num_var","beta","se","tstat","r2_nominal","pval_nominal","pval_perm","pval_beta",
-            "beta_shape1","beta_shape2","dof","rank"
-        ])
-    return pd.concat(out_rows, axis=0, ignore_index=True)
+        for rec in records_to_write:
+            buffers = _ensure_capacity(buffers, cursor, 1)
+            _write_row(buffers, cursor, rec)
+            cursor += 1
 
-
+    return _buffers_to_dataframe(expected_columns, buffers, cursor)
 def map_independent(
         genotype_df: pd.DataFrame, variant_df: pd.DataFrame, cis_df: pd.DataFrame,
         phenotype_df: pd.DataFrame, phenotype_pos_df: pd.DataFrame,
