@@ -119,6 +119,12 @@ autodoc cross-references:
        device="auto",
    )
 
+``map_nominal``, ``map_permutations``, and ``map_independent`` accept a
+``preload_haplotypes`` flag that defaults to ``True``. When ancestry dosages
+are provided, enabling the flag stages haplotypes as contiguous tensors on the
+target device (GPU or CPU). Disable it if the additional memory pressure is a
+concern.
+
 CisMapper orchestration
 ~~~~~~~~~~~~~~~~~~~~~~~
 

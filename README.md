@@ -180,6 +180,7 @@ print(lead_df.head())
 * `H` (from `RFMixReader.load_haplotypes()`) is ancestry dosages with shape `(variants, samples, ancestries)` for ≥3 ancestries; for 2 ancestries the reader exposes the configured channel.
 * `loci_df` rows correspond 1:1 to `H`'s and be joinable (by `chrom`/`pos`) to `variant_df` used for genotypes.
 * Sample order in `genotype_df`, `phenotype_df`, and `covariates_df` should match `rfmix.sample_ids` (reindex as shown).
+* The cis-mapping helpers default to ``preload_haplotypes=True`` so ancestry blocks are staged as contiguous tensors on the requested device (GPU or CPU). Override this flag when working under strict memory constraints.
 
 ## Testing
 

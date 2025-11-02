@@ -125,7 +125,17 @@ def _run_independent_core(
         # Tensors for the window
         y_t = torch.tensor(p, dtype=torch.float32, device=device)
         G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
-        H_t = (None if H_block is None else torch.tensor(H_block, dtype=torch.float32, device=device))
+        if H_block is None:
+            H_t = None
+        elif isinstance(H_block, torch.Tensor):
+            if H_block.device.type != device:
+                H_t = H_block.to(device=device, dtype=torch.float32)
+            elif H_block.dtype != torch.float32:
+                H_t = H_block.to(dtype=torch.float32)
+            else:
+                H_t = H_block
+        else:
+            H_t = torch.tensor(H_block, dtype=torch.float32, device=device)
 
         # Impute & filter (and optional MAF)
         G_t, keep_mask, _ = impute_mean_and_filter(G_t)
@@ -425,7 +435,17 @@ def _run_independent_core_group( ## TODO: Needs updating
         seed_vid = str(seed_row["variant_id"])
 
         G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
-        H_t = None if H_block is None else torch.tensor(H_block, dtype=torch.float32, device=device)
+        if H_block is None:
+            H_t = None
+        elif isinstance(H_block, torch.Tensor):
+            if H_block.device.type != device:
+                H_t = H_block.to(device=device, dtype=torch.float32)
+            elif H_block.dtype != torch.float32:
+                H_t = H_block.to(dtype=torch.float32)
+            else:
+                H_t = H_block
+        else:
+            H_t = torch.tensor(H_block, dtype=torch.float32, device=device)
 
         G_t, keep_mask, _ = impute_mean_and_filter(G_t)
         if keep_mask.sum().item() == 0:
@@ -694,10 +714,19 @@ def map_independent(
         window: int = 1_000_000, missing: float = -9.0, random_tiebreak: bool = False,
         device: str = "auto", beta_approx: bool = True, seed: int | None = None,
         logger: SimpleLogger | None = None, verbose: bool = True,
+        preload_haplotypes: bool = True,
 ) -> pd.DataFrame:
-    """Entry point: build IG; derive seed/threshold from cis_df; dispatch to grouped/ungrouped core."""
+    """Entry point: build IG; derive seed/threshold from cis_df; dispatch to grouped/ungrouped core.
+
+    Parameters
+    ----------
+    preload_haplotypes : bool, default True
+        When haplotypes are provided, pre-load them into a contiguous torch.Tensor
+        on the requested device to avoid per-batch host<->device transfers.
+    """
     device = ("cuda" if (device in ("auto", None) and torch.cuda.is_available())
               else (device if device in ("cuda", "cpu") else "cpu"))
+    torch_device = torch.device(device)
     logger = logger or SimpleLogger(verbose=verbose, timestamps=True)
     sync = (torch.cuda.synchronize if device == "cuda" else None)
 
@@ -729,14 +758,20 @@ def map_independent(
         logger.write(f"  * {covariates_df.shape[1]} covariates")
     if haplotypes is not None:
         K = int(haplotypes.shape[2])
-        logger.write(f"  * including local ancestry channels (K={K})")
+        preload_flag = preload_haplotypes and haplotypes is not None
+        logger.write(
+            f"  * including local ancestry channels (K={K}, preload={'on' if preload_flag else 'off'})"
+        )
 
     # Build the appropriate input generator (no residualization up front)
     ig = (
         InputGeneratorCisWithHaps(
             genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
             phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes,
-            loci_df=loci_df, group_s=group_s)
+            loci_df=loci_df, group_s=group_s,
+            preload_to_torch=(preload_haplotypes and haplotypes is not None),
+            torch_device=torch_device,
+        )
         if haplotypes is not None else
         InputGeneratorCis(
             genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,

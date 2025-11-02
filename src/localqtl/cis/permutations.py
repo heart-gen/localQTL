@@ -127,7 +127,17 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
         # Tensors
         y_t = torch.tensor(p, dtype=torch.float32, device=device)
         G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
-        H_t = torch.tensor(H_block, dtype=torch.float32, device=device) if H_block is not None else None
+        if H_block is None:
+            H_t = None
+        elif isinstance(H_block, torch.Tensor):
+            if H_block.device.type != device:
+                H_t = H_block.to(device=device, dtype=torch.float32)
+            elif H_block.dtype != torch.float32:
+                H_t = H_block.to(dtype=torch.float32)
+            else:
+                H_t = H_block
+        else:
+            H_t = torch.tensor(H_block, dtype=torch.float32, device=device)
 
         # Impute and drop monomorphic
         G_t, keep_mask, _ = impute_mean_and_filter(G_t)
@@ -295,7 +305,17 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
 
         # Tensors for window
         G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
-        H_t = torch.tensor(H_block, dtype=torch.float32, device=device) if H_block is not None else None
+        if H_block is None:
+            H_t = None
+        elif isinstance(H_block, torch.Tensor):
+            if H_block.device.type != device:
+                H_t = H_block.to(device=device, dtype=torch.float32)
+            elif H_block.dtype != torch.float32:
+                H_t = H_block.to(dtype=torch.float32)
+            else:
+                H_t = H_block
+        else:
+            H_t = torch.tensor(H_block, dtype=torch.float32, device=device)
 
         # Impute + drop monomorphic
         G_t, keep_mask, _ = impute_mean_and_filter(G_t)
@@ -443,13 +463,21 @@ def map_permutations(
         group_s: Optional[pd.Series] = None, maf_threshold: float = 0.0,
         window: int = 1_000_000, nperm: int = 10_000, device: str = "cuda",
         beta_approx: bool = True, seed: int | None = None,
-        logger: SimpleLogger | None = None, verbose: bool = True
+        logger: SimpleLogger | None = None, verbose: bool = True,
+        preload_haplotypes: bool = True,
 ) -> pd.DataFrame:
     """
     Empirical cis-QTL mapping (one top variant per phenotype) with permutations.
     Returns a DataFrame with empirical p-values (and optional Beta approximation).
+
+    Parameters
+    ----------
+    preload_haplotypes : bool, default True
+        When haplotypes are provided, pre-load them into a contiguous torch.Tensor
+        on the requested device to avoid per-batch host<->device transfers.
     """
     device = device if device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
+    torch_device = torch.device(device)
     logger = logger or SimpleLogger(verbose=verbose, timestamps=True)
     sync = (torch.cuda.synchronize if device == "cuda" else None)
 
@@ -468,14 +496,20 @@ def map_permutations(
         logger.write(f"  * {covariates_df.shape[1]} covariates")
     if haplotypes is not None:
         K = int(haplotypes.shape[2])
-        logger.write(f"  * including local ancestry channels (K={K})")
+        preload_flag = preload_haplotypes and haplotypes is not None
+        logger.write(
+            f"  * including local ancestry channels (K={K}, preload={'on' if preload_flag else 'off'})"
+        )
 
     # Build the appropriate input generator
     ig = (
         InputGeneratorCisWithHaps(
             genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
             phenotype_pos_df=phenotype_pos_df, window=window, haplotypes=haplotypes,
-            loci_df=loci_df, group_s=group_s) if haplotypes is not None else
+            loci_df=loci_df, group_s=group_s,
+            preload_to_torch=(preload_haplotypes and haplotypes is not None),
+            torch_device=torch_device,
+        ) if haplotypes is not None else
         InputGeneratorCis(
             genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
             phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s)
