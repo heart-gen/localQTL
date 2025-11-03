@@ -7,8 +7,6 @@ try:
 except Exception:
     pass
 
-_EPS = 1e-8
-
 __all__ = [
     "Residualizer",
     "run_batch_regression",
