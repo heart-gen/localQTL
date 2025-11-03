@@ -18,7 +18,7 @@ from ..regression_kernels import (
     Residualizer,
     run_batch_regression_with_permutations
 )
-from .common import residualize_batch, dosage_vector_for_covariate
+from .common import align_like_casefold, residualize_batch, dosage_vector_for_covariate
 
 __all__ = [
     "map_independent",
@@ -190,8 +190,13 @@ def _run_independent_core(
     # Basic alignment checks
     covariates_base_t: torch.Tensor | None = None
     if covariates_df is not None:
-        if not covariates_df.index.equals(ig.phenotype_df.columns):
-            covariates_df = covariates_df.loc[ig.phenotype_df.columns]
+        covariates_df = align_like_casefold(
+            covariates_df,
+            ig.phenotype_df.columns,
+            axis="index",
+            what="sample IDs in covariates_df.index",
+            strict=True,
+        )
         covariates_base_t = _to_device_float32(
             covariates_df.to_numpy(np.float32, copy=False), device)
 
@@ -526,8 +531,13 @@ def _run_independent_core_group(
 
     covariates_base_t: torch.Tensor | None = None
     if covariates_df is not None:
-        if not covariates_df.index.equals(ig.phenotype_df.columns):
-            covariates_df = covariates_df.loc[ig.phenotype_df.columns]
+        covariates_df = align_like_casefold(
+            covariates_df,
+            ig.phenotype_df.columns,
+            axis="index",
+            what="sample IDs in covariates_df.index",
+            strict=True,
+        )
         covariates_base_t = _to_device_float32(
             covariates_df.to_numpy(np.float32, copy=False), device)
 
