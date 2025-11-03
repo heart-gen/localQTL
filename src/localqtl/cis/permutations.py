@@ -71,9 +71,19 @@ def _estimate_rows(ig, chrom: str | None, grouped: bool = False) -> int:
         return int(pd.Index(group_s[mask].dropna().unique()).shape[0])
     return int(mask.sum())
 
-def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
-                          beta_approx: bool = True, maf_threshold: float = 0.0,
-                          seed: int | None = None, chrom: str | None = None) -> pd.DataFrame:
+def _run_permutation_core(
+        ig,
+        variant_df,
+        rez,
+        nperm: int,
+        device: str,
+        beta_approx: bool = True,
+        maf_threshold: float = 0.0,
+        seed: int | None = None,
+        chrom: str | None = None,
+        logger: SimpleLogger | None = None,
+        total_phenotypes: int | None = None,
+) -> pd.DataFrame:
     """
     One top association per phenotype with empirical permutation p-value (no grouping).
     Compatible with InputGeneratorCis and InputGeneratorCisWithHaps (ungrouped only).
@@ -107,11 +117,19 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
     }
     buffers = _allocate_result_buffers(expected_columns, dtype_map, _estimate_rows(ig, chrom))
     cursor = 0
+    processed = 0
     if nperm is None or nperm <= 0:
         raise ValueError("nperm must be a positive integer for map_permutations.")
 
     idx_to_id = variant_df.index.to_numpy()
     pos_arr = variant_df["pos"].to_numpy(np.int64, copy=False)
+
+    if total_phenotypes is None:
+        total_phenotypes = _estimate_rows(ig, chrom)
+    if logger is None:
+        logger = SimpleLogger(verbose=True, timestamps=True)
+    progress_interval = max(1, total_phenotypes // 10) if total_phenotypes else 0
+    chrom_label = f"{chrom}" if chrom is not None else "all chromosomes"
 
     for batch in ig.generate_data(chrom=chrom):
         # Accept shapes: (p, G, v_idx, pid) or (p, G, v_idx, H, pid)
@@ -245,13 +263,33 @@ def _run_permutation_core(ig, variant_df, rez, nperm: int, device: str,
             },
         )
         cursor += 1
+        processed += 1
+        if (
+                logger.verbose
+                and total_phenotypes
+                and progress_interval
+                and (processed % progress_interval == 0 or processed == total_phenotypes)
+        ):
+            logger.write(
+                f"      processed {processed}/{total_phenotypes} phenotypes on {chrom_label}"
+            )
 
     return _buffers_to_dataframe(expected_columns, buffers, cursor)
 
 
-def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
-                                beta_approx: bool = True, maf_threshold: float = 0.0,
-                                seed: int | None = None, chrom: str | None = None) -> pd.DataFrame:
+def _run_permutation_core_group(
+        ig,
+        variant_df,
+        rez,
+        nperm: int,
+        device: str,
+        beta_approx: bool = True,
+        maf_threshold: float = 0.0,
+        seed: int | None = None,
+        chrom: str | None = None,
+        logger: SimpleLogger | None = None,
+        total_groups: int | None = None,
+) -> pd.DataFrame:
     """
     Group-aware permutation mapping: returns one top association per *group* (best phenotype within group),
     with empirical p-values computed by taking the max R² across variants and phenotypes for each permutation.
@@ -291,6 +329,13 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
     }
     buffers = _allocate_result_buffers(expected_columns, dtype_map, _estimate_rows(ig, chrom, grouped=True))
     cursor = 0
+    processed = 0
+    if total_groups is None:
+        total_groups = _estimate_rows(ig, chrom, grouped=True)
+    if logger is None:
+        logger = SimpleLogger(verbose=True, timestamps=True)
+    progress_interval = max(1, total_groups // 10) if total_groups else 0
+    chrom_label = f"{chrom}" if chrom is not None else "all chromosomes"
     idx_to_id = variant_df.index.to_numpy()
     pos_arr = variant_df["pos"].to_numpy(np.int64, copy=False)
     for batch in ig.generate_data(chrom=chrom):
@@ -452,6 +497,16 @@ def _run_permutation_core_group(ig, variant_df, rez, nperm: int, device: str,
             },
         )
         cursor += 1
+        processed += 1
+        if (
+                logger.verbose
+                and total_groups
+                and progress_interval
+                and (processed % progress_interval == 0 or processed == total_groups)
+        ):
+            logger.write(
+                f"      processed {processed}/{total_groups} groups on {chrom_label}"
+            )
 
     return _buffers_to_dataframe(expected_columns, buffers, cursor)
 
@@ -529,7 +584,8 @@ def map_permutations(
     if logger.verbose:
         logger.write(f"    Mapping all chromosomes ({total_phenotypes} phenotypes)")
 
-    core = _run_permutation_core_group if getattr(ig, "group_s", None) is not None else _run_permutation_core
+    group_mode = getattr(ig, "group_s", None) is not None
+    core = _run_permutation_core_group if group_mode else _run_permutation_core
 
     overall_start = time.time()
     results: list[pd.DataFrame] = []
@@ -540,11 +596,21 @@ def map_permutations(
                 logger.write(f"    Mapping chromosome {chrom} ({chrom_total} phenotypes)")
             chrom_start = time.time()
             with logger.time_block(f"{chrom}: map_permutations", sync=sync):
-                chrom_df = core(
-                    ig, variant_df, rez, nperm=nperm, device=device,
-                    beta_approx=beta_approx, maf_threshold=maf_threshold,
-                    seed=seed, chrom=chrom,
-                )
+                total_units = _estimate_rows(ig, chrom, grouped=group_mode)
+                if group_mode:
+                    chrom_df = core(
+                        ig, variant_df, rez, nperm=nperm, device=device,
+                        beta_approx=beta_approx, maf_threshold=maf_threshold,
+                        seed=seed, chrom=chrom,
+                        logger=logger, total_groups=total_units,
+                    )
+                else:
+                    chrom_df = core(
+                        ig, variant_df, rez, nperm=nperm, device=device,
+                        beta_approx=beta_approx, maf_threshold=maf_threshold,
+                        seed=seed, chrom=chrom,
+                        logger=logger, total_phenotypes=total_units,
+                    )
             results.append(chrom_df)
             if logger.verbose:
                 elapsed = time.time() - chrom_start
