@@ -1,4 +1,5 @@
 import torch
+from ._torch_utils import move_to_device, resolve_device
 
 try:
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -6,7 +7,7 @@ try:
 except Exception:
     pass
 
-from ._torch_utils import move_to_device, resolve_device
+_EPS = 1e-8
 
 __all__ = [
     "Residualizer",
@@ -167,17 +168,10 @@ def run_batch_regression(y, G, H=None, k_eff: int = 0, device="cuda"):
     return betas, ses, tstats
 
 
-_EPS = 1e-8
-
-
 @torch.no_grad()
 def run_batch_regression_with_permutations(
-    y: torch.Tensor,              # (n,)
-    G: torch.Tensor,              # (m, n), residualized
-    H: torch.Tensor | None = None,  # ignored here (already residualized externally)
-    y_perm: torch.Tensor | None = None,  # (n, chunk) chunk of permutations (optional)
-    k_eff: int = 0,
-    device: str = "cuda",
+        y: torch.Tensor, G: torch.Tensor, H: torch.Tensor | None = None,
+        y_perm: torch.Tensor | None = None, k_eff: int = 0, device: str = "cuda",
 ):
     """
     Return nominal betas/ses/tstats for G~y, and per-permutation max r^2 across variants.
@@ -185,8 +179,8 @@ def run_batch_regression_with_permutations(
     """
     device = resolve_device(device)
 
-    y = y.to(device)
-    G = G.to(device)
+    y = move_to_device(y, device)
+    G = move_to_device(G, device)
     if y_perm is not None:
         y_perm = y_perm.to(device)
 
@@ -194,13 +188,14 @@ def run_batch_regression_with_permutations(
     m = G.shape[0]
     dof = max(n - 1 - int(k_eff), 1)
 
-    # ----- nominal (vectorized) -----
+    # Nominal (vectorized)
     # Norms and inner products (all on GPU)
     Gnorm2 = (G * G).sum(dim=1) + _EPS          # (m,)
     ynorm2 = (y * y).sum() + _EPS               # scalar
     Gy     = G @ y                               # (m,)
 
     r      = Gy / torch.sqrt(Gnorm2 * ynorm2)    # (m,)
+
     # t-stat for single predictor: t = r * sqrt(dof / (1 - r^2))
     one_minus_r2 = 1.0 - r * r
     t      = r * torch.sqrt(dof / torch.clamp(one_minus_r2, min=_EPS))
@@ -211,22 +206,19 @@ def run_batch_regression_with_permutations(
     ses    = se.unsqueeze(1)                     # (m,1)
     tstats = t.unsqueeze(1)                      # (m,1)
 
-    # ----- permutations (chunked) -----
+    # Permutations (chunked)
     r2_perm = None
     if y_perm is not None:
-        # y_perm: (n, chunk)
-        Ypnorm2 = (y_perm * y_perm).sum(dim=0) + _EPS             # (chunk,)
-        # GYp: (m, chunk). Use autocast to reduce memory if available.
+        Ypnorm2 = (y_perm * y_perm).sum(dim=0) + _EPS
         use_autocast = (
-            G.is_cuda
-            and y_perm.is_cuda
+            G.is_cuda and y_perm.is_cuda
             and hasattr(torch.cuda, "amp")
             and hasattr(torch.cuda.amp, "autocast")
         )
         if use_autocast:
             try:
                 with torch.cuda.amp.autocast(dtype=torch.float16):
-                    GYp = G @ y_perm                                  # (m, chunk)
+                    GYp = G @ y_perm
             except Exception:
                 GYp = G @ y_perm
         else:
@@ -234,9 +226,8 @@ def run_batch_regression_with_permutations(
 
         GYp = GYp.float()
 
-        # r^2 for each (variant, perm): (GYp^2)/(||G||^2 * ||y_perm||^2)
-        denom = torch.sqrt(Gnorm2).unsqueeze(1) * torch.sqrt(Ypnorm2).unsqueeze(0)  # (m, chunk)
-        R2 = (GYp / torch.clamp(denom, min=_EPS)) ** 2                               # (m, chunk)
-        r2_perm = torch.nanmax(R2, dim=0).values.float()                             # (chunk,)
+        denom = torch.sqrt(Gnorm2).unsqueeze(1) * torch.sqrt(Ypnorm2).unsqueeze(0)
+        R2 = (GYp / torch.clamp(denom, min=_EPS)) ** 2
+        r2_perm = torch.nanmax(R2, dim=0).values.float()
 
     return betas, ses, tstats, r2_perm
