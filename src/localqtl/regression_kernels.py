@@ -1,5 +1,11 @@
 import torch
 
+try:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
 from ._torch_utils import move_to_device, resolve_device
 
 __all__ = [
@@ -161,98 +167,76 @@ def run_batch_regression(y, G, H=None, k_eff: int = 0, device="cuda"):
     return betas, ses, tstats
 
 
-def run_batch_regression_with_permutations(y, G, H=None, y_perm=None, k_eff: int = 0, device="cuda"):
+_EPS = 1e-8
+
+
+@torch.no_grad()
+def run_batch_regression_with_permutations(
+    y: torch.Tensor,              # (n,)
+    G: torch.Tensor,              # (m, n), residualized
+    H: torch.Tensor | None = None,  # ignored here (already residualized externally)
+    y_perm: torch.Tensor | None = None,  # (n, chunk) chunk of permutations (optional)
+    k_eff: int = 0,
+    device: str = "cuda",
+):
     """
-    Batched OLS regression for one phenotype across all variants in a cis-window,
-    with optional haplotype ancestry and phenotype permutations.
-
-    Parameters
-    ----------
-    y : torch.Tensor
-        (n,) phenotype vector (samples)
-    G : torch.Tensor
-        (m × n) genotype matrix (variants × samples)
-    H : torch.Tensor, optional
-        (m × n × (k-1)) haplotype ancestry matrix (variants × samples × ancestries-1)
-    y_perm : torch.Tensor, optional
-        (n × nperm) permuted phenotype matrix
-    k_eff : int, optional
-        Number of covariate columns projected out beforehand (effective dof reduction).
-    device : str
-        "cuda" or "cpu"
-
-    Returns
-    -------
-    betas : torch.Tensor
-        (m × p) regression coefficients (for true phenotype)
-    ses : torch.Tensor
-        (m × p) standard errors (for true phenotype)
-    tstats : torch.Tensor
-        (m × p) t-statistics (for true phenotype)
-    r2_perm : torch.Tensor, optional
-        (nperm,) max R² across variants for each permutation
+    Return nominal betas/ses/tstats for G~y, and per-permutation max r^2 across variants.
+    No (chunk x chunk) allocations; memory scales with (m*n + (m+n)*chunk).
     """
     device = resolve_device(device)
 
-    y = move_to_device(y, device)
-    G = move_to_device(G, device)
+    y = y.to(device)
+    G = G.to(device)
     if y_perm is not None:
-        y_perm = move_to_device(y_perm, device)
+        y_perm = y_perm.to(device)
 
     n = y.shape[0]
+    m = G.shape[0]
+    dof = max(n - 1 - int(k_eff), 1)
 
-    # Expand y across variants: (m × n × 1)
-    y_exp = y.unsqueeze(0).expand(G.shape[0], -1).unsqueeze(-1)
+    # ----- nominal (vectorized) -----
+    # Norms and inner products (all on GPU)
+    Gnorm2 = (G * G).sum(dim=1) + _EPS          # (m,)
+    ynorm2 = (y * y).sum() + _EPS               # scalar
+    Gy     = G @ y                               # (m,)
 
-    # Build design matrix
-    G_exp = G.unsqueeze(-1)  # (m × n × 1)
-    if H is not None:
-        H = move_to_device(H, device)  # (m × n × (k-1))
-        X = torch.cat([G_exp, H], dim=2)  # (m × n × p)
-    else:
-        X = G_exp
-    m, n, p = X.shape
+    r      = Gy / torch.sqrt(Gnorm2 * ynorm2)    # (m,)
+    # t-stat for single predictor: t = r * sqrt(dof / (1 - r^2))
+    one_minus_r2 = 1.0 - r * r
+    t      = r * torch.sqrt(dof / torch.clamp(one_minus_r2, min=_EPS))
+    beta   = Gy / Gnorm2                         # (m,)
+    se     = torch.abs(beta) / torch.clamp(t.float(), min=1e-8)
 
-    # Compute XtX, Xty (true phenotype)
-    XtX = torch.matmul(X.transpose(1, 2), X)      # (m × p × p)
-    Xty = torch.matmul(X.transpose(1, 2), y_exp)  # (m × p × 1)
+    betas  = beta.unsqueeze(1)                   # (m,1)
+    ses    = se.unsqueeze(1)                     # (m,1)
+    tstats = t.unsqueeze(1)                      # (m,1)
 
-    # Solve for betas
-    betas = torch.linalg.solve(XtX, Xty).squeeze(-1)  # (m × p)
-
-    # Residuals and variance
-    y_hat = torch.matmul(X, betas.unsqueeze(-1))      # (m × n × 1)
-    resid = y_exp - y_hat
-    dof = n - int(k_eff) - p
-    sigma2 = (resid.transpose(1,2) @ resid).squeeze() / dof  # (m,)
-
-    # SEs and t-stats
-    XtX_inv = torch.linalg.inv(XtX)                       # (m × p × p)
-    var_betas = XtX_inv * sigma2.view(-1,1,1)             # (m × p × p)
-    ses = torch.sqrt(torch.diagonal(var_betas, dim1=1, dim2=2))  # (m × p)
-    tstats = betas / ses
-
-    # --- Permutations ---
+    # ----- permutations (chunked) -----
     r2_perm = None
     if y_perm is not None:
-        # y_perm: (n × nperm) -> (1 × n × nperm), then expand across variants
-        y_perm_exp = y_perm.unsqueeze(0).expand(m, -1, -1)  # (m × n × nperm)
+        # y_perm: (n, chunk)
+        Ypnorm2 = (y_perm * y_perm).sum(dim=0) + _EPS             # (chunk,)
+        # GYp: (m, chunk). Use autocast to reduce memory if available.
+        use_autocast = (
+            G.is_cuda
+            and y_perm.is_cuda
+            and hasattr(torch.cuda, "amp")
+            and hasattr(torch.cuda.amp, "autocast")
+        )
+        if use_autocast:
+            try:
+                with torch.cuda.amp.autocast(dtype=torch.float16):
+                    GYp = G @ y_perm                                  # (m, chunk)
+            except Exception:
+                GYp = G @ y_perm
+        else:
+            GYp = G @ y_perm
 
-        # Project genotypes onto y_perm
-        # Compute betas for each permutation
-        Xty_perm = torch.matmul(X.transpose(1,2), y_perm_exp)   # (m × p × nperm)
-        betas_perm = torch.linalg.solve(XtX, Xty_perm)          # (m × p × nperm)
+        GYp = GYp.float()
 
-        # Predicted values
-        y_hat_perm = torch.matmul(X, betas_perm)                # (m × n × nperm)
-        resid_perm = y_perm_exp - y_hat_perm
-
-        sigma2_perm = (resid_perm.transpose(1,2) @ resid_perm)  # (m × nperm × nperm) too big!
-        # Instead: use correlation-based shortcut: R² = var(Xb) / var(y)
-        # Here we compute R² for genotype effect only (first column of betas_perm)
-        b_g = betas_perm[:,0,:]             # (m × nperm)
-        # variance explained by genotype predictor
-        y_g_hat = G.unsqueeze(-1) * b_g.unsqueeze(1)  # (m × n × nperm)
-        r2_perm = (y_g_hat.var(dim=1) / y_perm.var(dim=0)).max(dim=0).values  # (nperm,)
+        # r^2 for each (variant, perm): (GYp^2)/(||G||^2 * ||y_perm||^2)
+        denom = torch.sqrt(Gnorm2).unsqueeze(1) * torch.sqrt(Ypnorm2).unsqueeze(0)  # (m, chunk)
+        R2 = (GYp / torch.clamp(denom, min=_EPS)) ** 2                               # (m, chunk)
+        r2_perm = torch.nanmax(R2, dim=0).values.float()                             # (chunk,)
 
     return betas, ses, tstats, r2_perm
