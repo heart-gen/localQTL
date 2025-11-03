@@ -10,6 +10,7 @@ __all__ = [
     "dosage_vector_for_covariate",
     "residualize_matrix_with_covariates",
     "residualize_batch",
+    "align_like_casefold",
 ]
 
 
@@ -122,3 +123,52 @@ def residualize_batch(
         return [Y_resid[i, :] for i in range(Y_resid.shape[0])], G_resid, H_resid
     else:
         return Y_resid.squeeze(0), G_resid, H_resid
+
+
+def align_like_casefold(
+    df: pd.DataFrame, like: pd.Index, axis: str = "index",
+    what: str = "samples", strict: bool = True,
+) -> pd.DataFrame:
+    """
+    Case-insensitive, order-preserving alignment of df to 'like'.
+
+    axis='index'  -> align rows (df.index) to 'like'
+    axis='columns'-> align columns (df.columns) to 'like'
+    """
+    if axis not in ("index", "columns"):
+        raise ValueError("axis must be 'index' or 'columns'")
+
+    src = pd.Index(getattr(df, axis).astype(str))
+    src_cf = src.str.casefold()
+
+    dup_mask = src_cf.duplicated(keep=False)
+    if dup_mask.any():
+        dups = list(src[dup_mask].unique())
+        raise ValueError(
+            f"Case-insensitive duplicate {what} in df.{axis}: {dups}. "
+            "Disambiguate these IDs (they collide when case is ignored)."
+        )
+
+    lut = pd.Series(src.values, index=src_cf, dtype=object)
+    want_cf = pd.Index(like.astype(str)).str.casefold()
+    take = lut.reindex(want_cf)
+
+    if strict:
+        missing = want_cf[take.isna()]
+        if len(missing):
+            raise KeyError(
+                f"{len(missing)} {what} not found (case-insensitive): {list(pd.Index(missing).unique())}"
+            )
+
+    take = take.fillna("__MISSING__")
+
+    if axis == "index":
+        out = df.reindex(index=take.values)
+        if "__MISSING__" in out.index:
+            out = out.drop(index="__MISSING__")
+    else:
+        out = df.reindex(columns=take.values)
+        if "__MISSING__" in out.columns:
+            out = out.drop(columns="__MISSING__")
+
+    return out
