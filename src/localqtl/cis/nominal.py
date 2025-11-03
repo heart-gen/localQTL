@@ -387,20 +387,15 @@ def map_nominal(
                 with logger.time_block(f"{chrom}: map_nominal", sync=sync):
                     target_rows = _count_cis_pairs(ig, chrom)
                     with AsyncParquetSink(
-                            out_path, schema=schema,
-                            compression=compression,
+                            out_path, schema=schema, compression=compression,
                             row_group_size=DEFAULT_ROW_GROUP_SIZE,
-                            use_dictionary=("phenotype_id",),
-                            write_statistics=False,
-                            column_order=list(schema.names),
-                            max_queue_items=4,
+                            use_dictionary=("phenotype_id",), write_statistics=False,
+                            column_order=list(schema.names), max_queue_items=4,
                     ) as sink:
                         _run_nominal_core(
                             ig, variant_df, rez, nperm, device,
-                            maf_threshold=maf_threshold,
-                            chrom=chrom, sink=sink,
-                            target_rows=target_rows,
-                            logger=logger,
+                            maf_threshold=maf_threshold, chrom=chrom, sink=sink,
+                            target_rows=target_rows, logger=logger,
                             total_phenotypes=chrom_total,
                         )
                         # logger.write(f"{chrom}: ~{sink.rows:,} rows written")

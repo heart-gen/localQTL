@@ -115,19 +115,10 @@ def _estimate_rows(ig, chrom: str | None, grouped: bool = False) -> int:
     return int(mask.sum())
 
 def _run_permutation_core(
-        ig,
-        variant_df,
-        rez,
-        nperm: int,
-        device: str,
-        beta_approx: bool = True,
-        maf_threshold: float = 0.0,
-        seed: int | None = None,
-        chrom: str | None = None,
-        logger: SimpleLogger | None = None,
-        total_phenotypes: int | None = None,
-        perm_ix_t: torch.Tensor | None = None,
-        perm_chunk: int = 4096,
+        ig, variant_df, rez, nperm: int, device: str, beta_approx: bool = True,
+        maf_threshold: float = 0.0, seed: int | None = None, chrom: str | None = None,
+        logger: SimpleLogger | None = None, total_phenotypes: int | None = None,
+        perm_ix_t: torch.Tensor | None = None, perm_chunk: int = 4096,
 ) -> pd.DataFrame:
     """
     One top association per phenotype with empirical permutation p-value (no grouping).
@@ -332,18 +323,10 @@ def _run_permutation_core(
 
 
 def _run_permutation_core_group(
-        ig,
-        variant_df,
-        rez,
-        nperm: int,
-        device: str,
-        beta_approx: bool = True,
-        maf_threshold: float = 0.0,
-        seed: int | None = None,
-        chrom: str | None = None,
-        logger: SimpleLogger | None = None,
-        total_groups: int | None = None,
-        perm_ix_t: torch.Tensor | None = None,
+        ig, variant_df, rez, nperm: int, device: str, beta_approx: bool = True,
+        maf_threshold: float = 0.0, seed: int | None = None,
+        chrom: str | None = None, logger: SimpleLogger | None = None,
+        total_groups: int | None = None, perm_ix_t: torch.Tensor | None = None,
         perm_chunk: int = 4096,
 ) -> pd.DataFrame:
     """
@@ -663,7 +646,7 @@ def map_permutations(
 
     overall_start = time.time()
     results: list[pd.DataFrame] = []
-    with logger.time_block("Computing associations (permutations)", sync=sync):
+    with logger.time_block("Permutation scan (per-chrom)", sync=sync, sec=False):
         for chrom in ig.chrs:
             chrom_total = int(phenotype_counts.get(chrom, 0))
             if logger.verbose:
