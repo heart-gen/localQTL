@@ -27,13 +27,22 @@ def _make_gen(seed: int | None, device: str) -> torch.Generator | None:
     g.manual_seed(int(seed) & ((1 << 63) - 1))
     return g
 
-def dosage_vector_for_covariate(genotype_df: pd.DataFrame, variant_id: str,
-                                sample_order: pd.Index, missing: float | int | None) -> np.ndarray:
+def dosage_vector_for_covariate(
+    genotype_df: pd.DataFrame,
+    variant_id: str,
+    sample_order: pd.Index,
+    missing: float | int | None,
+) -> np.ndarray:
     """Fetch a dosage row aligned to samples; impute 'missing' to mean of observed."""
-    if not genotype_df.columns.equals(sample_order):
-        row = genotype_df.loc[variant_id, sample_order].to_numpy(dtype=np.float32, copy=True)
-    else:
-        row = genotype_df.loc[variant_id].to_numpy(dtype=np.float32, copy=True)
+    G_aligned = align_like_casefold(
+        genotype_df,
+        like=sample_order,
+        axis="columns",
+        what="sample IDs in genotype_df.columns",
+        strict=True,
+    )
+
+    row = G_aligned.loc[variant_id].to_numpy(dtype=np.float32, copy=True)
     if missing is not None:
         mm = (row == missing)
         if mm.any():
