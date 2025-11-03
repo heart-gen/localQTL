@@ -96,6 +96,18 @@ class Residualizer(object):
         return max_corr
 
 
+def _max_ignore_nan(x: torch.Tensor, dim: int):
+    """
+    Torch <=1.12 doesn't have torch.nanmax.
+    Replace NaNs with -inf then take max; return (values, indices).
+    Columns that were all-NaN become -inf; we map those to 0.0.
+    """
+    x2 = torch.nan_to_num(x, nan=float("-inf"), posinf=float("inf"), neginf=float("-inf"))
+    vals, idx = torch.max(x2, dim=dim)
+    vals = torch.where(torch.isfinite(vals), vals, torch.zeros_like(vals))
+    return vals, idx
+
+
 def run_batch_regression(y, G, H=None, k_eff: int = 0, device="cuda"):
     """
     Batched OLS regression for one phenotype and all variants in a cis-window.
@@ -189,16 +201,14 @@ def run_batch_regression_with_permutations(
     dof = max(n - 1 - int(k_eff), 1)
 
     # Nominal (vectorized)
-    # Norms and inner products (all on GPU)
-    Gnorm2 = (G * G).sum(dim=1) + _EPS          # (m,)
-    ynorm2 = (y * y).sum() + _EPS               # scalar
-    Gy     = G @ y                               # (m,)
+    EPS = 1e-8
+    Gnorm2 = (G * G).sum(dim=1) + EPS          # (m,)
+    ynorm2 = (y * y).sum() + EPS               # scalar
+    Gy     = G @ y                             # (m,)
 
-    r      = Gy / torch.sqrt(Gnorm2 * ynorm2)    # (m,)
-
-    # t-stat for single predictor: t = r * sqrt(dof / (1 - r^2))
+    r      = Gy / torch.sqrt(Gnorm2 * ynorm2)  # (m,)
     one_minus_r2 = 1.0 - r * r
-    t      = r * torch.sqrt(dof / torch.clamp(one_minus_r2, min=_EPS))
+    t      = r * torch.sqrt(dof / torch.clamp(one_minus_r2, min=EPS))
     beta   = Gy / Gnorm2                         # (m,)
     se     = torch.abs(beta) / torch.clamp(t.float(), min=1e-8)
 
@@ -209,25 +219,24 @@ def run_batch_regression_with_permutations(
     # Permutations (chunked)
     r2_perm = None
     if y_perm is not None:
-        Ypnorm2 = (y_perm * y_perm).sum(dim=0) + _EPS
-        use_autocast = (
-            G.is_cuda and y_perm.is_cuda
-            and hasattr(torch.cuda, "amp")
-            and hasattr(torch.cuda.amp, "autocast")
-        )
-        if use_autocast:
+        Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS
+        use_amp = G.is_cuda and y_perm.is_cuda
+        if use_amp:
             try:
+                with torch.amp.autocast("cuda", dtype=torch.float16):
+                    GYp = G @ y_perm             # (m, chunk)
+            except Exception:
+                # older Torch
                 with torch.cuda.amp.autocast(dtype=torch.float16):
                     GYp = G @ y_perm
-            except Exception:
-                GYp = G @ y_perm
         else:
             GYp = G @ y_perm
 
         GYp = GYp.float()
-
         denom = torch.sqrt(Gnorm2).unsqueeze(1) * torch.sqrt(Ypnorm2).unsqueeze(0)
         R2 = (GYp / torch.clamp(denom, min=_EPS)) ** 2
-        r2_perm = torch.nanmax(R2, dim=0).values.float()
+
+        r2_vals, _ = _max_ignore_nan(R2, dim=0)
+        r2_perm = r2_vals.float()
 
     return betas, ses, tstats, r2_perm
