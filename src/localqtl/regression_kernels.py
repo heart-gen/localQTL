@@ -232,7 +232,7 @@ def run_batch_regression_with_permutations(
 
         GYp = GYp.float()
         denom = torch.sqrt(Gnorm2).unsqueeze(1) * torch.sqrt(Ypnorm2).unsqueeze(0)
-        R2 = (GYp / torch.clamp(denom, min=_EPS)) ** 2
+        R2 = (GYp / torch.clamp(denom, min=EPS)) ** 2
 
         r2_vals, _ = _max_ignore_nan(R2, dim=0)
         r2_perm = r2_vals.float()

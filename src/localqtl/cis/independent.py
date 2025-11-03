@@ -5,13 +5,17 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
 from ..utils import SimpleLogger, subseed
 from ..stats import beta_approx_pval, get_t_pval
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from ..preproc import impute_mean_and_filter, allele_stats, filter_by_maf
 from ..regression_kernels import (
     Residualizer,
-    run_batch_regression,
     run_batch_regression_with_permutations
 )
 from .common import residualize_batch, dosage_vector_for_covariate
@@ -19,6 +23,86 @@ from .common import residualize_batch, dosage_vector_for_covariate
 __all__ = [
     "map_independent",
 ]
+
+
+def _make_perm_ix(n_samples: int, nperm: int, device: str, seed: int | None) -> torch.Tensor:
+    """Create (nperm × n_samples) permutation index tensor on ``device``."""
+    g = torch.Generator(device=device)
+    if seed is not None:
+        g.manual_seed(seed)
+    return torch.stack(
+        [torch.randperm(n_samples, generator=g, device=device) for _ in range(nperm)],
+        dim=0,
+    )
+
+
+def _roll_for_pid(perm_ix: torch.Tensor, pid: str | int, seed: int | None) -> torch.Tensor:
+    if seed is None:
+        return perm_ix
+    shift = abs(hash((seed, str(pid)))) % perm_ix.shape[0]
+    if shift == 0:
+        return perm_ix
+    return perm_ix.roll(shifts=int(shift), dims=0)
+
+
+def _to_device_float32(array_like, device: str) -> torch.Tensor:
+    if isinstance(array_like, torch.Tensor):
+        tensor = array_like
+        if tensor.device.type != device:
+            tensor = tensor.to(device=device, dtype=torch.float32, non_blocking=True)
+        elif tensor.dtype != torch.float32:
+            tensor = tensor.to(dtype=torch.float32)
+        return tensor
+    np_arr = np.asarray(array_like, dtype=np.float32)
+    return torch.from_numpy(np_arr).to(device=device, non_blocking=True)
+
+
+def _compute_perm_r2_max(
+        y_resid: torch.Tensor,
+        G_resid: torch.Tensor,
+        H_resid: torch.Tensor | None,
+        k_eff: int,
+        perm_ix: torch.Tensor,
+        device: str,
+        perm_chunk: int,
+        return_nominal: bool = False,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+    """Chunked permutation scan returning max R² per permutation and optional nominal stats."""
+    nperm_total = int(perm_ix.shape[0])
+    if nperm_total == 0:
+        empty = torch.empty((0,), device=device, dtype=torch.float32)
+        return (None, None, None, empty) if return_nominal else (None, None, None, empty)
+    r2_perm_max = torch.full(
+        (nperm_total,),
+        -float("inf"),
+        device=device,
+        dtype=torch.float32,
+    )
+    n_samples = y_resid.shape[0]
+    nominal_b = nominal_s = nominal_t = None
+    for off in range(0, nperm_total, perm_chunk):
+        sel = perm_ix[off:off + perm_chunk]
+        if sel.numel() == 0:
+            continue
+        chunk = sel.shape[0]
+        y_perm = y_resid.index_select(0, sel.reshape(-1)).view(chunk, n_samples).transpose(0, 1)
+        betas, ses, tstats, r2_block = run_batch_regression_with_permutations(
+            y=y_resid,
+            G=G_resid,
+            H=H_resid,
+            y_perm=y_perm,
+            k_eff=k_eff,
+            device=device,
+        )
+        if nominal_b is None and return_nominal:
+            nominal_b, nominal_s, nominal_t = betas, ses, tstats
+        r2_perm_max[off:off + chunk] = torch.maximum(
+            r2_perm_max[off:off + chunk],
+            r2_block.to(torch.float32),
+        )
+    if return_nominal:
+        return nominal_b, nominal_s, nominal_t, r2_perm_max
+    return None, None, None, r2_perm_max
 
 
 def _allocate_result_buffers(
@@ -65,7 +149,8 @@ def _run_independent_core(
         signif_seed_df: pd.DataFrame, signif_threshold: float, nperm: int,
         device: str, maf_threshold: float = 0.0, random_tiebreak: bool = False,
         missing: float = -9.0, beta_approx: bool = True, seed: int | None = None,
-        chrom: str | None = None
+        chrom: str | None = None, perm_ix_t: torch.Tensor | None = None,
+        perm_chunk: int = 2048
 ) -> pd.DataFrame:
     """Forward–backward independent mapping for ungrouped phenotypes."""
     expected_columns = [
@@ -107,11 +192,8 @@ def _run_independent_core(
     if covariates_df is not None:
         if not covariates_df.index.equals(ig.phenotype_df.columns):
             covariates_df = covariates_df.loc[ig.phenotype_df.columns]
-        covariates_base_t = torch.as_tensor(
-            covariates_df.to_numpy(np.float32, copy=False),
-            dtype=torch.float32,
-            device=device,
-        )
+        covariates_base_t = _to_device_float32(
+            covariates_df.to_numpy(np.float32, copy=False), device)
 
     var_in_frame = set(variant_df.index)
 
@@ -131,31 +213,25 @@ def _run_independent_core(
         seed_row = signif_seed_df.loc[pid]
 
         # Tensors for the window
-        y_t = torch.tensor(p, dtype=torch.float32, device=device)
-        G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
+        y_t = _to_device_float32(p, device)
+        G_t = _to_device_float32(G_block, device)
         if H_block is None:
             H_t = None
-        elif isinstance(H_block, torch.Tensor):
-            if H_block.device.type != device:
-                H_t = H_block.to(device=device, dtype=torch.float32)
-            elif H_block.dtype != torch.float32:
-                H_t = H_block.to(dtype=torch.float32)
-            else:
-                H_t = H_block
         else:
-            H_t = torch.tensor(H_block, dtype=torch.float32, device=device)
+            H_t = _to_device_float32(H_block, device)
 
         # Impute & filter (and optional MAF)
-        G_t, keep_mask, _ = impute_mean_and_filter(G_t)
-        if keep_mask.sum().item() == 0:
+        G_imputed, keep_mask, _ = impute_mean_and_filter(G_t)
+        if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
             continue
         if maf_threshold and maf_threshold > 0:
-            keep_maf, _ = filter_by_maf(G_t, maf_threshold, ploidy=2)
+            keep_maf, _ = filter_by_maf(G_imputed, maf_threshold, ploidy=2)
             keep_mask = keep_mask & keep_maf
             if keep_mask.sum().item() == 0:
                 continue
-        G_t = G_t[keep_mask]
-        v_idx = v_idx[keep_mask.detach().cpu().numpy()]
+        mask_cpu = keep_mask.detach().cpu().numpy()
+        G_t = G_imputed[keep_mask]
+        v_idx = v_idx[mask_cpu]
         if H_t is not None:
             H_t = H_t[keep_mask]
             if H_t.shape[2] > 1:
@@ -170,15 +246,18 @@ def _run_independent_core(
             gen = torch.Generator(device=device)
             gen.manual_seed(subseed(seed, pid))
 
-        # Fixed permutations for this phenotype
+        # Permutation indices for this phenotype
         n = y_t.shape[0]
-        perms = torch.stack(
-            [torch.randperm(n, device=device, generator=gen) for _ in range(nperm)],
-            dim=1,
-        )  # (n, nperm)
+        if perm_ix_t is not None:
+            perm_ix_pid = _roll_for_pid(perm_ix_t, pid, seed)
+        else:
+            local_seed = subseed(seed, pid) if seed is not None else None
+            perm_ix_pid = _make_perm_ix(n, nperm, device, local_seed)
 
         # Forward pass
-        forward_rows = [seed_row.to_frame().T]  # initialize with seed from cis_df
+        forward_records: list[dict[str, object]] = []
+        base_record = {col: seed_row.get(col) for col in expected_columns if col != "rank"}
+        forward_records.append(base_record)
         dosage_dict: dict[str, torch.Tensor] = {}
         seed_vid = str(seed_row["variant_id"])
         if seed_vid in var_in_frame and seed_vid in ig.genotype_df.index:
@@ -206,11 +285,17 @@ def _run_independent_core(
                 C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
                 rez_aug = Residualizer(C_aug_t)
             y_resid, G_resid, H_resid = residualize_batch(y_t, G_t, H_t, rez_aug, center=True, group=False)
-            y_perm = y_resid[perms]
 
             k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
-            betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
-                y=y_resid, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
+            betas, ses, tstats, r2_perm = _compute_perm_r2_max(
+                y_resid=y_resid,
+                G_resid=G_resid,
+                H_resid=H_resid,
+                k_eff=k_eff,
+                perm_ix=perm_ix_pid,
+                device=device,
+                perm_chunk=perm_chunk,
+                return_nominal=True,
             )
 
             p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
@@ -292,8 +377,6 @@ def _run_independent_core(
 
         if not forward_records:
             continue
-        for rk, rec in enumerate(forward_records, start=1):
-            rec["rank"] = rk
 
         # Backward pass
         if len(forward_records) > 1:
@@ -303,20 +386,26 @@ def _run_independent_core(
                 kept = [v for v in selected if v != drop_vid]
                 rez_aug = None
                 extras = [dosage_dict[v] for v in kept]
-                if covariates_base_t is not None or extras:
-                    components = []
-                    if covariates_base_t is not None:
-                        components.append(covariates_base_t)
-                    if extras:
-                        components.append(torch.stack(extras, dim=1))
-                    C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
-                    rez_aug = Residualizer(C_aug_t)
+            if covariates_base_t is not None or extras:
+                components = []
+                if covariates_base_t is not None:
+                    components.append(covariates_base_t)
+                if extras:
+                    components.append(torch.stack(extras, dim=1))
+                C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
+                rez_aug = Residualizer(C_aug_t)
                 y_resid, G_resid, H_resid = residualize_batch(y_t, G_t, H_t, rez_aug, center=True, group=False)
-                y_perm = y_resid[perms]
 
                 k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
-                betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
-                    y=y_resid, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
+                betas, ses, tstats, r2_perm = _compute_perm_r2_max(
+                    y_resid=y_resid,
+                    G_resid=G_resid,
+                    H_resid=H_resid,
+                    k_eff=k_eff,
+                    perm_ix=perm_ix_pid,
+                    device=device,
+                    perm_chunk=perm_chunk,
+                    return_nominal=True,
                 )
                 p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
                 dof = max(int(n) - int(k_eff) - int(p_pred), 1)
@@ -380,7 +469,8 @@ def _run_independent_core(
         else:
             records_to_write = forward_records
 
-        for rec in records_to_write:
+        for rk, rec in enumerate(records_to_write, start=1):
+            rec["rank"] = rk
             buffers = _ensure_capacity(buffers, cursor, 1)
             _write_row(buffers, cursor, rec)
             cursor += 1
@@ -389,14 +479,16 @@ def _run_independent_core(
 
 
 
-def _run_independent_core_group( ## TODO: Needs updating
+
+def _run_independent_core_group(
         ig, variant_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame],
         seed_by_group_df: pd.DataFrame, signif_threshold: float, nperm: int,
         device: str, maf_threshold: float = 0.0, random_tiebreak: bool = False,
         missing: float = -9.0, beta_approx: bool = True, seed: int | None = None,
-        chrom: str | None = None
+        chrom: str | None = None, perm_ix_t: torch.Tensor | None = None,
+        perm_chunk: int = 2048
 ) -> pd.DataFrame:
-    """Forward–backward independent mapping for grouped phenotypes."""
+    """Forward-backward independent mapping for grouped phenotypes."""
     expected_columns = [
         "group_id", "group_size", "phenotype_id", "variant_id", "pos",
         "start_distance", "end_distance", "num_var", "beta", "se", "tstat",
@@ -436,11 +528,8 @@ def _run_independent_core_group( ## TODO: Needs updating
     if covariates_df is not None:
         if not covariates_df.index.equals(ig.phenotype_df.columns):
             covariates_df = covariates_df.loc[ig.phenotype_df.columns]
-        covariates_base_t = torch.as_tensor(
-            covariates_df.to_numpy(np.float32, copy=False),
-            dtype=torch.float32,
-            device=device,
-        )
+        covariates_base_t = _to_device_float32(
+            covariates_df.to_numpy(np.float32, copy=False), device)
 
     for batch in ig.generate_data(chrom=chrom):
         if len(batch) == 5:
@@ -457,43 +546,34 @@ def _run_independent_core_group( ## TODO: Needs updating
         seed_row = seed_rows.iloc[0]
         seed_vid = str(seed_row["variant_id"])
 
-        G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
+        G_t = _to_device_float32(G_block, device)
         if H_block is None:
             H_t = None
-        elif isinstance(H_block, torch.Tensor):
-            if H_block.device.type != device:
-                H_t = H_block.to(device=device, dtype=torch.float32)
-            elif H_block.dtype != torch.float32:
-                H_t = H_block.to(dtype=torch.float32)
-            else:
-                H_t = H_block
         else:
-            H_t = torch.tensor(H_block, dtype=torch.float32, device=device)
+            H_t = _to_device_float32(H_block, device)
 
-        G_t, keep_mask, _ = impute_mean_and_filter(G_t)
-        if keep_mask.sum().item() == 0:
+        G_imputed, keep_mask, _ = impute_mean_and_filter(G_t)
+        if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
             continue
         if maf_threshold and maf_threshold > 0:
-            keep_maf, _ = filter_by_maf(G_t, maf_threshold, ploidy=2)
+            keep_maf, _ = filter_by_maf(G_imputed, maf_threshold, ploidy=2)
             keep_mask = keep_mask & keep_maf
             if keep_mask.sum().item() == 0:
                 continue
-        G_t = G_t[keep_mask]
-        v_idx = v_idx[keep_mask.detach().cpu().numpy()]
+        mask_cpu = keep_mask.detach().cpu().numpy()
+        G_t = G_imputed[keep_mask]
+        v_idx = v_idx[mask_cpu]
         if H_t is not None:
             H_t = H_t[keep_mask]
             if H_t.shape[2] > 1:
                 H_t = H_t[:, :, :-1]
 
-        n = ig.phenotype_df.shape[1]
-        gen = None
-        if seed is not None:
-            gen = torch.Generator(device=device)
-            gen.manual_seed(subseed(seed, f"group:{group_id}"))
-        perms = torch.stack(
-            [torch.randperm(n, device=device, generator=gen) for _ in range(nperm)],
-            dim=1,
-        )
+        n_samples = ig.phenotype_df.shape[1]
+        if perm_ix_t is not None:
+            perm_ix_group = _roll_for_pid(perm_ix_t, f"group:{group_id}", seed)
+        else:
+            local_seed = subseed(seed, f"group:{group_id}") if seed is not None else None
+            perm_ix_group = _make_perm_ix(n_samples, nperm, device, local_seed)
 
         dosage_dict: dict[str, torch.Tensor] = {}
         if seed_vid in var_in_frame and seed_vid in geno_has_variant:
@@ -507,14 +587,22 @@ def _run_independent_core_group( ## TODO: Needs updating
                 dtype=torch.float32,
                 device=device,
             )
+
+        ids_list = list(ids)
+        y_stack = torch.stack([
+            _to_device_float32(
+                ig.phenotype_df.loc[pid].to_numpy(np.float32, copy=False), device
+            )
+            for pid in ids_list
+        ], dim=0)
+
         forward_records: list[dict[str, object]] = []
         base_record = {col: seed_row.get(col) for col in expected_columns if col not in ("rank", "group_size")}
-        base_record["group_size"] = len(ids)
+        base_record["group_size"] = len(ids_list)
         base_record["group_id"] = group_id
         forward_records.append(base_record)
 
         while True:
-            # augmented covariates for this forward step
             rez_aug = None
             extras = [dosage_dict[v] for v in dosage_dict]
             if covariates_base_t is not None or extras:
@@ -526,39 +614,27 @@ def _run_independent_core_group( ## TODO: Needs updating
                 C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
                 rez_aug = Residualizer(C_aug_t)
 
+            y_resid_list, G_resid, H_resid = residualize_batch(
+                y_stack, G_t, H_t, rez_aug, center=True, group=True
+            )
+            k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
+
             best = dict(r2=-np.inf, ix_var=-1, ix_pheno=-1, beta=None, se=None, t=None, dof=None)
-            r2_perm_list = []
+            r2_perm_list: list[torch.Tensor] = []
 
-            mats = [G_t]
-            H_shape = None
-            if H_t is not None:
-                m, n_s, pH = H_t.shape
-                H_shape = (m, n_s, pH)
-                mats.append(H_t.reshape(m * pH, n_s))
-
-            for j, pid in enumerate(ids):
-                y = ig.phenotype_df.loc[pid].to_numpy(np.float32)
-                y_t = torch.tensor(y, dtype=torch.float32, device=device)
-
-                if rez_aug is None:
-                    mats_resid = [G_t] + ([H_t.reshape(H_shape[0] * H_shape[2], H_shape[1])] if H_t is not None else []) + [y_t.unsqueeze(0)]
-                else:
-                    mats_resid = rez_aug.transform(*mats, y_t.unsqueeze(0), center=True)
-                G_resid = mats_resid[0]
-                idx = 1
-                H_resid = None
-                if H_t is not None:
-                    H_resid = mats_resid[idx].reshape(H_shape)
-                    idx += 1
-                y_resid = mats_resid[idx].squeeze(0)
-
-                y_perm = y_resid[perms]
-                k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
-                betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
-                    y=y_resid, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
+            for j, (pid, y_resid) in enumerate(zip(ids_list, y_resid_list)):
+                betas, ses, tstats, r2_perm_vec = _compute_perm_r2_max(
+                    y_resid=y_resid,
+                    G_resid=G_resid,
+                    H_resid=H_resid,
+                    k_eff=k_eff,
+                    perm_ix=perm_ix_group,
+                    device=device,
+                    perm_chunk=perm_chunk,
+                    return_nominal=True,
                 )
                 p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-                dof = max(int(n) - int(k_eff) - int(p_pred), 1)
+                dof = max(int(n_samples) - int(k_eff) - int(p_pred), 1)
                 t_g = tstats[:, 0]
                 r2_nominal_vec = (t_g.double().pow(2) / (t_g.double().pow(2) + dof)).detach().cpu().numpy()
                 ix = int(np.nanargmax(r2_nominal_vec))
@@ -572,19 +648,20 @@ def _run_independent_core_group( ## TODO: Needs updating
                         t=float(t_g[ix].detach().cpu().numpy()),
                         dof=int(dof),
                     )
-                r2_perm_list.append(r2_perm)
+                r2_perm_list.append(r2_perm_vec)
 
             r2_perm_max = torch.stack(r2_perm_list, dim=0).max(dim=0).values.detach().cpu().numpy()
             pval_perm = float((np.sum(r2_perm_max >= best["r2"]) + 1) / (r2_perm_max.size + 1))
-            pval_beta, a_hat, b_hat = (beta_approx_pval(r2_perm_max, best["r2"]) if beta_approx
-                                       else (np.nan, np.nan, np.nan))
+            pval_beta, a_hat, b_hat = (
+                beta_approx_pval(r2_perm_max, best["r2"]) if beta_approx else (np.nan, np.nan, np.nan)
+            )
             stop_pval = float(pval_beta)
             if not np.isfinite(stop_pval):
                 stop_pval = pval_perm
             if stop_pval > signif_threshold:
                 break
 
-            pid_best = ids[best["ix_pheno"]]
+            pid_best = ids_list[best["ix_pheno"]]
             var_id = idx_to_id[v_idx[best["ix_var"]]]
             var_pos = int(pos_arr[v_idx[best["ix_var"]]])
             start_pos = ig.phenotype_start[pid_best]
@@ -592,13 +669,13 @@ def _run_independent_core_group( ## TODO: Needs updating
 
             forward_records.append({
                 "group_id": group_id,
-                "group_size": len(ids),
+                "group_size": len(ids_list),
                 "phenotype_id": pid_best,
                 "variant_id": var_id,
                 "pos": var_pos,
                 "start_distance": int(var_pos - start_pos),
                 "end_distance": int(var_pos - end_pos),
-                "num_var": int(G_t.shape[0]),
+                "num_var": int(G_resid.shape[0]),
                 "beta": best["beta"],
                 "se": best["se"],
                 "tstat": best["t"],
@@ -625,8 +702,6 @@ def _run_independent_core_group( ## TODO: Needs updating
 
         if not forward_records:
             continue
-        for rk, rec in enumerate(forward_records, start=1):
-            rec["rank"] = rk
 
         if len(forward_records) > 1:
             kept_records: list[dict[str, object]] = []
@@ -646,43 +721,33 @@ def _run_independent_core_group( ## TODO: Needs updating
                     C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
                     rez_aug = Residualizer(C_aug_t)
 
+                y_resid_list, G_resid, H_resid = residualize_batch(
+                    y_stack, G_t, H_t, rez_aug, center=True, group=True
+                )
+                k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
+
                 best = dict(r2=-np.inf, ix_var=-1, ix_pheno=-1, beta=None, se=None, t=None, dof=None)
                 r2_perm_list = []
-                mats = [G_t]
-                H_shape = None
-                if H_t is not None:
-                    m, n_s, pH = H_t.shape
-                    H_shape = (m, n_s, pH)
-                    mats.append(H_t.reshape(m * pH, n_s))
 
-                for j, pid in enumerate(ids):
-                    y = ig.phenotype_df.loc[pid].to_numpy(np.float32)
-                    y_t = torch.tensor(y, dtype=torch.float32, device=device)
-                    if rez_aug is None:
-                        mats_resid = [G_t] + ([H_t.reshape(H_shape[0] * H_shape[2], H_shape[1])] if H_t is not None else []) + [y_t.unsqueeze(0)]
-                    else:
-                        mats_resid = rez_aug.transform(*mats, y_t.unsqueeze(0), center=True)
-                    G_resid = mats_resid[0]
-                    idx = 1
-                    H_resid = None
-                    if H_t is not None:
-                        H_resid = mats_resid[idx].reshape(H_shape)
-                        idx += 1
-                    y_resid = mats_resid[idx].squeeze(0)
-
-                    y_perm = y_resid[perms]
-                    k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
-                    betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
-                        y=y_resid, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
+                for j, (pid, y_resid) in enumerate(zip(ids_list, y_resid_list)):
+                    betas, ses, tstats, r2_perm_vec = _compute_perm_r2_max(
+                        y_resid=y_resid,
+                        G_resid=G_resid,
+                        H_resid=H_resid,
+                        k_eff=k_eff,
+                        perm_ix=perm_ix_group,
+                        device=device,
+                        perm_chunk=perm_chunk,
+                        return_nominal=True,
                     )
                     p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-                    dof = max(int(n) - int(k_eff) - int(p_pred), 1)
+                    dof = max(int(n_samples) - int(k_eff) - int(p_pred), 1)
                     t_g = tstats[:, 0]
-                    r2_nominal_vec = (t_g.double().pow(2) / (t_g.double().pow(2) + dof)).detach().cpu().numpy()
-                    ix = int(np.nanargmax(r2_nominal_vec))
-                    if r2_nominal_vec[ix] > best["r2"]:
+                    r2_np = (t_g.double().pow(2) / (t_g.double().pow(2) + dof)).detach().cpu().numpy()
+                    ix = int(np.nanargmax(r2_np))
+                    if r2_np[ix] > best["r2"]:
                         best.update(
-                            r2=float(r2_nominal_vec[ix]),
+                            r2=float(r2_np[ix]),
                             ix_var=ix,
                             ix_pheno=j,
                             beta=float(betas[ix, 0].detach().cpu().numpy()),
@@ -690,18 +755,19 @@ def _run_independent_core_group( ## TODO: Needs updating
                             t=float(t_g[ix].detach().cpu().numpy()),
                             dof=int(dof),
                         )
-                    r2_perm_list.append(r2_perm)
+                    r2_perm_list.append(r2_perm_vec)
 
                 r2_perm_max = torch.stack(r2_perm_list, dim=0).max(dim=0).values.detach().cpu().numpy()
                 pval_perm = float((np.sum(r2_perm_max >= best["r2"]) + 1) / (r2_perm_max.size + 1))
-                pval_beta, a_hat, b_hat = (beta_approx_pval(r2_perm_max, best["r2"]) if beta_approx
-                                           else (np.nan, np.nan, np.nan))
+                pval_beta, a_hat, b_hat = (
+                    beta_approx_pval(r2_perm_max, best["r2"]) if beta_approx else (np.nan, np.nan, np.nan)
+                )
                 stop_pval = float(pval_beta)
                 if not np.isfinite(stop_pval):
                     stop_pval = pval_perm
 
                 if stop_pval <= signif_threshold:
-                    pid_best = ids[best["ix_pheno"]]
+                    pid_best = ids_list[best["ix_pheno"]]
                     var_id = idx_to_id[v_idx[best["ix_var"]]]
                     var_pos = int(pos_arr[v_idx[best["ix_var"]]])
                     start_pos = ig.phenotype_start[pid_best]
@@ -709,13 +775,13 @@ def _run_independent_core_group( ## TODO: Needs updating
 
                     kept_records.append({
                         "group_id": group_id,
-                        "group_size": len(ids),
+                        "group_size": len(ids_list),
                         "phenotype_id": pid_best,
                         "variant_id": var_id,
                         "pos": var_pos,
                         "start_distance": int(var_pos - start_pos),
                         "end_distance": int(var_pos - end_pos),
-                        "num_var": int(G_t.shape[0]),
+                        "num_var": int(G_resid.shape[0]),
                         "beta": best["beta"],
                         "se": best["se"],
                         "tstat": best["t"],
@@ -735,12 +801,14 @@ def _run_independent_core_group( ## TODO: Needs updating
         else:
             records_to_write = forward_records
 
-        for rec in records_to_write:
+        for rk, rec in enumerate(records_to_write, start=1):
+            rec["rank"] = rk
             buffers = _ensure_capacity(buffers, cursor, 1)
             _write_row(buffers, cursor, rec)
             cursor += 1
 
     return _buffers_to_dataframe(expected_columns, buffers, cursor)
+
 def map_independent(
         genotype_df: pd.DataFrame, variant_df: pd.DataFrame, cis_df: pd.DataFrame,
         phenotype_df: pd.DataFrame, phenotype_pos_df: pd.DataFrame,
@@ -817,6 +885,13 @@ def map_independent(
     if ig.n_phenotypes == 0:
         raise ValueError("No valid phenotypes after generator preprocessing.")
 
+    if nperm is None or nperm <= 0:
+        raise ValueError("nperm must be a positive integer for map_independent.")
+
+    n_samples = int(ig.phenotype_df.shape[1])
+    perm_ix_t = _make_perm_ix(n_samples, nperm, device, seed)
+    perm_chunk = 2048
+
     if group_s is None:
         if "phenotype_id" not in signif_df.columns:
             raise ValueError("cis_df must contain 'phenotype_id' for ungrouped mapping.")
@@ -833,6 +908,7 @@ def map_independent(
                 nperm=nperm, device=device, maf_threshold=maf_threshold,
                 random_tiebreak=random_tiebreak, missing=missing,
                 beta_approx=beta_approx, seed=seed, chrom=chrom,
+                perm_ix_t=perm_ix_t, perm_chunk=perm_chunk,
             )
     else:
         if "group_id" not in signif_df.columns:
@@ -858,6 +934,7 @@ def map_independent(
                 nperm=nperm, device=device, maf_threshold=maf_threshold,
                 random_tiebreak=random_tiebreak, missing=missing,
                 beta_approx=beta_approx, seed=seed, chrom=chrom,
+                perm_ix_t=perm_ix_t, perm_chunk=perm_chunk,
             )
 
     if logger.verbose:
