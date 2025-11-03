@@ -420,5 +420,5 @@ def map_nominal(
                                     total_phenotypes=total_phenotypes)
     if logger.verbose:
         elapsed = time.time() - overall_start
-        logger.write(f"    Completed nominal scan in {elapsed:.2f}s")
+        logger.write(f"    Completed nominal scan in {elapsed / 60:.2f} min")
     return results
