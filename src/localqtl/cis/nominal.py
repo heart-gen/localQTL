@@ -377,7 +377,7 @@ def map_nominal(
         os.makedirs(out_dir, exist_ok=True)
         include_perm = nperm is not None and nperm > 0
         schema = _nominal_parquet_schema(include_perm)
-        with logger.time_block("Nominal scan (per-chrom streaming)", sync=sync):
+        with logger.time_block("Nominal scan (per-chrom streaming)", sync=sync, sec=False):
             for chrom in ig.chrs:
                 out_path = os.path.join(out_dir, f"{out_prefix}.{chrom}.parquet")
                 chrom_total = int(phenotype_counts.get(chrom, 0))

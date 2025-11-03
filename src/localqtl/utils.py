@@ -37,7 +37,7 @@ class SimpleLogger:
             self.log.flush()
 
     @contextmanager
-    def time_block(self, label: str, sync=None):
+    def time_block(self, label: str, sync=None, sec=True):
         if sync: sync()
         t0 = time.perf_counter()
         try:
@@ -45,7 +45,10 @@ class SimpleLogger:
         finally:
             if sync: sync()
             dt = time.perf_counter() - t0
-            self.write(f"{label} done in {dt:.2f}s")
+            if sec:
+                self.write(f"{label} done in {dt:.2f}s")
+            else:
+                self.write(f"{label} done in {dt / 60: .2f} min")
 
     def close(self):
         if self.log:
