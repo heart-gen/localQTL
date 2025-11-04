@@ -12,7 +12,7 @@ from ..utils import SimpleLogger, subseed
 from .._torch_utils import to_device_tensor
 from ..stats import beta_approx_pval, get_t_pval
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
-from ..preproc import impute_mean_and_filter, allele_stats, filter_by_maf
+from ..preproc import impute_mean_and_filter, filter_by_maf
 from ..regression_kernels import (
     Residualizer,
     run_batch_regression_with_permutations
@@ -32,6 +32,30 @@ from .common import (
 __all__ = [
     "map_independent",
 ]
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
+def _auto_perm_chunk(n_variants: int, nperm: int, safety: float = 0.65) -> int:
+    if not torch.cuda.is_available():
+        return min(nperm, 2048)
+    free, _ = torch.cuda.mem_get_info()
+    # r2 buffer ~ [n_variants x chunk] float32
+    bytes_per = 4
+    if n_variants <= 0:
+        return min(nperm, 2048)
+    max_chunk = max(1, min(nperm, int(free * safety) // (n_variants * bytes_per)))
+    # round down to power of two for kernel efficiency
+    p2 = 1 << (max_chunk.bit_length() - 1)
+    return max(1, p2)
+
+
+def _nanmax(x: torch.Tensor, dim: int):
+    if hasattr(torch, "nanmax"):
+        return torch.nanmax(x, dim=dim)
+    replace = torch.full_like(x, float("-inf"))
+    return torch.max(torch.where(torch.isnan(x), replace, x), dim=dim)
 
 def _run_independent_core(
         ig, variant_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame],
@@ -133,15 +157,17 @@ def _run_independent_core(
             if keep_mask.sum().item() == 0:
                 continue
         mask_cpu = keep_mask.detach().cpu().numpy()
-        G_t = G_imputed[keep_mask]
+        G_t = G_imputed[keep_mask].contiguous()
         v_idx = v_idx[mask_cpu]
         if H_t is not None:
             H_t = H_t[keep_mask]
             if H_t.shape[2] > 1:
                 H_t = H_t[:, :, :-1]  # drop one ancestry channel
+            H_t = H_t.contiguous()
 
-        # Minor-allele stats (pre-residualization)
-        af_t, ma_samples_t, ma_count_t = allele_stats(G_t, ploidy=2)
+        perm_chunk_local = _auto_perm_chunk(G_t.shape[0], nperm)
+        if perm_chunk is not None and perm_chunk > 0:
+            perm_chunk_local = min(perm_chunk_local, int(perm_chunk))
 
         # Build per-phenotype generator
         gen = None
@@ -176,63 +202,83 @@ def _run_independent_core(
             )
 
         while True:
-            # Build augmented covariates = [C | selected dosages]
-            rez_aug = None
             extras = [dosage_dict[v] for v in dosage_dict]
-            if covariates_base_t is not None or extras:
-                components = []
-                if covariates_base_t is not None:
-                    components.append(covariates_base_t)
-                if extras:
-                    components.append(torch.stack(extras, dim=1))
-                C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
-                rez_aug = Residualizer(C_aug_t)
-            y_resid, G_resid, H_resid = residualize_batch(y_t, G_t, H_t, rez_aug, center=True, group=False)
+            rez_aug = None
+            with torch.no_grad():
+                if covariates_base_t is not None or extras:
+                    components = []
+                    if covariates_base_t is not None:
+                        components.append(covariates_base_t)
+                    if extras:
+                        components.append(torch.stack(extras, dim=1))
+                    C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
+                    rez_aug = Residualizer(C_aug_t)
+                y_resid, G_resid, H_resid = residualize_batch(
+                    y_t, G_t, H_t, rez_aug, center=True, group=False
+                )
+                k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
+                betas, ses, tstats, r2_perm = compute_perm_r2_max(
+                    y_resid=y_resid,
+                    G_resid=G_resid,
+                    H_resid=H_resid,
+                    k_eff=k_eff,
+                    perm_ix=perm_ix_pid,
+                    device=device,
+                    perm_chunk=perm_chunk_local,
+                    return_nominal=True,
+                )
 
-            k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
-            betas, ses, tstats, r2_perm = compute_perm_r2_max(
-                y_resid=y_resid,
-                G_resid=G_resid,
-                H_resid=H_resid,
-                k_eff=k_eff,
-                perm_ix=perm_ix_pid,
-                device=device,
-                perm_chunk=perm_chunk,
-                return_nominal=True,
-            )
-
-            p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-            dof = max(int(n) - int(k_eff) - int(p_pred), 1)
-            t_g = tstats[:, 0]
-            r2_nominal_vec = (t_g.double().pow(2) / (t_g.double().pow(2) + dof))
-            r2_np = r2_nominal_vec.detach().cpu().numpy()
-            r2_max = np.nanmax(r2_np)
-            if random_tiebreak:
-                ties = np.flatnonzero(np.isclose(r2_np, r2_max, atol=1e-12))
-                if gen is None:
-                    choice = int(torch.randint(0, len(ties), (1,)).item())
+                p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
+                dof = max(int(n) - int(k_eff) - int(p_pred), 1)
+                t_g = tstats[:, 0]
+                t2 = t_g * t_g
+                r2_nominal_vec = t2 / (t2 + float(dof))
+                r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
+                ix = int(ix_t.item())
+                if random_tiebreak:
+                    ties = torch.nonzero(
+                        torch.isclose(r2_nominal_vec, r2_max_t, atol=1e-12),
+                        as_tuple=True,
+                    )[0]
+                    if ties.numel() > 1:
+                        if gen is None:
+                            choice_tensor = torch.randint(0, ties.numel(), (1,), device=ties.device)
+                        else:
+                            choice_tensor = torch.randint(
+                                0, ties.numel(), (1,), device=ties.device, generator=gen
+                            )
+                        ix = int(ties[int(choice_tensor.item())].item())
+                        r2_max_t = r2_nominal_vec[ix]
+                beta = float(betas[ix, 0].item())
+                se = float(ses[ix, 0].item())
+                tval = float(t_g[ix].item())
+                r2_nom = float(r2_max_t.item())
+                pval_perm = (
+                    (r2_perm >= r2_max_t).sum().add_(1).float() / (r2_perm.numel() + 1)
+                ).item()
+                r2_perm_np = r2_perm.detach().cpu().numpy()
+                if beta_approx:
+                    pval_beta, a_hat, b_hat = beta_approx_pval(r2_perm_np, r2_nom)
                 else:
-                    choice = int(torch.randint(0, len(ties), (1,), generator=gen).item())
-                ix = int(ties[choice])
-            else:
-                ix = int(np.nanargmax(r2_np))
+                    pval_beta, a_hat, b_hat = (np.nan, np.nan, np.nan)
+                stop_pval = float(pval_beta)
+                if not np.isfinite(stop_pval):
+                    stop_pval = pval_perm
+                pval_nominal = float(get_t_pval(tval, dof))
+                num_var = int(G_resid.shape[0])
+                g_sel = G_t[ix].contiguous()
+                s = g_sel.sum()
+                n2 = 2.0 * g_sel.numel()
+                af = (s / n2).item()
+                gt_half = (g_sel > 0.5)
+                sum_gt_half = g_sel[gt_half].sum()
+                if af <= 0.5:
+                    ma_samples = int(gt_half.sum().item())
+                    ma_count = float(sum_gt_half.item())
+                else:
+                    ma_samples = int((g_sel < 1.5).sum().item())
+                    ma_count = float(n2 - sum_gt_half.item())
 
-            # Stats for the selected variant
-            beta = float(betas[ix, 0].detach().cpu().numpy())
-            se = float(ses[ix, 0].detach().cpu().numpy())
-            tval = float(t_g[ix].detach().cpu().numpy())
-            r2_nom = float(r2_np[ix])
-
-            r2_perm_np = r2_perm.detach().cpu().numpy()
-            pval_perm = float((np.sum(r2_perm_np >= r2_nom) + 1) / (r2_perm_np.size + 1))
-            pval_beta, a_hat, b_hat = (beta_approx_pval(r2_perm_np, r2_nom) if beta_approx
-                                       else (np.nan, np.nan, np.nan))
-            stop_pval = float(pval_beta)
-            if not np.isfinite(stop_pval):
-                stop_pval = pval_perm
-            pval_nominal = float(get_t_pval(tval, dof))
-
-            # Stop if not significant under threshold
             if stop_pval > signif_threshold:
                 break
 
@@ -242,7 +288,6 @@ def _run_independent_core(
             end_pos = ig.phenotype_end[pid]
             start_distance = int(var_pos - start_pos)
             end_distance = int(var_pos - end_pos)
-            num_var = int(G_resid.shape[0])
             forward_records.append({
                 "phenotype_id": pid,
                 "variant_id": var_id,
@@ -259,13 +304,12 @@ def _run_independent_core(
                 "pval_beta": float(pval_beta),
                 "beta_shape1": float(a_hat),
                 "beta_shape2": float(b_hat),
-                "af": float(af_t[ix].detach().cpu().numpy()),
-                "ma_samples": int(ma_samples_t[ix].detach().cpu().numpy()),
-                "ma_count": float(ma_count_t[ix].detach().cpu().numpy()),
+                "af": af,
+                "ma_samples": ma_samples,
+                "ma_count": ma_count,
                 "dof": int(dof),
             })
 
-            # add dosage covariate for next round
             if var_id in var_in_frame and var_id in ig.genotype_df.index and var_id not in dosage_dict:
                 dosage_dict[var_id] = torch.as_tensor(
                     dosage_vector_for_covariate(
@@ -281,62 +325,86 @@ def _run_independent_core(
         if not forward_records:
             continue
 
-        # Backward pass
         if len(forward_records) > 1:
             kept_records: list[dict[str, object]] = []
             selected = [rec["variant_id"] for rec in forward_records]
             for rk, drop_vid in enumerate(selected, start=1):
                 kept = [v for v in selected if v != drop_vid]
-                rez_aug = None
                 extras = [dosage_dict[v] for v in kept]
-            if covariates_base_t is not None or extras:
-                components = []
-                if covariates_base_t is not None:
-                    components.append(covariates_base_t)
-                if extras:
-                    components.append(torch.stack(extras, dim=1))
-                C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
-                rez_aug = Residualizer(C_aug_t)
-                y_resid, G_resid, H_resid = residualize_batch(y_t, G_t, H_t, rez_aug, center=True, group=False)
-
-                k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
-                betas, ses, tstats, r2_perm = compute_perm_r2_max(
-                    y_resid=y_resid,
-                    G_resid=G_resid,
-                    H_resid=H_resid,
-                    k_eff=k_eff,
-                    perm_ix=perm_ix_pid,
-                    device=device,
-                    perm_chunk=perm_chunk,
-                    return_nominal=True,
-                )
-                p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-                dof = max(int(n) - int(k_eff) - int(p_pred), 1)
-                t_g = tstats[:, 0]
-                r2_np = (t_g.double().pow(2) / (t_g.double().pow(2) + dof)).detach().cpu().numpy()
-                r2_max = np.nanmax(r2_np)
-                if random_tiebreak:
-                    ties = np.flatnonzero(np.isclose(r2_np, r2_max, atol=1e-12))
-                    if gen is None:
-                        choice = int(torch.randint(0, len(ties), (1,)).item())
+                rez_aug = None
+                with torch.no_grad():
+                    if covariates_base_t is not None or extras:
+                        components = []
+                        if covariates_base_t is not None:
+                            components.append(covariates_base_t)
+                        if extras:
+                            components.append(torch.stack(extras, dim=1))
+                        C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
+                        rez_aug = Residualizer(C_aug_t)
+                    y_resid, G_resid, H_resid = residualize_batch(
+                        y_t, G_t, H_t, rez_aug, center=True, group=False
+                    )
+                    k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
+                    betas, ses, tstats, r2_perm = compute_perm_r2_max(
+                        y_resid=y_resid,
+                        G_resid=G_resid,
+                        H_resid=H_resid,
+                        k_eff=k_eff,
+                        perm_ix=perm_ix_pid,
+                        device=device,
+                        perm_chunk=perm_chunk_local,
+                        return_nominal=True,
+                    )
+                    p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
+                    dof = max(int(n) - int(k_eff) - int(p_pred), 1)
+                    t_g = tstats[:, 0]
+                    t2 = t_g * t_g
+                    r2_nominal_vec = t2 / (t2 + float(dof))
+                    r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
+                    ix = int(ix_t.item())
+                    if random_tiebreak:
+                        ties = torch.nonzero(
+                            torch.isclose(r2_nominal_vec, r2_max_t, atol=1e-12),
+                            as_tuple=True,
+                        )[0]
+                        if ties.numel() > 1:
+                            if gen is None:
+                                choice_tensor = torch.randint(0, ties.numel(), (1,), device=ties.device)
+                            else:
+                                choice_tensor = torch.randint(
+                                    0, ties.numel(), (1,), device=ties.device, generator=gen
+                                )
+                            ix = int(ties[int(choice_tensor.item())].item())
+                            r2_max_t = r2_nominal_vec[ix]
+                    beta = float(betas[ix, 0].item())
+                    se = float(ses[ix, 0].item())
+                    tval = float(t_g[ix].item())
+                    r2_nom = float(r2_max_t.item())
+                    pval_perm = (
+                        (r2_perm >= r2_max_t).sum().add_(1).float() / (r2_perm.numel() + 1)
+                    ).item()
+                    r2_perm_np = r2_perm.detach().cpu().numpy()
+                    if beta_approx:
+                        pval_beta, a_hat, b_hat = beta_approx_pval(r2_perm_np, r2_nom)
                     else:
-                        choice = int(torch.randint(0, len(ties), (1,), generator=gen).item())
-                    ix = int(ties[choice])
-                else:
-                    ix = int(np.nanargmax(r2_np))
-
-                beta = float(betas[ix, 0].detach().cpu().numpy())
-                se = float(ses[ix, 0].detach().cpu().numpy())
-                tval = float(t_g[ix].detach().cpu().numpy())
-                r2_nom = float(r2_np[ix])
-
-                r2_perm_np = r2_perm.detach().cpu().numpy()
-                pval_perm = float((np.sum(r2_perm_np >= r2_nom) + 1) / (r2_perm_np.size + 1))
-                pval_beta, a_hat, b_hat = (beta_approx_pval(r2_perm_np, r2_nom) if beta_approx
-                                           else (np.nan, np.nan, np.nan))
-                stop_pval = float(pval_beta)
-                if not np.isfinite(stop_pval):
-                    stop_pval = pval_perm
+                        pval_beta, a_hat, b_hat = (np.nan, np.nan, np.nan)
+                    stop_pval = float(pval_beta)
+                    if not np.isfinite(stop_pval):
+                        stop_pval = pval_perm
+                    pval_nominal = float(get_t_pval(tval, dof))
+                    num_var = int(G_resid.shape[0])
+                    g_sel = G_t[ix].contiguous()
+                    s = g_sel.sum()
+                    n2 = 2.0 * g_sel.numel()
+                    af = (s / n2).item()
+                    gt_half = (g_sel > 0.5)
+                    sum_gt_half = g_sel[gt_half].sum()
+                    if af <= 0.5:
+                        ma_samples = int(gt_half.sum().item())
+                        ma_count = float(sum_gt_half.item())
+                    else:
+                        ma_samples = int((g_sel < 1.5).sum().item())
+                        ma_count = float(n2 - sum_gt_half.item())
 
                 if stop_pval <= signif_threshold:
                     var_id = idx_to_id[v_idx[ix]]
@@ -349,19 +417,19 @@ def _run_independent_core(
                         "pos": var_pos,
                         "start_distance": int(var_pos - start_pos),
                         "end_distance": int(var_pos - end_pos),
-                        "num_var": int(G_resid.shape[0]),
+                        "num_var": num_var,
                         "beta": beta,
                         "se": se,
                         "tstat": tval,
                         "r2_nominal": r2_nom,
-                        "pval_nominal": float(get_t_pval(tval, dof)),
+                        "pval_nominal": pval_nominal,
                         "pval_perm": pval_perm,
                         "pval_beta": float(pval_beta),
                         "beta_shape1": float(a_hat),
                         "beta_shape2": float(b_hat),
-                        "af": float(af_t[ix].detach().cpu().numpy()),
-                        "ma_samples": int(ma_samples_t[ix].detach().cpu().numpy()),
-                        "ma_count": float(ma_count_t[ix].detach().cpu().numpy()),
+                        "af": af,
+                        "ma_samples": ma_samples,
+                        "ma_count": ma_count,
                         "dof": int(dof),
                         "rank": int(rk),
                     })
@@ -489,12 +557,17 @@ def _run_independent_core_group(
             if keep_mask.sum().item() == 0:
                 continue
         mask_cpu = keep_mask.detach().cpu().numpy()
-        G_t = G_imputed[keep_mask]
+        G_t = G_imputed[keep_mask].contiguous()
         v_idx = v_idx[mask_cpu]
         if H_t is not None:
             H_t = H_t[keep_mask]
             if H_t.shape[2] > 1:
                 H_t = H_t[:, :, :-1]
+            H_t = H_t.contiguous()
+
+        perm_chunk_local = _auto_perm_chunk(G_t.shape[0], nperm)
+        if perm_chunk is not None and perm_chunk > 0:
+            perm_chunk_local = min(perm_chunk_local, int(perm_chunk))
 
         n_samples = ig.phenotype_df.shape[1]
         if perm_ix_t is not None:
@@ -532,67 +605,101 @@ def _run_independent_core_group(
         forward_records.append(base_record)
 
         while True:
-            rez_aug = None
             extras = [dosage_dict[v] for v in dosage_dict]
-            if covariates_base_t is not None or extras:
-                components = []
-                if covariates_base_t is not None:
-                    components.append(covariates_base_t)
-                if extras:
-                    components.append(torch.stack(extras, dim=1))
-                C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
-                rez_aug = Residualizer(C_aug_t)
+            rez_aug = None
+            best_ix_var = -1
+            best_ix_pheno = -1
+            best_beta = best_se = best_t = None
+            best_dof = 0
+            best_r2_val = -np.inf
+            stop_pval = float("inf")
+            pval_perm = float("nan")
+            pval_beta = float("nan")
+            a_hat = float("nan")
+            b_hat = float("nan")
+            pval_nominal = float("nan")
+            num_var = 0
+            with torch.no_grad():
+                if covariates_base_t is not None or extras:
+                    components = []
+                    if covariates_base_t is not None:
+                        components.append(covariates_base_t)
+                    if extras:
+                        components.append(torch.stack(extras, dim=1))
+                    C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
+                    rez_aug = Residualizer(C_aug_t)
 
-            y_resid_list, G_resid, H_resid = residualize_batch(
-                y_stack, G_t, H_t, rez_aug, center=True, group=True
-            )
-            k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
-
-            best = dict(r2=-np.inf, ix_var=-1, ix_pheno=-1, beta=None, se=None, t=None, dof=None)
-            r2_perm_list: list[torch.Tensor] = []
-
-            for j, (pid, y_resid) in enumerate(zip(ids_list, y_resid_list)):
-                betas, ses, tstats, r2_perm_vec = compute_perm_r2_max(
-                    y_resid=y_resid,
-                    G_resid=G_resid,
-                    H_resid=H_resid,
-                    k_eff=k_eff,
-                    perm_ix=perm_ix_group,
-                    device=device,
-                    perm_chunk=perm_chunk,
-                    return_nominal=True,
+                y_resid_list, G_resid, H_resid = residualize_batch(
+                    y_stack, G_t, H_t, rez_aug, center=True, group=True
                 )
-                p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-                dof = max(int(n_samples) - int(k_eff) - int(p_pred), 1)
-                t_g = tstats[:, 0]
-                r2_nominal_vec = (t_g.double().pow(2) / (t_g.double().pow(2) + dof)).detach().cpu().numpy()
-                ix = int(np.nanargmax(r2_nominal_vec))
-                if r2_nominal_vec[ix] > best["r2"]:
-                    best.update(
-                        r2=float(r2_nominal_vec[ix]),
-                        ix_var=ix,
-                        ix_pheno=j,
-                        beta=float(betas[ix, 0].detach().cpu().numpy()),
-                        se=float(ses[ix, 0].detach().cpu().numpy()),
-                        t=float(t_g[ix].detach().cpu().numpy()),
-                        dof=int(dof),
-                    )
-                r2_perm_list.append(r2_perm_vec)
+                k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
+                num_var = int(G_resid.shape[0])
 
-            r2_perm_max = torch.stack(r2_perm_list, dim=0).max(dim=0).values.detach().cpu().numpy()
-            pval_perm = float((np.sum(r2_perm_max >= best["r2"]) + 1) / (r2_perm_max.size + 1))
-            pval_beta, a_hat, b_hat = (
-                beta_approx_pval(r2_perm_max, best["r2"]) if beta_approx else (np.nan, np.nan, np.nan)
-            )
-            stop_pval = float(pval_beta)
-            if not np.isfinite(stop_pval):
-                stop_pval = pval_perm
-            if stop_pval > signif_threshold:
+                r2_perm_list: list[torch.Tensor] = []
+                best_r2_t = torch.tensor(float("-inf"), device=G_t.device)
+
+                for j, (pid_inner, y_resid) in enumerate(zip(ids_list, y_resid_list)):
+                    betas, ses, tstats, r2_perm_vec = compute_perm_r2_max(
+                        y_resid=y_resid,
+                        G_resid=G_resid,
+                        H_resid=H_resid,
+                        k_eff=k_eff,
+                        perm_ix=perm_ix_group,
+                        device=device,
+                        perm_chunk=perm_chunk_local,
+                        return_nominal=True,
+                    )
+                    p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
+                    dof = max(int(n_samples) - int(k_eff) - int(p_pred), 1)
+                    t_g = tstats[:, 0]
+                    t2 = t_g * t_g
+                    r2_nominal_vec = t2 / (t2 + float(dof))
+                    r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
+                    ix = int(ix_t.item())
+                    if random_tiebreak:
+                        ties = torch.nonzero(
+                            torch.isclose(r2_nominal_vec, r2_max_t, atol=1e-12),
+                            as_tuple=True,
+                        )[0]
+                        if ties.numel() > 1:
+                            choice_tensor = torch.randint(0, ties.numel(), (1,), device=ties.device)
+                            ix = int(ties[int(choice_tensor.item())].item())
+                            r2_max_t = r2_nominal_vec[ix]
+                    if r2_max_t > best_r2_t:
+                        best_r2_t = r2_max_t
+                        best_r2_val = float(r2_max_t.item())
+                        best_ix_var = ix
+                        best_ix_pheno = j
+                        best_beta = float(betas[ix, 0].item())
+                        best_se = float(ses[ix, 0].item())
+                        best_t = float(t_g[ix].item())
+                        best_dof = int(dof)
+                    r2_perm_list.append(r2_perm_vec)
+
+                if best_ix_var >= 0:
+                    r2_perm_max = torch.stack(r2_perm_list, dim=0).max(dim=0).values
+                    pval_perm = (
+                        (r2_perm_max >= best_r2_t).sum().add_(1).float() / (r2_perm_max.numel() + 1)
+                    ).item()
+                    r2_perm_np = r2_perm_max.detach().cpu().numpy()
+                    if beta_approx:
+                        pval_beta, a_hat, b_hat = beta_approx_pval(r2_perm_np, best_r2_val)
+                    else:
+                        pval_beta, a_hat, b_hat = (np.nan, np.nan, np.nan)
+                    if np.isfinite(pval_beta):
+                        stop_pval = float(pval_beta)
+                    else:
+                        stop_pval = pval_perm
+                    pval_nominal = float(get_t_pval(best_t, best_dof))
+                else:
+                    stop_pval = float("inf")
+
+            if best_ix_var < 0 or stop_pval > signif_threshold:
                 break
 
-            pid_best = ids_list[best["ix_pheno"]]
-            var_id = idx_to_id[v_idx[best["ix_var"]]]
-            var_pos = int(pos_arr[v_idx[best["ix_var"]]])
+            pid_best = ids_list[best_ix_pheno]
+            var_id = idx_to_id[v_idx[best_ix_var]]
+            var_pos = int(pos_arr[v_idx[best_ix_var]])
             start_pos = ig.phenotype_start[pid_best]
             end_pos = ig.phenotype_end[pid_best]
 
@@ -604,17 +711,17 @@ def _run_independent_core_group(
                 "pos": var_pos,
                 "start_distance": int(var_pos - start_pos),
                 "end_distance": int(var_pos - end_pos),
-                "num_var": int(G_resid.shape[0]),
-                "beta": best["beta"],
-                "se": best["se"],
-                "tstat": best["t"],
-                "r2_nominal": best["r2"],
-                "pval_nominal": float(get_t_pval(best["t"], best["dof"])),
+                "num_var": num_var,
+                "beta": best_beta,
+                "se": best_se,
+                "tstat": best_t,
+                "r2_nominal": best_r2_val,
+                "pval_nominal": pval_nominal,
                 "pval_perm": pval_perm,
                 "pval_beta": float(pval_beta),
                 "beta_shape1": float(a_hat),
                 "beta_shape2": float(b_hat),
-                "dof": int(best["dof"]),
+                "dof": int(best_dof),
             })
 
             if var_id not in dosage_dict and var_id in var_in_frame and var_id in geno_has_variant:
@@ -639,59 +746,97 @@ def _run_independent_core_group(
             for rk, drop_vid in enumerate(selected, start=1):
                 kept = [v for v in selected if v != drop_vid]
 
-                rez_aug = None
                 extras = [dosage_dict[v] for v in kept]
-                if covariates_base_t is not None or extras:
-                    components = []
-                    if covariates_base_t is not None:
-                        components.append(covariates_base_t)
-                    if extras:
-                        components.append(torch.stack(extras, dim=1))
-                    C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
-                    rez_aug = Residualizer(C_aug_t)
+                rez_aug = None
+                best_ix_var = -1
+                best_ix_pheno = -1
+                best_beta = best_se = best_t = None
+                best_dof = 0
+                best_r2_val = -np.inf
+                pval_perm = float("nan")
+                pval_beta = float("nan")
+                a_hat = float("nan")
+                b_hat = float("nan")
+                pval_nominal = float("nan")
+                num_var = 0
+                stop_pval = float("inf")
+                with torch.no_grad():
+                    if covariates_base_t is not None or extras:
+                        components = []
+                        if covariates_base_t is not None:
+                            components.append(covariates_base_t)
+                        if extras:
+                            components.append(torch.stack(extras, dim=1))
+                        C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
+                        rez_aug = Residualizer(C_aug_t)
 
-                y_resid_list, G_resid, H_resid = residualize_batch(
-                    y_stack, G_t, H_t, rez_aug, center=True, group=True
-                )
-                k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
-
-                best = dict(r2=-np.inf, ix_var=-1, ix_pheno=-1, beta=None, se=None, t=None, dof=None)
-                r2_perm_list = []
-
-                for j, (pid, y_resid) in enumerate(zip(ids_list, y_resid_list)):
-                    betas, ses, tstats, r2_perm_vec = compute_perm_r2_max(
-                        y_resid=y_resid, G_resid=G_resid, H_resid=H_resid,
-                        k_eff=k_eff, perm_ix=perm_ix_group, device=device,
-                        perm_chunk=perm_chunk, return_nominal=True,
+                    y_resid_list, G_resid, H_resid = residualize_batch(
+                        y_stack, G_t, H_t, rez_aug, center=True, group=True
                     )
-                    p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-                    dof = max(int(n_samples) - int(k_eff) - int(p_pred), 1)
-                    t_g = tstats[:, 0]
-                    r2_np = (t_g.double().pow(2) / (t_g.double().pow(2) + dof)).detach().cpu().numpy()
-                    ix = int(np.nanargmax(r2_np))
-                    if r2_np[ix] > best["r2"]:
-                        best.update(
-                            r2=float(r2_np[ix]), ix_var=ix, ix_pheno=j,
-                            beta=float(betas[ix, 0].detach().cpu().numpy()),
-                            se=float(ses[ix, 0].detach().cpu().numpy()),
-                            t=float(t_g[ix].detach().cpu().numpy()),
-                            dof=int(dof),
+                    k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
+                    num_var = int(G_resid.shape[0])
+
+                    r2_perm_list: list[torch.Tensor] = []
+                    best_r2_t = torch.tensor(float("-inf"), device=G_t.device)
+
+                    for j, (pid_inner, y_resid) in enumerate(zip(ids_list, y_resid_list)):
+                        betas, ses, tstats, r2_perm_vec = compute_perm_r2_max(
+                            y_resid=y_resid,
+                            G_resid=G_resid,
+                            H_resid=H_resid,
+                            k_eff=k_eff,
+                            perm_ix=perm_ix_group,
+                            device=device,
+                            perm_chunk=perm_chunk_local,
+                            return_nominal=True,
                         )
-                    r2_perm_list.append(r2_perm_vec)
+                        p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
+                        dof = max(int(n_samples) - int(k_eff) - int(p_pred), 1)
+                        t_g = tstats[:, 0]
+                        t2 = t_g * t_g
+                        r2_nominal_vec = t2 / (t2 + float(dof))
+                        r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
+                        ix = int(ix_t.item())
+                        if random_tiebreak:
+                            ties = torch.nonzero(
+                                torch.isclose(r2_nominal_vec, r2_max_t, atol=1e-12),
+                                as_tuple=True,
+                            )[0]
+                            if ties.numel() > 1:
+                                choice_tensor = torch.randint(0, ties.numel(), (1,), device=ties.device)
+                                ix = int(ties[int(choice_tensor.item())].item())
+                                r2_max_t = r2_nominal_vec[ix]
+                        if r2_max_t > best_r2_t:
+                            best_r2_t = r2_max_t
+                            best_r2_val = float(r2_max_t.item())
+                            best_ix_var = ix
+                            best_ix_pheno = j
+                            best_beta = float(betas[ix, 0].item())
+                            best_se = float(ses[ix, 0].item())
+                            best_t = float(t_g[ix].item())
+                            best_dof = int(dof)
+                        r2_perm_list.append(r2_perm_vec)
 
-                r2_perm_max = torch.stack(r2_perm_list, dim=0).max(dim=0).values.detach().cpu().numpy()
-                pval_perm = float((np.sum(r2_perm_max >= best["r2"]) + 1) / (r2_perm_max.size + 1))
-                pval_beta, a_hat, b_hat = (
-                    beta_approx_pval(r2_perm_max, best["r2"]) if beta_approx else (np.nan, np.nan, np.nan)
-                )
-                stop_pval = float(pval_beta)
-                if not np.isfinite(stop_pval):
-                    stop_pval = pval_perm
+                    if best_ix_var >= 0:
+                        r2_perm_max = torch.stack(r2_perm_list, dim=0).max(dim=0).values
+                        pval_perm = (
+                            (r2_perm_max >= best_r2_t).sum().add_(1).float() / (r2_perm_max.numel() + 1)
+                        ).item()
+                        r2_perm_np = r2_perm_max.detach().cpu().numpy()
+                        if beta_approx:
+                            pval_beta, a_hat, b_hat = beta_approx_pval(r2_perm_np, best_r2_val)
+                        else:
+                            pval_beta, a_hat, b_hat = (np.nan, np.nan, np.nan)
+                        if np.isfinite(pval_beta):
+                            stop_pval = float(pval_beta)
+                        else:
+                            stop_pval = pval_perm
+                        pval_nominal = float(get_t_pval(best_t, best_dof))
 
-                if stop_pval <= signif_threshold:
-                    pid_best = ids_list[best["ix_pheno"]]
-                    var_id = idx_to_id[v_idx[best["ix_var"]]]
-                    var_pos = int(pos_arr[v_idx[best["ix_var"]]])
+                if best_ix_var >= 0 and stop_pval <= signif_threshold:
+                    pid_best = ids_list[best_ix_pheno]
+                    var_id = idx_to_id[v_idx[best_ix_var]]
+                    var_pos = int(pos_arr[v_idx[best_ix_var]])
                     start_pos = ig.phenotype_start[pid_best]
                     end_pos = ig.phenotype_end[pid_best]
 
@@ -703,17 +848,17 @@ def _run_independent_core_group(
                         "pos": var_pos,
                         "start_distance": int(var_pos - start_pos),
                         "end_distance": int(var_pos - end_pos),
-                        "num_var": int(G_resid.shape[0]),
-                        "beta": best["beta"],
-                        "se": best["se"],
-                        "tstat": best["t"],
-                        "r2_nominal": best["r2"],
-                        "pval_nominal": float(get_t_pval(best["t"], best["dof"])),
+                        "num_var": num_var,
+                        "beta": best_beta,
+                        "se": best_se,
+                        "tstat": best_t,
+                        "r2_nominal": best_r2_val,
+                        "pval_nominal": pval_nominal,
                         "pval_perm": pval_perm,
                         "pval_beta": float(pval_beta),
                         "beta_shape1": float(a_hat),
                         "beta_shape2": float(b_hat),
-                        "dof": int(best["dof"]),
+                        "dof": int(best_dof),
                         "rank": int(rk),
                     })
 
