@@ -1,5 +1,7 @@
 import torch
 
+from ..regression_kernels import run_batch_regression_with_permutations
+
 __all__ = [
     "make_perm_ix",
     "roll_for_key",
