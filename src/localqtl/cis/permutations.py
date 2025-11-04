@@ -1,6 +1,4 @@
-import time
-
-import torch
+import torch, time
 import numpy as np
 import pandas as pd
 from typing import Optional
@@ -11,6 +9,7 @@ except Exception:
     pass
 
 from ..utils import SimpleLogger, subseed
+from .._torch_utils import to_device_tensor
 from ..stats import beta_approx_pval, get_t_pval
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from ..preproc import impute_mean_and_filter, allele_stats, filter_by_maf
@@ -18,90 +17,17 @@ from ..regression_kernels import (
     run_batch_regression,
     run_batch_regression_with_permutations
 )
+from ._permute import make_perm_ix, roll_for_key
+from ._buffer import (
+    allocate_result_buffers,
+    ensure_capacity, write_row,
+    buffers_to_dataframe
+)
 from .common import residualize_matrix_with_covariates, residualize_batch
 
 __all__ = [
     "map_permutations",
 ]
-
-
-@torch.no_grad()
-def _make_perm_ix(n_samples: int, nperm: int, device: str, seed: int | None) -> torch.Tensor:
-    """
-    Build a global permutation index tensor of shape (nperm, n_samples) on `device`.
-    Reuse this across all phenotypes. Deterministic if seed is set.
-    """
-    g = torch.Generator(device=device)
-    if seed is not None:
-        g.manual_seed(seed)
-    return torch.stack(
-        [torch.randperm(n_samples, generator=g, device=device) for _ in range(nperm)],
-        dim=0
-    )
-
-
-def _roll_for_pid(perm_ix: torch.Tensor, pid: str | int, seed: int | None) -> torch.Tensor:
-    """
-    Derive a deterministic row-rotation per phenotype/group to decorrelate
-    permutations without regenerating them.
-    """
-    if seed is None:
-        return perm_ix
-    shift = abs(hash((seed, str(pid)))) % perm_ix.shape[0]
-    return perm_ix.roll(shifts=int(shift), dims=0)
-
-
-def _to_device_float32(array_like, device: str) -> torch.Tensor:
-    if isinstance(array_like, torch.Tensor):
-        tensor = array_like
-        if tensor.device.type != device:
-            tensor = tensor.to(device=device, dtype=torch.float32, non_blocking=True)
-        elif tensor.dtype != torch.float32:
-            tensor = tensor.to(dtype=torch.float32)
-        return tensor
-    np_arr = np.asarray(array_like, dtype=np.float32)
-    return torch.from_numpy(np_arr).to(device=device, non_blocking=True)
-
-
-def _allocate_result_buffers(
-        columns: list[str], dtype_map: dict[str, type | np.dtype], target_rows: int) -> dict[str, np.ndarray]:
-    target = max(int(target_rows), 1)
-    buffers: dict[str, np.ndarray] = {}
-    for name in columns:
-        dtype = dtype_map.get(name, np.float32)
-        buffers[name] = np.empty(target, dtype=dtype)
-    return buffers
-
-
-def _ensure_capacity(buffers: dict[str, np.ndarray], cursor: int, additional: int) -> dict[str, np.ndarray]:
-    required = cursor + int(additional)
-    current = next(iter(buffers.values())).shape[0] if buffers else 0
-    if required <= current:
-        return buffers
-    new_size = max(required, current * 2 if current else 1)
-    for key, arr in buffers.items():
-        new_arr = np.empty(new_size, dtype=arr.dtype)
-        new_arr[:cursor] = arr[:cursor]
-        buffers[key] = new_arr
-    return buffers
-
-
-def _write_row(buffers: dict[str, np.ndarray], idx: int, row: dict[str, object]) -> None:
-    for key, arr in buffers.items():
-        value = row.get(key)
-        if arr.dtype == object:
-            arr[idx] = None if value is None else value
-        elif np.issubdtype(arr.dtype, np.integer):
-            arr[idx] = int(value) if value is not None else 0
-        else:
-            arr[idx] = np.nan if value is None else float(value)
-
-
-def _buffers_to_dataframe(columns: list[str], buffers: dict[str, np.ndarray], n_rows: int) -> pd.DataFrame:
-    n = int(n_rows)
-    data = {col: buffers[col][:n] for col in columns if col in buffers}
-    return pd.DataFrame(data, columns=columns)
-
 
 def _estimate_rows(ig, chrom: str | None, grouped: bool = False) -> int:
     if chrom is None:
@@ -113,6 +39,7 @@ def _estimate_rows(ig, chrom: str | None, grouped: bool = False) -> int:
         group_s = ig.group_s.loc[ig.phenotype_pos_df.index]
         return int(pd.Index(group_s[mask].dropna().unique()).shape[0])
     return int(mask.sum())
+
 
 def _run_permutation_core(
         ig, variant_df, rez, nperm: int, device: str, beta_approx: bool = True,
@@ -151,7 +78,7 @@ def _run_permutation_core(
         "ma_count": np.float32,
         "dof": np.int32,
     }
-    buffers = _allocate_result_buffers(expected_columns, dtype_map, _estimate_rows(ig, chrom))
+    buffers = allocate_result_buffers(expected_columns, dtype_map, _estimate_rows(ig, chrom))
     cursor = 0
     processed = 0
     if nperm is None or nperm <= 0:
@@ -179,12 +106,12 @@ def _run_permutation_core(
             raise ValueError("Group mode not supported in _run_permutation_core.")
 
         # Tensors
-        y_t = _to_device_float32(p, device)
-        G_t = _to_device_float32(G_block, device)
+        y_t = to_device_tensor(p, device, dtype=torch.float32)
+        G_t = to_device_tensor(G_block, device, dtype=torch.float32)
         if H_block is None:
             H_t = None
         else:
-            H_t = _to_device_float32(H_block, device)
+            H_t = to_device_tensor(H_block, device, dtype=torch.float32)
 
         # Impute and drop monomorphic
         G_imputed, keep_mask, _ = impute_mean_and_filter(G_t)
@@ -237,10 +164,10 @@ def _run_permutation_core(
 
         # Build permutation indices for phenotype
         if perm_ix_t is not None:
-            perm_ix_pid = _roll_for_pid(perm_ix_t, pid, seed)
+            perm_ix_pid = roll_for_key(perm_ix_t, pid, seed)
         else:
             local_seed = subseed(seed, pid) if seed is not None else None
-            perm_ix_pid = _make_perm_ix(y_resid_t.shape[0], nperm, device, local_seed)
+            perm_ix_pid = make_perm_ix(y_resid_t.shape[0], nperm, device, local_seed)
 
         nperm_local = int(perm_ix_pid.shape[0])
         r2_perm_max = torch.full((nperm_local,), -float("inf"), device=device, dtype=torch.float32)
@@ -282,8 +209,8 @@ def _run_permutation_core(
         end_distance = int(var_pos - end_pos)
         num_var = int(G_resid.shape[0])
 
-        buffers = _ensure_capacity(buffers, cursor, 1)
-        _write_row(
+        buffers = ensure_capacity(buffers, cursor, 1)
+        write_row(
             buffers, cursor,
             {
                 "phenotype_id": pid,
@@ -319,7 +246,7 @@ def _run_permutation_core(
                 f"      processed {processed}/{total_phenotypes} phenotypes on {chrom_label}"
             )
 
-    return _buffers_to_dataframe(expected_columns, buffers, cursor)
+    return buffers_to_dataframe(expected_columns, buffers, cursor)
 
 
 def _run_permutation_core_group(
@@ -366,7 +293,8 @@ def _run_permutation_core_group(
         "ma_count": np.float32,
         "dof": np.int32,
     }
-    buffers = _allocate_result_buffers(expected_columns, dtype_map, _estimate_rows(ig, chrom, grouped=True))
+    buffers = allocate_result_buffers(expected_columns, dtype_map,
+                                      _estimate_rows(ig, chrom, grouped=True))
     cursor = 0
     processed = 0
     if total_groups is None:
@@ -388,11 +316,11 @@ def _run_permutation_core_group(
             raise ValueError("Unexpected grouped batch shape.")
 
         # Tensors for window
-        G_t = _to_device_float32(G_block, device)
+        G_t = to_device_tensor(G_block, device, dtype=torch.float32)
         if H_block is None:
             H_t = None
         else:
-            H_t = _to_device_float32(H_block, device)
+            H_t = to_device_tensor(H_block, device, dtype=torch.float32)
 
         # Impute + drop monomorphic
         G_imputed, keep_mask, _ = impute_mean_and_filter(G_t)
@@ -456,10 +384,10 @@ def _run_permutation_core_group(
         # Evaluate each phenotype: t-stats -> partial R²; keep the global best (variant, phenotype)
         best = dict(r2=-np.inf, ix_var=-1, ix_pheno=-1, beta=None, se=None, t=None)
         if perm_ix_t is not None:
-            perm_ix_group = _roll_for_pid(perm_ix_t, group_id, seed)
+            perm_ix_group = roll_for_key(perm_ix_t, group_id, seed)
         else:
             local_seed = subseed(seed, group_id) if seed is not None else None
-            perm_ix_group = _make_perm_ix(n, nperm, device, local_seed)
+            perm_ix_group = make_perm_ix(n, nperm, device, local_seed)
 
         nperm_local = int(perm_ix_group.shape[0])
         r2_perm_global_max = torch.full((nperm_local,), -float("inf"), device=device, dtype=torch.float32)
@@ -519,8 +447,8 @@ def _run_permutation_core_group(
         else:
             pval_beta, a_hat, b_hat = np.nan, np.nan, np.nan
 
-        buffers = _ensure_capacity(buffers, cursor, 1)
-        _write_row(
+        buffers = ensure_capacity(buffers, cursor, 1)
+        write_row(
             buffers, cursor,
             {
                 "group_id": group_id,
@@ -558,7 +486,7 @@ def _run_permutation_core_group(
                 f"      processed {processed}/{total_groups} groups on {chrom_label}"
             )
 
-    return _buffers_to_dataframe(expected_columns, buffers, cursor)
+    return buffers_to_dataframe(expected_columns, buffers, cursor)
 
 
 def map_permutations(
@@ -624,7 +552,7 @@ def map_permutations(
     )
 
     # Residualize phenotypes once (after generator filters constants/missing)
-    Y = _to_device_float32(ig.phenotype_df.values, device)
+    Y = to_device_tensor(ig.phenotype_df.values, device, dtype=torch.float32)
     with logger.time_block("Residualizing phenotypes", sync=sync):
         Y_resid, rez = residualize_matrix_with_covariates(Y, covariates_df, device)
 
@@ -632,7 +560,7 @@ def map_permutations(
                                    columns=ig.phenotype_df.columns)
 
     n_samples = int(ig.phenotype_df.shape[1])
-    perm_ix_t = _make_perm_ix(n_samples, nperm, device, seed)
+    perm_ix_t = make_perm_ix(n_samples, nperm, device, seed)
     perm_chunk = 2048
 
     # Core either grouped or single-phenotype
