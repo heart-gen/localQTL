@@ -68,20 +68,19 @@ def _run_independent_core(
 ) -> pd.DataFrame:
     """Forward–backward independent mapping for ungrouped phenotypes."""
     expected_columns = [
-        "phenotype_id", "variant_id", "pos", "start_distance", "end_distance",
-        "num_var", "beta", "se", "tstat", "r2_nominal", "pval_nominal",
-        "pval_perm", "pval_beta", "beta_shape1", "beta_shape2", "af",
-        "ma_samples", "ma_count", "dof", "rank",
+        "phenotype_id", "variant_id", "start_distance", "end_distance",
+        "num_var", "slope", "slope_se", "tstat", "r2_nominal", "pval_nominal",
+        "pval_perm", "pval_beta", "beta_shape1", "beta_shape2", "ma_samples",
+        "ma_count", "af", "true_dof", "pval_true_dof", "rank",
     ]
     dtype_map = {
         "phenotype_id": object,
         "variant_id": object,
-        "pos": np.int32,
         "start_distance": np.int32,
         "end_distance": np.int32,
         "num_var": np.int32,
-        "beta": np.float32,
-        "se": np.float32,
+        "slope": np.float32,
+        "slope_se": np.float32,
         "tstat": np.float32,
         "r2_nominal": np.float32,
         "pval_nominal": np.float32,
@@ -89,10 +88,11 @@ def _run_independent_core(
         "pval_beta": np.float32,
         "beta_shape1": np.float32,
         "beta_shape2": np.float32,
-        "af": np.float32,
         "ma_samples": np.int32,
         "ma_count": np.float32,
-        "dof": np.int32,
+        "af": np.float32,
+        "true_dof": np.int32,
+        "pval_true_dof": np.int32,
         "rank": np.int32,
     }
     buffers = allocate_result_buffers(expected_columns, dtype_map, signif_seed_df.shape[0])
@@ -258,9 +258,11 @@ def _run_independent_core(
                 ).item()
                 r2_perm_np = r2_perm.detach().cpu().numpy()
                 if beta_approx:
-                    pval_beta, a_hat, b_hat = beta_approx_pval(r2_perm_np, r2_nom)
+                    pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
+                        r2_perm_np, r2_nom, dof_init=dof
+                    )
                 else:
-                    pval_beta, a_hat, b_hat = (np.nan, np.nan, np.nan)
+                    pval_beta = a_hat = b_hat = true_dof = p_true =  np.nan
                 stop_pval = float(pval_beta)
                 if not np.isfinite(stop_pval):
                     stop_pval = pval_perm
@@ -291,12 +293,11 @@ def _run_independent_core(
             forward_records.append({
                 "phenotype_id": pid,
                 "variant_id": var_id,
-                "pos": var_pos,
                 "start_distance": start_distance,
                 "end_distance": end_distance,
                 "num_var": num_var,
-                "beta": beta,
-                "se": se,
+                "slope": beta,
+                "slope_se": se,
                 "tstat": tval,
                 "r2_nominal": r2_nom,
                 "pval_nominal": pval_nominal,
@@ -307,7 +308,8 @@ def _run_independent_core(
                 "af": af,
                 "ma_samples": ma_samples,
                 "ma_count": ma_count,
-                "dof": int(dof),
+                "true_dof": int(dof),
+                "pval_true_dof": p_true,
             })
 
             if var_id in var_in_frame and var_id in ig.genotype_df.index and var_id not in dosage_dict:
@@ -385,9 +387,11 @@ def _run_independent_core(
                     ).item()
                     r2_perm_np = r2_perm.detach().cpu().numpy()
                     if beta_approx:
-                        pval_beta, a_hat, b_hat = beta_approx_pval(r2_perm_np, r2_nom)
+                        pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
+                            r2_perm_np, r2_nom, dof_init=dof
+                        )
                     else:
-                        pval_beta, a_hat, b_hat = (np.nan, np.nan, np.nan)
+                        pval_beta = a_hat = b_hat = true_dof = p_true =  np.nan
                     stop_pval = float(pval_beta)
                     if not np.isfinite(stop_pval):
                         stop_pval = pval_perm
@@ -414,12 +418,11 @@ def _run_independent_core(
                     kept_records.append({
                         "phenotype_id": pid,
                         "variant_id": var_id,
-                        "pos": var_pos,
                         "start_distance": int(var_pos - start_pos),
                         "end_distance": int(var_pos - end_pos),
                         "num_var": num_var,
-                        "beta": beta,
-                        "se": se,
+                        "slope": beta,
+                        "slope_se": se,
                         "tstat": tval,
                         "r2_nominal": r2_nom,
                         "pval_nominal": pval_nominal,
@@ -430,7 +433,8 @@ def _run_independent_core(
                         "af": af,
                         "ma_samples": ma_samples,
                         "ma_count": ma_count,
-                        "dof": int(dof),
+                        "true_dof": int(dof),
+                        "pval_true_dof": p_true,
                         "rank": int(rk),
                     })
 
@@ -473,22 +477,21 @@ def _run_independent_core_group(
 ) -> pd.DataFrame:
     """Forward-backward independent mapping for grouped phenotypes."""
     expected_columns = [
-        "group_id", "group_size", "phenotype_id", "variant_id", "pos",
-        "start_distance", "end_distance", "num_var", "beta", "se", "tstat",
-        "r2_nominal", "pval_nominal", "pval_perm", "pval_beta", "beta_shape1",
-        "beta_shape2", "dof", "rank",
+        "group_id", "group_size", "phenotype_id", "variant_id", "start_distance",
+        "end_distance", "num_var", "slope", "slope_se", "tstat", "r2_nominal",
+        "pval_nominal", "pval_perm", "pval_beta", "beta_shape1", "beta_shape2",
+        "ma_samples", "ma_count", "af", "true_dof", "pval_true_dof", "rank",
     ]
     dtype_map = {
         "group_id": object,
         "group_size": np.int32,
         "phenotype_id": object,
         "variant_id": object,
-        "pos": np.int32,
         "start_distance": np.int32,
         "end_distance": np.int32,
         "num_var": np.int32,
-        "beta": np.float32,
-        "se": np.float32,
+        "slope": np.float32,
+        "slope_se": np.float32,
         "tstat": np.float32,
         "r2_nominal": np.float32,
         "pval_nominal": np.float32,
@@ -496,7 +499,11 @@ def _run_independent_core_group(
         "pval_beta": np.float32,
         "beta_shape1": np.float32,
         "beta_shape2": np.float32,
-        "dof": np.int32,
+        "ma_samples": np.int32,
+        "ma_count": np.float32,
+        "af": np.float32,
+        "true_dof": np.int32,
+        "pval_true_dof": np.int32,
         "rank": np.int32,
     }
     buffers = allocate_result_buffers(expected_columns, dtype_map, seed_by_group_df.shape[0])
@@ -683,9 +690,11 @@ def _run_independent_core_group(
                     ).item()
                     r2_perm_np = r2_perm_max.detach().cpu().numpy()
                     if beta_approx:
-                        pval_beta, a_hat, b_hat = beta_approx_pval(r2_perm_np, best_r2_val)
+                        pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
+                            r2_perm_np, best_r2_val, dof_init=odf
+                        )
                     else:
-                        pval_beta, a_hat, b_hat = (np.nan, np.nan, np.nan)
+                        pval_beta = a_hat = b_hat = true_dof = p_true =  np.nan
                     if np.isfinite(pval_beta):
                         stop_pval = float(pval_beta)
                     else:
@@ -708,12 +717,11 @@ def _run_independent_core_group(
                 "group_size": len(ids_list),
                 "phenotype_id": pid_best,
                 "variant_id": var_id,
-                "pos": var_pos,
                 "start_distance": int(var_pos - start_pos),
                 "end_distance": int(var_pos - end_pos),
                 "num_var": num_var,
-                "beta": best_beta,
-                "se": best_se,
+                "slope": best_beta,
+                "slope_se": best_se,
                 "tstat": best_t,
                 "r2_nominal": best_r2_val,
                 "pval_nominal": pval_nominal,
@@ -721,7 +729,8 @@ def _run_independent_core_group(
                 "pval_beta": float(pval_beta),
                 "beta_shape1": float(a_hat),
                 "beta_shape2": float(b_hat),
-                "dof": int(best_dof),
+                "true_dof": int(best_dof),
+                "pval_true_dof": p_true,
             })
 
             if var_id not in dosage_dict and var_id in var_in_frame and var_id in geno_has_variant:
@@ -824,9 +833,11 @@ def _run_independent_core_group(
                         ).item()
                         r2_perm_np = r2_perm_max.detach().cpu().numpy()
                         if beta_approx:
-                            pval_beta, a_hat, b_hat = beta_approx_pval(r2_perm_np, best_r2_val)
+                            pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
+                                r2_perm_np, best_r2_val, dof_init=dof
+                            )
                         else:
-                            pval_beta, a_hat, b_hat = (np.nan, np.nan, np.nan)
+                            pval_beta = a_hat = b_hat = true_dof = p_true =  np.nan
                         if np.isfinite(pval_beta):
                             stop_pval = float(pval_beta)
                         else:
@@ -845,12 +856,11 @@ def _run_independent_core_group(
                         "group_size": len(ids_list),
                         "phenotype_id": pid_best,
                         "variant_id": var_id,
-                        "pos": var_pos,
                         "start_distance": int(var_pos - start_pos),
                         "end_distance": int(var_pos - end_pos),
                         "num_var": num_var,
-                        "beta": best_beta,
-                        "se": best_se,
+                        "slope": best_beta,
+                        "slope_se": best_se,
                         "tstat": best_t,
                         "r2_nominal": best_r2_val,
                         "pval_nominal": pval_nominal,
@@ -858,7 +868,8 @@ def _run_independent_core_group(
                         "pval_beta": float(pval_beta),
                         "beta_shape1": float(a_hat),
                         "beta_shape2": float(b_hat),
-                        "dof": int(best_dof),
+                        "true_dof": int(best_dof),
+                        "pval_true_dof": p_true,
                         "rank": int(rk),
                     })
 

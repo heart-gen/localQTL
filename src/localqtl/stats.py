@@ -6,9 +6,11 @@ Adapted from tensorqtl:
 """
 from __future__ import annotations
 import torch
+import scipy
 import numpy as np
 import pandas as pd
 from scipy import stats
+from scipy.special import betaln
 from py_qvalue import qvalue, pi0est
 from typing import Optional, Sequence, Union
 
@@ -18,33 +20,56 @@ __all__ = [
     "t_two_sided_pval_torch",
     "nominal_pvals_tensorqtl",
     "calculate_qvalues",
+    "pval_from_corr_r2"
 ]
 
-def beta_approx_pval(r2_perm: np.ndarray, r2_true: float) -> tuple[float, float, float]:
+def pval_from_corr_r2(r2, dof, log10: bool = False):
+    r2 = np.clip(r2, 0.0, 1.0 - 1e-12)
+    t = np.sqrt(dof * r2 / np.maximum(1.0 - r2, 1e-12))
+    return get_t_pval(t, dof, log10=log10)
+
+
+def _beta_shape1_from_dof(r2_perm, dof):
+    p = pval_from_corr_r2(r2_perm, dof)
+    m, v = p.mean(), p.var()
+    return m * (m * (1.0 - m) / v - 1.0)
+
+
+def _solve_true_dof(r2_perm, dof_init, tol=1e-4):
+    f = lambda x: np.log(_beta_shape1_from_dof(r2_perm, np.exp(x)))
+    try:
+        log_dof = scipy.optimize.newton(f, np.log(dof_init), tol=tol, maxiter=50)
+        return float(np.exp(log_dof))
+    except Exception:
+        res = scipy.optimize.minimize(
+            lambda x: abs(_beta_shape1_from_dof(r2_perm, x[0]) - 1.0),
+            x0=[dof_init], method="Nelder-Mead", tol=tol,
+        )
+        return float(res.x[0])
+
+
+def _beta_mle_on_p(p):
+    m, v = p.mean(), p.var()
+    a0 = m * (m * (1.0 - m) / v - 1.0)
+    b0 = a0 * (1.0/m - 1.0)
+    def nll(ab):
+        a, b = ab
+        if a <= 0 or b <= 0: return np.inf
+        return -((a-1)*np.log(p).sum() + (b-1)*np.log(1.0-p).sum() - len(p)*betaln(a,b))
+    a,b = scipy.optimize.minimize(nll, x0=[a0, b0], method="Nelder-Mead").x
+    return float(a), float(b)
+
+
+def beta_approx_pval(r2_perm, r2_true, dof_init):
     """
-    Fit Beta(a,b) to permutation R^2 by method of moments and return:
-        (pval_beta, a_hat, b_hat).
-    Falls back to empirical tail if variance is ~0 or invalid.
+    Fit Beta(a,b) to permutation R^2 using tensorQTL method.
     """
-    r2_perm = np.asarray(r2_perm, dtype=np.float64)
-    if r2_perm.size == 0 or not np.isfinite(r2_perm).all():
-        # Degenerate input: return NA-like outputs
-        return float("nan"), float("nan"), float("nan")
-
-    mu = r2_perm.mean()
-    var = r2_perm.var(ddof=1)
-    if not np.isfinite(mu) or not np.isfinite(var) or var <= 1e-12:
-        # Use empirical tail as a safe fallback
-        p_emp = (np.sum(r2_perm >= r2_true) + 1) / (r2_perm.size + 1)
-        return float(p_emp), float("nan"), float("nan")
-
-    # Method-of-moments for Beta
-    k = mu * (1.0 - mu) / var - 1.0
-    a = max(mu * k, 1e-6)
-    b = max((1.0 - mu) * k, 1e-6)
-
-    p_beta = 1.0 - stats.beta.cdf(r2_true, a, b)
-    return float(p_beta), float(a), float(b)
+    true_dof = _solve_true_dof(r2_perm, dof_init)
+    p_perm = pval_from_corr_r2(r2_perm, true_dof)
+    a,b = _beta_mle_on_p(p_perm)
+    p_true = pval_from_corr_r2(np.array([r2_true]), true_dof)[0]
+    p_beta = stats.beta.cdf(p_true, a, b) 
+    return p_beta, a, b, true_dof, p_true
 
 
 def get_t_pval(t, df, two_tailed: bool = True, log10: bool = False):
