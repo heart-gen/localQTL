@@ -39,7 +39,8 @@ def _run_independent_core(
         device: str, maf_threshold: float = 0.0, random_tiebreak: bool = False,
         missing: float = -9.0, beta_approx: bool = True, seed: int | None = None,
         chrom: str | None = None, perm_ix_t: torch.Tensor | None = None,
-        perm_chunk: int = 2048
+        perm_chunk: int = 2048, logger: SimpleLogger | None = None,
+        total_items: int | None = None, item_label: str = "phenotypes"
 ) -> pd.DataFrame:
     """Forward–backward independent mapping for ungrouped phenotypes."""
     expected_columns = [
@@ -72,6 +73,12 @@ def _run_independent_core(
     }
     buffers = allocate_result_buffers(expected_columns, dtype_map, signif_seed_df.shape[0])
     cursor = 0
+    processed = 0
+
+    if logger is None:
+        logger = SimpleLogger(verbose=True, timestamps=True)
+    progress_interval = max(1, int(total_items) // 10) if total_items else 0
+    chrom_label = f"{chrom}" if chrom is not None else "all chromosomes"
 
     idx_to_id = variant_df.index.to_numpy()
     pos_arr = variant_df["pos"].to_numpy(np.int32)
@@ -371,6 +378,17 @@ def _run_independent_core(
             write_row(buffers, cursor, rec)
             cursor += 1
 
+        processed += 1
+        if (
+            logger.verbose
+            and total_items
+            and progress_interval
+            and (processed % progress_interval == 0 or processed == total_items)
+        ):
+            logger.write(
+                f"      processed {processed}/{total_items} {item_label} on {chrom_label}"
+            )
+
     return buffers_to_dataframe(expected_columns, buffers, cursor)
 
 
@@ -382,7 +400,8 @@ def _run_independent_core_group(
         device: str, maf_threshold: float = 0.0, random_tiebreak: bool = False,
         missing: float = -9.0, beta_approx: bool = True, seed: int | None = None,
         chrom: str | None = None, perm_ix_t: torch.Tensor | None = None,
-        perm_chunk: int = 2048
+        perm_chunk: int = 2048, logger: SimpleLogger | None = None,
+        total_items: int | None = None, item_label: str = "phenotype groups"
 ) -> pd.DataFrame:
     """Forward-backward independent mapping for grouped phenotypes."""
     expected_columns = [
@@ -414,6 +433,12 @@ def _run_independent_core_group(
     }
     buffers = allocate_result_buffers(expected_columns, dtype_map, seed_by_group_df.shape[0])
     cursor = 0
+    processed = 0
+
+    if logger is None:
+        logger = SimpleLogger(verbose=True, timestamps=True)
+    progress_interval = max(1, int(total_items) // 10) if total_items else 0
+    chrom_label = f"{chrom}" if chrom is not None else "all chromosomes"
 
     var_in_frame = set(variant_df.index)
     geno_has_variant = set(ig.genotype_df.index)
@@ -704,6 +729,17 @@ def _run_independent_core_group(
             write_row(buffers, cursor, rec)
             cursor += 1
 
+        processed += 1
+        if (
+            logger.verbose
+            and total_items
+            and progress_interval
+            and (processed % progress_interval == 0 or processed == total_items)
+        ):
+            logger.write(
+                f"      processed {processed}/{total_items} {item_label} on {chrom_label}"
+            )
+
     return buffers_to_dataframe(expected_columns, buffers, cursor)
 
 
@@ -799,7 +835,7 @@ def map_independent(
         total_items = int(valid_ids.shape[0])
         item_label = "phenotypes"
 
-        def run_core(chrom: str | None) -> pd.DataFrame:
+        def run_core(chrom: str | None, chrom_total: int | None) -> pd.DataFrame:
             return _run_independent_core(
                 ig=ig, variant_df=variant_df, covariates_df=covariates_df,
                 signif_seed_df=signif_seed_df, signif_threshold=signif_threshold,
@@ -807,6 +843,7 @@ def map_independent(
                 random_tiebreak=random_tiebreak, missing=missing,
                 beta_approx=beta_approx, seed=seed, chrom=chrom,
                 perm_ix_t=perm_ix_t, perm_chunk=perm_chunk,
+                logger=logger, total_items=chrom_total, item_label=item_label,
             )
     else:
         if "group_id" not in signif_df.columns:
@@ -825,7 +862,7 @@ def map_independent(
         phenotype_counts = group_counts
         item_label = "phenotype groups"
 
-        def run_core(chrom: str | None) -> pd.DataFrame:
+        def run_core(chrom: str | None, chrom_total: int | None) -> pd.DataFrame:
             return _run_independent_core_group(
                 ig=ig, variant_df=variant_df, covariates_df=covariates_df,
                 seed_by_group_df=seed_by_group_df, signif_threshold=signif_threshold,
@@ -833,6 +870,7 @@ def map_independent(
                 random_tiebreak=random_tiebreak, missing=missing,
                 beta_approx=beta_approx, seed=seed, chrom=chrom,
                 perm_ix_t=perm_ix_t, perm_chunk=perm_chunk,
+                logger=logger, total_items=chrom_total, item_label=item_label,
             )
 
     if logger.verbose:
@@ -847,7 +885,7 @@ def map_independent(
                 logger.write(f"    Mapping chromosome {chrom} ({chrom_total} {item_label})")
             chrom_start = time.time()
             with logger.time_block(f"{chrom}: map_independent", sync=sync):
-                chrom_df = run_core(chrom)
+                chrom_df = run_core(chrom, chrom_total)
             results.append(chrom_df)
             if logger.verbose:
                 elapsed = time.time() - chrom_start
