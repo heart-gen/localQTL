@@ -68,7 +68,7 @@ def beta_approx_pval(r2_perm, r2_true, dof_init):
     p_perm = pval_from_corr_r2(r2_perm, true_dof)
     a,b = _beta_mle_on_p(p_perm)
     p_true = pval_from_corr_r2(np.array([r2_true]), true_dof)[0]
-    p_beta = stats.beta.cdf(p_true, a, b) 
+    p_beta = stats.beta.cdf(p_true, a, b)
     return p_beta, a, b, true_dof, p_true
 
 
@@ -212,7 +212,7 @@ def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
     if qvalue_lambda is not None:
         logger.write(f'  * Calculating q-values with lambda = {qvalue_lambda:.3f}')
 
-    qvals_res = qvalue(p, lambda_qvalue=qvalue_lambda)
+    qvals_res = qvalue(p, lambda_=qvalue_lambda)
     qvals, pi0 = qvals_res["qvalues"], qvals_res["pi0"]
 
     res_df['qval'] = qvals
