@@ -52,20 +52,19 @@ def _run_permutation_core(
     Compatible with InputGeneratorCis and InputGeneratorCisWithHaps (ungrouped only).
     """
     expected_columns = [
-        "phenotype_id", "variant_id", "pos", "start_distance", "end_distance",
-        "num_var", "beta", "se", "tstat", "r2_nominal", "pval_nominal",
-        "pval_perm", "pval_beta", "beta_shape1", "beta_shape2", "af",
-        "ma_samples", "ma_count", "dof",
+        "phenotype_id", "variant_id", "start_distance", "end_distance",
+        "num_var", "slope", "slope_se", "tstat", "r2_nominal", "pval_nominal",
+        "pval_perm", "pval_beta", "beta_shape1", "beta_shape2",
+        "ma_samples", "ma_count", "af", "true_dof", "pval_true_dof"
     ]
     dtype_map = {
         "phenotype_id": object,
         "variant_id": object,
-        "pos": np.int32,
         "start_distance": np.int32,
         "end_distance": np.int32,
         "num_var": np.int32,
-        "beta": np.float32,
-        "se": np.float32,
+        "slope": np.float32,
+        "slope_se": np.float32,
         "tstat": np.float32,
         "r2_nominal": np.float32,
         "pval_nominal": np.float32,
@@ -73,10 +72,11 @@ def _run_permutation_core(
         "pval_beta": np.float32,
         "beta_shape1": np.float32,
         "beta_shape2": np.float32,
-        "af": np.float32,
         "ma_samples": np.int32,
         "ma_count": np.float32,
-        "dof": np.int32,
+        "af": np.float32,
+        "true_dof": np.int32,
+        "pval_true_dof": np.int32,
     }
     buffers = allocate_result_buffers(expected_columns, dtype_map, _estimate_rows(ig, chrom))
     cursor = 0
@@ -196,9 +196,11 @@ def _run_permutation_core(
 
         # Optional Beta approximation
         if beta_approx:
-            pval_beta, a_hat, b_hat = beta_approx_pval(r2_perm_np, r2_nominal)
+            pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
+                r2_perm_np, r2_nominal, dof_init=dof
+            )
         else:
-            pval_beta, a_hat, b_hat = np.nan, np.nan, np.nan
+            pval_beta = a_hat = b_hat = true_dof = p_true =  np.nan
 
         # Metadata
         var_id = idx_to_id[v_idx[ix]]
@@ -214,24 +216,24 @@ def _run_permutation_core(
             buffers, cursor,
             {
                 "phenotype_id": pid,
+                "num_var": num_var,
+                "beta_shape1": a_hat,
+                "beta_shape2": b_hat,
+                "true_dof": true_dof,
+                "pval_true_dof": p_true,
                 "variant_id": var_id,
-                "pos": var_pos,
                 "start_distance": start_distance,
                 "end_distance": end_distance,
-                "num_var": num_var,
-                "beta": beta,
-                "se": se,
+                "ma_samples": int(ma_samples_t[ix].item()),
+                "ma_count": float(ma_count_t[ix].item()),
+                "af": float(af_t[ix].item()),
+                "slope": beta,
+                "slope_se": se,
                 "tstat": tval,
                 "r2_nominal": r2_nominal,
                 "pval_nominal": pval_nominal,
                 "pval_perm": pval_perm,
                 "pval_beta": pval_beta,
-                "beta_shape1": a_hat,
-                "beta_shape2": b_hat,
-                "af": float(af_t[ix].item()),
-                "ma_samples": int(ma_samples_t[ix].item()),
-                "ma_count": float(ma_count_t[ix].item()),
-                "dof": dof,
             },
         )
         cursor += 1
@@ -265,22 +267,21 @@ def _run_permutation_core_group(
         raise ValueError("nperm must be a positive integer for map_permutations.")
 
     expected_columns = [
-        "group_id", "group_size", "phenotype_id", "variant_id", "pos",
-        "start_distance", "end_distance", "num_var", "beta", "se",
-        "tstat", "r2_nominal", "pval_nominal", "pval_perm", "pval_beta",
-        "beta_shape1", "beta_shape2", "af", "ma_samples", "ma_count", "dof",
+        "group_id", "group_size", "phenotype_id", "variant_id", "start_distance",
+        "end_distance", "num_var", "slope", "slope_se", "tstat", "r2_nominal",
+        "pval_nominal", "pval_perm", "pval_beta", "beta_shape1", "beta_shape2",
+        "ma_samples", "ma_count", "af", "true_dof", "pval_true_dof",
     ]
     dtype_map = {
         "group_id": object,
         "group_size": np.int32,
         "phenotype_id": object,
         "variant_id": object,
-        "pos": np.int32,
         "start_distance": np.int32,
         "end_distance": np.int32,
         "num_var": np.int32,
-        "beta": np.float32,
-        "se": np.float32,
+        "slope": np.float32,
+        "slope_se": np.float32,
         "tstat": np.float32,
         "r2_nominal": np.float32,
         "pval_nominal": np.float32,
@@ -288,10 +289,11 @@ def _run_permutation_core_group(
         "pval_beta": np.float32,
         "beta_shape1": np.float32,
         "beta_shape2": np.float32,
-        "af": np.float32,
         "ma_samples": np.int32,
         "ma_count": np.float32,
-        "dof": np.int32,
+        "af": np.float32,
+        "true_dof": np.int32,
+        "pval_true_dof": np.int32,
     }
     buffers = allocate_result_buffers(expected_columns, dtype_map,
                                       _estimate_rows(ig, chrom, grouped=True))
@@ -443,9 +445,11 @@ def _run_permutation_core_group(
         pval_nominal = float(get_t_pval(best["t"], dof))
         pval_perm = float((np.sum(r2_perm_max >= best["r2"]) + 1) / (r2_perm_max.size + 1))
         if beta_approx:
-            pval_beta, a_hat, b_hat = beta_approx_pval(r2_perm_max, best["r2"])
+            pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
+                r2_perm_max, best["r2"], dof_init=dof
+            )
         else:
-            pval_beta, a_hat, b_hat = np.nan, np.nan, np.nan
+            pval_beta = a_hat = b_hat = true_dof = p_true =  np.nan
 
         buffers = ensure_capacity(buffers, cursor, 1)
         write_row(
@@ -455,12 +459,11 @@ def _run_permutation_core_group(
                 "group_size": len(ids),
                 "phenotype_id": pid,
                 "variant_id": var_id,
-                "pos": pos,
                 "start_distance": start_distance,
                 "end_distance": end_distance,
                 "num_var": num_var,
-                "beta": best["beta"],
-                "se": best["se"],
+                "slope": best["beta"],
+                "slope_se": best["se"],
                 "tstat": best["t"],
                 "r2_nominal": best["r2"],
                 "pval_nominal": pval_nominal,
@@ -468,10 +471,11 @@ def _run_permutation_core_group(
                 "pval_beta": pval_beta,
                 "beta_shape1": a_hat,
                 "beta_shape2": b_hat,
-                "af": float(af_t[best["ix_var"]].item()),
                 "ma_samples": int(ma_samples_t[best["ix_var"]].item()),
                 "ma_count": float(ma_count_t[best["ix_var"]].item()),
-                "dof": dof,
+                "af": float(af_t[best["ix_var"]].item()),
+                "true_dof": true_dof,
+                "pval_true_dof": p_true,
             },
         )
         cursor += 1
