@@ -19,8 +19,8 @@ def test_map_permutations_computes_empirical_stats(toy_data):
         logger=SimpleLogger(verbose=False),
     )
 
-    assert {"phenotype_id", "variant_id", "pval_perm", "pval_beta", "dof"}.issubset(result.columns)
+    assert {"phenotype_id", "variant_id", "pval_perm", "pval_beta", "true_dof"}.issubset(result.columns)
     expected_ids = {pid for pid in toy_data["phenotype_df"].index if pid != "geneConst"}
     assert set(result["phenotype_id"]) == expected_ids
     assert ((result["pval_perm"] >= 0.0) & (result["pval_perm"] <= 1.0)).all()
-    assert np.isfinite(result[["beta", "se", "tstat", "r2_nominal"]]).all().all()
+    assert np.isfinite(result[["slope", "slope_se", "tstat", "r2_nominal"]]).all().all()

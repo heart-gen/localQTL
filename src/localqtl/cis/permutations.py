@@ -125,6 +125,12 @@ def _run_permutation_core(
             if keep_mask.sum().item() == 0:
                 continue
 
+        mono_t = (G_imputed == G_imputed[:, [0]]).all(1)
+        if mono_t.any():
+            keep_mask = keep_mask & (~mono_t)
+            if keep_mask.sum().item() == 0:
+                continue
+
         # Mask G, H, and indices consistently
         mask_cpu = keep_mask.detach().cpu().numpy()
         G_imputed = G_imputed[keep_mask]
@@ -147,7 +153,7 @@ def _run_permutation_core(
         )
 
         # Partial R^2 for genotype predictor
-        n = y_resid_t.shape[0]
+        n = int(y_resid_t.shape[0])
         ##p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
         ##dof = max(n - p_pred, 1)
         dof = max(n - 2 - int(k_eff), 1)
@@ -269,9 +275,9 @@ def _run_permutation_core_group(
 
     expected_columns = [
         "group_id", "group_size", "phenotype_id", "variant_id", "start_distance",
-        "end_distance", "num_var", "slope", "slope_se", "tstat", "r2_nominal",
-        "pval_nominal", "pval_perm", "pval_beta", "beta_shape1", "beta_shape2",
-        "ma_samples", "ma_count", "af", "true_dof", "pval_true_dof",
+        "end_distance", "num_var", "slope", "slope_se", "tstat",
+        "r2_nominal", "pval_nominal", "pval_perm", "pval_beta", "beta_shape1",
+        "beta_shape2", "ma_samples", "ma_count", "af", "true_dof", "pval_true_dof",
     ]
     dtype_map = {
         "group_id": object,
@@ -334,6 +340,11 @@ def _run_permutation_core_group(
             keep_mask = keep_mask & keep_maf
             if keep_mask.sum().item() == 0:
                 continue
+        mono_t = (G_imputed == G_imputed[:, [0]]).all(1)
+        if mono_t.any():
+            keep_mask = keep_mask & (~mono_t)
+            if keep_mask.sum().item() == 0:
+                continue
         mask_cpu = keep_mask.detach().cpu().numpy()
         G_imputed = G_imputed[keep_mask]
         v_idx = v_idx[mask_cpu]
@@ -377,13 +388,13 @@ def _run_permutation_core_group(
         Y_resid = mats_resid[idx]  # (k x n)
 
         # Design meta
-        n = int(Y_resid.shape[1])
         ##p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
         ##dof = max(n - p_pred, 1)
+        k_eff = rez.Q_t.shape[1] if rez is not None else 0
+        n = int(Y_resid.shape[1])
         dof = max(n - 2 - int(k_eff), 1)
         var_ids = idx_to_id[v_idx]
         var_pos = pos_arr[v_idx]
-        k_eff = rez.Q_t.shape[1] if rez is not None else 0
 
         # Evaluate each phenotype: t-stats -> partial R²; keep the global best (variant, phenotype)
         best = dict(r2=-np.inf, ix_var=-1, ix_pheno=-1, beta=None, se=None, t=None)

@@ -156,6 +156,11 @@ def _run_independent_core(
             keep_mask = keep_mask & keep_maf
             if keep_mask.sum().item() == 0:
                 continue
+        mono_t = (G_imputed == G_imputed[:, [0]]).all(1)
+        if mono_t.any():
+            keep_mask = keep_mask & (~mono_t)
+            if keep_mask.sum().item() == 0:
+                continue
         mask_cpu = keep_mask.detach().cpu().numpy()
         G_t = G_imputed[keep_mask].contiguous()
         v_idx = v_idx[mask_cpu]
@@ -228,11 +233,10 @@ def _run_independent_core(
                     return_nominal=True,
                 )
 
-                p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-                dof = max(int(n) - int(k_eff) - int(p_pred), 1)
-                t_g = tstats[:, 0]
-                t2 = t_g * t_g
-                r2_nominal_vec = t2 / (t2 + float(dof))
+                dof = max(int(n) - 2 - int(k_eff), 1)
+                t_g = tstats[:, 0].double()
+                t2 = t_g.pow(2)
+                r2_nominal_vec = (t2 / (t2 + float(dof))).to(torch.float32)
                 r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
                 ix = int(ix_t.item())
                 if random_tiebreak:
@@ -357,11 +361,10 @@ def _run_independent_core(
                         perm_chunk=perm_chunk_local,
                         return_nominal=True,
                     )
-                    p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-                    dof = max(int(n) - int(k_eff) - int(p_pred), 1)
-                    t_g = tstats[:, 0]
-                    t2 = t_g * t_g
-                    r2_nominal_vec = t2 / (t2 + float(dof))
+                    dof = max(int(n) - 2 - int(k_eff), 1)
+                    t_g = tstats[:, 0].double()
+                    t2 = t_g.pow(2)
+                    r2_nominal_vec = (t2 / (t2 + float(dof))).to(torch.float32)
                     r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
                     ix = int(ix_t.item())
                     if random_tiebreak:
@@ -563,6 +566,11 @@ def _run_independent_core_group(
             keep_mask = keep_mask & keep_maf
             if keep_mask.sum().item() == 0:
                 continue
+        mono_t = (G_imputed == G_imputed[:, [0]]).all(1)
+        if mono_t.any():
+            keep_mask = keep_mask & (~mono_t)
+            if keep_mask.sum().item() == 0:
+                continue
         mask_cpu = keep_mask.detach().cpu().numpy()
         G_t = G_imputed[keep_mask].contiguous()
         v_idx = v_idx[mask_cpu]
@@ -656,11 +664,10 @@ def _run_independent_core_group(
                         perm_chunk=perm_chunk_local,
                         return_nominal=True,
                     )
-                    p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-                    dof = max(int(n_samples) - int(k_eff) - int(p_pred), 1)
-                    t_g = tstats[:, 0]
-                    t2 = t_g * t_g
-                    r2_nominal_vec = t2 / (t2 + float(dof))
+                    dof = max(int(n_samples) - 2 - int(k_eff), 1)
+                    t_g = tstats[:, 0].double()
+                    t2 = t_g.pow(2)
+                    r2_nominal_vec = (t2 / (t2 + float(dof))).to(torch.float32)
                     r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
                     ix = int(ix_t.item())
                     if random_tiebreak:
@@ -691,7 +698,7 @@ def _run_independent_core_group(
                     r2_perm_np = r2_perm_max.detach().cpu().numpy()
                     if beta_approx:
                         pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
-                            r2_perm_np, best_r2_val, dof_init=odf
+                            r2_perm_np, best_r2_val, dof_init=best_dof
                         )
                     else:
                         pval_beta = a_hat = b_hat = true_dof = p_true =  np.nan
@@ -799,11 +806,10 @@ def _run_independent_core_group(
                             perm_chunk=perm_chunk_local,
                             return_nominal=True,
                         )
-                        p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-                        dof = max(int(n_samples) - int(k_eff) - int(p_pred), 1)
-                        t_g = tstats[:, 0]
-                        t2 = t_g * t_g
-                        r2_nominal_vec = t2 / (t2 + float(dof))
+                        dof = max(int(n_samples) - 2 - int(k_eff), 1)
+                        t_g = tstats[:, 0].double()
+                        t2 = t_g.pow(2)
+                        r2_nominal_vec = (t2 / (t2 + float(dof))).to(torch.float32)
                         r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
                         ix = int(ix_t.item())
                         if random_tiebreak:
