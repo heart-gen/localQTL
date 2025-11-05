@@ -64,7 +64,7 @@ def get_significant_pairs(res_df: pd.DataFrame,
 
     # Select the seed set and thresholds
     if grouped:
-        keep = res_df.loc[res_df["qval"] <= fdr, ["group_id", "pval_nominal_threshold"]].copy()
+        keep = res_df.loc[res_df["qval"] < fdr, ["group_id", "pval_nominal_threshold"]].copy()
         keep = keep.dropna(subset=["pval_nominal_threshold"])
         if keep.empty:
             lg.write("  * No groups pass FDR; returning empty DataFrame.")
@@ -80,7 +80,7 @@ def get_significant_pairs(res_df: pd.DataFrame,
     else:
         if "phenotype_id" not in res_df.columns or "pval_nominal_threshold" not in res_df.columns:
             raise ValueError("Ungrouped mode: res_df must contain 'phenotype_id' and 'pval_nominal_threshold'.")
-        keep = res_df.loc[res_df["qval"] <= fdr, ["phenotype_id", "pval_nominal_threshold"]].copy()
+        keep = res_df.loc[res_df["qval"] < fdr, ["phenotype_id", "pval_nominal_threshold"]].copy()
         keep = keep.dropna(subset=["pval_nominal_threshold"]).drop_duplicates("phenotype_id").set_index("phenotype_id")
         if keep.empty:
             lg.write("  * No phenotypes pass FDR; returning empty DataFrame.")
@@ -132,8 +132,8 @@ def get_significant_pairs(res_df: pd.DataFrame,
                 continue
             thr = df_nom["phenotype_id"].map(threshold_lookup)
 
-        # Thresholding (use <= to include exact boundary)
-        mask = df_nom["pval_nominal"] <= thr
+        # Thresholding (use < to include exact boundary)
+        mask = df_nom["pval_nominal"] < thr
         if mask.any():
             out.append(df_nom.loc[mask].copy())
 
