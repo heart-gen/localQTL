@@ -67,7 +67,7 @@ def _beta_mle_on_p(p):
     return float(a), float(b)
 
 
-def beta_approx_pval_tensor(r2_perm, r2_true, dof_init):
+def beta_approx_pval(r2_perm, r2_true, dof_init):
     """
     Fit Beta(a,b) to permutation R^2 using tensorQTL method.
     """
@@ -79,7 +79,7 @@ def beta_approx_pval_tensor(r2_perm, r2_true, dof_init):
     return p_beta, a, b, true_dof, p_true
 
 
-def beta_approx_pval(r2_perm, r2_true, dof_init):
+def beta_approx_pval_old(r2_perm, r2_true, dof_init):
     """
     Fit Beta(a,b) to permutation R^2 by method of moments and return:
         (pval_beta, a_hat, b_hat).
