@@ -142,10 +142,10 @@ def _run_permutation_core(
             assert H_t.shape[0] == G_t.shape[0], "G_t and H_t out of sync"
 
         # Minor-allele stats before residualization
-        af_t, ma_samples_t, ma_count_t = allele_stats(G_imputed, ploidy=2)
+        af_t, ma_samples_t, ma_count_t = allele_stats(G_t, ploidy=2)
 
         # Residualize y/G/H against covariates
-        y_resid_t, G_resid, H_resid = residualize_batch(y_t, G_imputed, H_t, rez, center=True)
+        y_resid_t, G_resid, H_resid = residualize_batch(y_t, G_t, H_t, rez, center=True)
 
         # Compute effective covariate rank for DoF
         k_eff = rez.Q_t.shape[1] if rez is not None else 0
@@ -363,7 +363,7 @@ def _run_permutation_core_group(
             assert H_t.shape[0] == G_t.shape[0], "G_t and H_t out of sync"
 
         # Minor-allele stats prior to residualization
-        af_t, ma_samples_t, ma_count_t = allele_stats(G_imputed, ploidy=2)
+        af_t, ma_samples_t, ma_count_t = allele_stats(G_t, ploidy=2)
 
         # Residualize once; reuse G/H residuals for each phenotype
         if isinstance(P, torch.Tensor):
@@ -381,13 +381,13 @@ def _run_permutation_core_group(
             Y_stack = Y_stack.unsqueeze(0)
 
         # Use shared routine to residualize matrices with the same Residualizer
-        mats: list[torch.Tensor] = [G_imputed]
+        mats: list[torch.Tensor] = [G_t]
         H_shape = None
         if H_t is not None:
             m, n, pH = H_t.shape
             H_shape = (m, n, pH)
             mats.append(H_t.reshape(m * pH, n))
-        mats_resid = rez.transform(*mats, Y_stack, center=True) if rez is not None else [G_imputed] + ([H_t.reshape(m*pH, n)] if H_t is not None else []) + [Y_stack]
+        mats_resid = rez.transform(*mats, Y_stack, center=True) if rez is not None else [G_t] + ([H_t.reshape(m*pH, n)] if H_t is not None else []) + [Y_stack]
         G_resid = mats_resid[0]
         idx = 1
         H_resid = None
