@@ -2,8 +2,8 @@ import torch
 from ._torch_utils import move_to_device, resolve_device
 
 try:
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.fp32_precision = 'tf32'
+    torch.backends.cuda.matmul.fp32_precision = 'highest'
 except Exception:
     pass
 
