@@ -114,29 +114,32 @@ def _run_permutation_core(
             H_t = to_device_tensor(H_block, device, dtype=torch.float32)
 
         # Impute and drop monomorphic
-        G_imputed, keep_mask, _ = impute_mean_and_filter(G_t)
-        if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
+        G_t, keep_mono, _ = impute_mean_and_filter(G_t)
+        if G_t.shape[0] == 0:
             continue
 
-        # Optional MAF filter
-        if maf_threshold and maf_threshold > 0:
-            keep_maf, _ = filter_by_maf(G_imputed, maf_threshold, ploidy=2)
-            keep_mask = keep_mask & keep_maf
-            if keep_mask.sum().item() == 0:
-                continue
-
-        mono_t = (G_imputed == G_imputed[:, [0]]).all(1)
-        if mono_t.any():
-            keep_mask = keep_mask & (~mono_t)
-            if keep_mask.sum().item() == 0:
-                continue
-
-        # Mask G, H, and indices consistently
-        mask_cpu = keep_mask.detach().cpu().numpy()
-        G_imputed = G_imputed[keep_mask]
-        v_idx = v_idx[mask_cpu]
+        # Keep variant metadata / haps in sync with the monomorphic filter
+        v_idx = v_idx[keep_mono.detach().cpu().numpy()]
         if H_t is not None:
-            H_t = H_t[keep_mask]
+            H_t = H_t[keep_mono]
+            if H_t.shape[2] > 1:
+                H_t = H_t[:, :, :-1]
+
+        # Optional MAF filter on the *current* (already-imputed/trimmed) G_t
+        if maf_threshold and maf_threshold > 0:
+            keep_maf, _ = filter_by_maf(G_t, maf_threshold, ploidy=2)
+            if keep_maf.sum().item() == 0:
+                continue
+            # Apply MAF mask consistently across tensors/indices
+            G_t   = G_t[keep_maf]
+            v_idx = v_idx[keep_maf.detach().cpu().numpy()]
+            if H_t is not None:
+                H_t = H_t[keep_maf]
+
+        # Sanity checks to catch any future drift
+        assert G_t.shape[0] == v_idx.shape[0], "G_t and v_idx out of sync"
+        if H_t is not None:
+            assert H_t.shape[0] == G_t.shape[0], "G_t and H_t out of sync"
 
         # Minor-allele stats before residualization
         af_t, ma_samples_t, ma_count_t = allele_stats(G_imputed, ploidy=2)
@@ -332,26 +335,32 @@ def _run_permutation_core_group(
             H_t = to_device_tensor(H_block, device, dtype=torch.float32)
 
         # Impute + drop monomorphic
-        G_imputed, keep_mask, _ = impute_mean_and_filter(G_t)
-        if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
+        G_t, keep_mono, _ = impute_mean_and_filter(G_t)
+        if G_t.shape[0] == 0:
             continue
-        if maf_threshold and maf_threshold > 0:
-            keep_maf, _ = filter_by_maf(G_imputed, maf_threshold, ploidy=2)
-            keep_mask = keep_mask & keep_maf
-            if keep_mask.sum().item() == 0:
-                continue
-        mono_t = (G_imputed == G_imputed[:, [0]]).all(1)
-        if mono_t.any():
-            keep_mask = keep_mask & (~mono_t)
-            if keep_mask.sum().item() == 0:
-                continue
-        mask_cpu = keep_mask.detach().cpu().numpy()
-        G_imputed = G_imputed[keep_mask]
-        v_idx = v_idx[mask_cpu]
+
+        # Keep variant metadata / haps in sync with the monomorphic filter
+        v_idx = v_idx[keep_mono.detach().cpu().numpy()]
         if H_t is not None:
-            H_t = H_t[keep_mask]
+            H_t = H_t[keep_mono]
             if H_t.shape[2] > 1:
-                H_t = H_t[:, :, :-1]  # drop one ancestry channel to avoid rank deficiency
+                H_t = H_t[:, :, :-1]
+
+        # Optional MAF filter on the *current* (already-imputed/trimmed) G_t
+        if maf_threshold and maf_threshold > 0:
+            keep_maf, _ = filter_by_maf(G_t, maf_threshold, ploidy=2)
+            if keep_maf.sum().item() == 0:
+                continue
+            # Apply MAF mask consistently across tensors/indices
+            G_t   = G_t[keep_maf]
+            v_idx = v_idx[keep_maf.detach().cpu().numpy()]
+            if H_t is not None:
+                H_t = H_t[keep_maf]
+
+        # Sanity checks to catch any future drift
+        assert G_t.shape[0] == v_idx.shape[0], "G_t and v_idx out of sync"
+        if H_t is not None:
+            assert H_t.shape[0] == G_t.shape[0], "G_t and H_t out of sync"
 
         # Minor-allele stats prior to residualization
         af_t, ma_samples_t, ma_count_t = allele_stats(G_imputed, ploidy=2)
