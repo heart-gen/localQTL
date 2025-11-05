@@ -14,6 +14,8 @@ from scipy.special import betaln
 from py_qvalue import qvalue, pi0est
 from typing import Optional, Sequence, Union
 
+from .utils import SimpleLogger
+
 __all__ = [
     "beta_approx_pval",
     "get_t_pval",
