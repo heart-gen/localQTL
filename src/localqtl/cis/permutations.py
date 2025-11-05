@@ -157,9 +157,9 @@ def _run_permutation_core(
 
         # Partial R^2 for genotype predictor
         n = int(y_resid_t.shape[0])
-        ##p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-        ##dof = max(n - p_pred, 1)
-        dof = max(n - 2 - int(k_eff), 1)
+        p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
+        dof = max(n - p_pred, 1)
+        ##dof = max(n - 2 - int(k_eff), 1)
         t_g = tstats[:, 0]
         t_sq = t_g.double().pow(2)
         r2_nominal_vec = (t_sq / (t_sq + dof)).to(torch.float32)
@@ -397,11 +397,11 @@ def _run_permutation_core_group(
         Y_resid = mats_resid[idx]  # (k x n)
 
         # Design meta
-        ##p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-        ##dof = max(n - p_pred, 1)
-        k_eff = rez.Q_t.shape[1] if rez is not None else 0
         n = int(Y_resid.shape[1])
-        dof = max(n - 2 - int(k_eff), 1)
+        p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
+        dof = max(n - p_pred, 1)
+        k_eff = rez.Q_t.shape[1] if rez is not None else 0
+        ##dof = max(n - 2 - int(k_eff), 1)
         var_ids = idx_to_id[v_idx]
         var_pos = pos_arr[v_idx]
 
@@ -523,7 +523,7 @@ def map_permutations(
         window: int = 1_000_000, nperm: int = 10_000, device: str = "cuda",
         beta_approx: bool = True, seed: int | None = None,
         logger: SimpleLogger | None = None, verbose: bool = True,
-        preload_haplotypes: bool = True,
+        preload_haplotypes: bool = True, tensorqtl_flavor: bool = False,
 ) -> pd.DataFrame:
     """
     Empirical cis-QTL mapping (one top variant per phenotype) with permutations.
@@ -580,7 +580,8 @@ def map_permutations(
     # Residualize phenotypes once (after generator filters constants/missing)
     Y = to_device_tensor(ig.phenotype_df.values, device, dtype=torch.float32)
     with logger.time_block("Residualizing phenotypes", sync=sync):
-        Y_resid, rez = residualize_matrix_with_covariates(Y, covariates_df, device)
+        Y_resid, rez = residualize_matrix_with_covariates(Y, covariates_df,
+                                                          device, tensorqtl_flavor)
 
     ig.phenotype_df = pd.DataFrame(Y_resid.cpu().numpy(), index=ig.phenotype_df.index,
                                    columns=ig.phenotype_df.columns)

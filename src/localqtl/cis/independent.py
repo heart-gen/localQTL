@@ -64,7 +64,8 @@ def _run_independent_core(
         missing: float = -9.0, beta_approx: bool = True, seed: int | None = None,
         chrom: str | None = None, perm_ix_t: torch.Tensor | None = None,
         perm_chunk: int = 2048, logger: SimpleLogger | None = None,
-        total_items: int | None = None, item_label: str = "phenotypes"
+        total_items: int | None = None, item_label: str = "phenotypes",
+        tensorqtl_flavor: bool = False,
 ) -> pd.DataFrame:
     """Forward–backward independent mapping for ungrouped phenotypes."""
     expected_columns = [
@@ -217,7 +218,7 @@ def _run_independent_core(
                     if extras:
                         components.append(torch.stack(extras, dim=1))
                     C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
-                    rez_aug = Residualizer(C_aug_t)
+                    rez_aug = Residualizer(C_aug_t, tensorqtl_flavor=tensorqtl_flavor)
                 y_resid, G_resid, H_resid = residualize_batch(
                     y_t, G_t, H_t, rez_aug, center=True, group=False
                 )
@@ -233,7 +234,8 @@ def _run_independent_core(
                     return_nominal=True,
                 )
 
-                dof = max(int(n) - 2 - int(k_eff), 1)
+                p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
+                dof = max(int(n) - int(k_eff) - int(p_pred), 1)
                 t_g = tstats[:, 0].double()
                 t2 = t_g.pow(2)
                 r2_nominal_vec = (t2 / (t2 + float(dof))).to(torch.float32)
@@ -346,7 +348,7 @@ def _run_independent_core(
                         if extras:
                             components.append(torch.stack(extras, dim=1))
                         C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
-                        rez_aug = Residualizer(C_aug_t)
+                        rez_aug = Residualizer(C_aug_t, tensorqtl_flavor=tensorqtl_flavor)
                     y_resid, G_resid, H_resid = residualize_batch(
                         y_t, G_t, H_t, rez_aug, center=True, group=False
                     )
@@ -361,7 +363,8 @@ def _run_independent_core(
                         perm_chunk=perm_chunk_local,
                         return_nominal=True,
                     )
-                    dof = max(int(n) - 2 - int(k_eff), 1)
+                    p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
+                    dof = max(int(n) - int(k_eff) - int(p_pred), 1)
                     t_g = tstats[:, 0].double()
                     t2 = t_g.pow(2)
                     r2_nominal_vec = (t2 / (t2 + float(dof))).to(torch.float32)
@@ -476,7 +479,8 @@ def _run_independent_core_group(
         missing: float = -9.0, beta_approx: bool = True, seed: int | None = None,
         chrom: str | None = None, perm_ix_t: torch.Tensor | None = None,
         perm_chunk: int = 2048, logger: SimpleLogger | None = None,
-        total_items: int | None = None, item_label: str = "phenotype groups"
+        total_items: int | None = None, item_label: str = "phenotype groups",
+        tensorqtl_flavor: bool = False,
 ) -> pd.DataFrame:
     """Forward-backward independent mapping for grouped phenotypes."""
     expected_columns = [
@@ -642,7 +646,7 @@ def _run_independent_core_group(
                     if extras:
                         components.append(torch.stack(extras, dim=1))
                     C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
-                    rez_aug = Residualizer(C_aug_t)
+                    rez_aug = Residualizer(C_aug_t, tensorqtl_flavor=tensorqtl_flavor)
 
                 y_resid_list, G_resid, H_resid = residualize_batch(
                     y_stack, G_t, H_t, rez_aug, center=True, group=True
@@ -664,7 +668,8 @@ def _run_independent_core_group(
                         perm_chunk=perm_chunk_local,
                         return_nominal=True,
                     )
-                    dof = max(int(n_samples) - 2 - int(k_eff), 1)
+                    p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
+                    dof = max(int(n) - int(k_eff) - int(p_pred), 1)
                     t_g = tstats[:, 0].double()
                     t2 = t_g.pow(2)
                     r2_nominal_vec = (t2 / (t2 + float(dof))).to(torch.float32)
@@ -784,7 +789,7 @@ def _run_independent_core_group(
                         if extras:
                             components.append(torch.stack(extras, dim=1))
                         C_aug_t = torch.cat(components, dim=1) if len(components) > 1 else components[0]
-                        rez_aug = Residualizer(C_aug_t)
+                        rez_aug = Residualizer(C_aug_t, tensorqtl_flavor=tensorqtl_flavor)
 
                     y_resid_list, G_resid, H_resid = residualize_batch(
                         y_stack, G_t, H_t, rez_aug, center=True, group=True
@@ -806,7 +811,8 @@ def _run_independent_core_group(
                             perm_chunk=perm_chunk_local,
                             return_nominal=True,
                         )
-                        dof = max(int(n_samples) - 2 - int(k_eff), 1)
+                        p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
+                        dof = max(int(n) - int(k_eff) - int(p_pred), 1)
                         t_g = tstats[:, 0].double()
                         t2 = t_g.pow(2)
                         r2_nominal_vec = (t2 / (t2 + float(dof))).to(torch.float32)

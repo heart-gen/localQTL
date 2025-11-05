@@ -17,7 +17,8 @@ class Residualizer(object):
     """
     Residualizer for regressing out covariates from genotype/phenotype matrices.
     """
-    def __init__(self, C_t: torch.Tensor):
+    def __init__(self, C_t: torch.Tensor, tensorqtl_flavor: bool = False):
+        self.tensorqtl_flavor = tensorqtl_flavor
         # Center covariates and drop columns with zero variance (e.g., intercept-only)
         n_samples = C_t.shape[0]
         C_centered = C_t - C_t.mean(0)
@@ -35,7 +36,15 @@ class Residualizer(object):
             self.P = None
             self.rank = 0
 
-        self.dof = n_samples - 2 - self.rank
+        if tensorqtl_flavor:
+            self.dof = n_samples - 2 - C_t.shape[1]
+        else:
+            self.dof = n_samples - 2 - self.rank
+
+        if tensorqtl_flavor and self.rank < C_t.shape[1]:
+            print(f"[warning] Covariate matrix has {C_t.shape[1] - self.rank} "
+                  "constant or colinear columns. "
+                  "tensorQTL flavor uses full column count.")
 
     def transform(self, *matrices: torch.Tensor, center: bool=True
                   ) -> tuple[torch.Tensor]:

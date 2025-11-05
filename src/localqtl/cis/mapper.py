@@ -38,6 +38,7 @@ class CisMapper:
             out_prefix: str = "cis_nominal",
             compression: str = "snappy",
             return_df: bool = False,
+            tensorqtl_flavor: bool = False,
             logger: Optional[SimpleLogger] = None,
             verbose: bool = True,
     ):
@@ -58,6 +59,7 @@ class CisMapper:
         self.out_prefix = out_prefix
         self.compression = compression
         self.return_df = return_df
+        self.tensorqtl_flavor = tensorqtl_flavor
 
         self.logger = logger or SimpleLogger(verbose=verbose, timestamps=True)
 
@@ -85,6 +87,7 @@ class CisMapper:
             compression=self.compression,
             return_df=self.return_df,
             logger=self.logger,
+            tensorqtl_flavor=self.tensorqtl_flavor,
             verbose=getattr(self.logger, "verbose", True),
         )
 
@@ -110,6 +113,7 @@ class CisMapper:
             beta_approx=beta_approx,
             seed=seed,
             logger=self.logger,
+            tensorqtl_flavor=self.tensorqtl_flavor,
             verbose=getattr(self.logger, "verbose", True),
         )
 
@@ -141,6 +145,7 @@ class CisMapper:
             beta_approx=beta_approx,
             seed=seed,
             logger=self.logger,
+            tensorqtl_flavor=self.tensorqtl_flavor,
             verbose=getattr(self.logger, "verbose", True),
         )
 
@@ -150,8 +155,7 @@ class CisMapper:
     ) -> pd.DataFrame:
         """Annotate permutation results with q-values via :func:`calculate_qvalues`."""
         return _calculate_qvalues(
-            perm_df,
-            fdr=fdr,
+            perm_df, fdr=fdr,
             qvalue_lambda=qvalue_lambda,
             logger=self.logger,
         )
