@@ -148,8 +148,9 @@ def _run_permutation_core(
 
         # Partial R^2 for genotype predictor
         n = y_resid_t.shape[0]
-        p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-        dof = max(n - p_pred, 1)
+        ##p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
+        ##dof = max(n - p_pred, 1)
+        dof = max(n - 2 - int(k_eff), 1)
         t_g = tstats[:, 0]
         t_sq = t_g.double().pow(2)
         r2_nominal_vec = (t_sq / (t_sq + dof)).to(torch.float32)
@@ -376,9 +377,10 @@ def _run_permutation_core_group(
         Y_resid = mats_resid[idx]  # (k x n)
 
         # Design meta
-        n = Y_resid.shape[1]
-        p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-        dof = max(n - p_pred, 1)
+        n = int(Y_resid.shape[1])
+        ##p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
+        ##dof = max(n - p_pred, 1)
+        dof = max(n - 2 - int(k_eff), 1)
         var_ids = idx_to_id[v_idx]
         var_pos = pos_arr[v_idx]
         k_eff = rez.Q_t.shape[1] if rez is not None else 0

@@ -19,23 +19,28 @@ def impute_mean_and_filter(
     if not inplace:
         G_t = G_t.clone()
 
-    miss = (G_t == missing)
+    miss_mask = (G_t == missing)
     if allow_nonfinite:
-        miss = miss | (~torch.isfinite(G_t))
+        miss_mask = miss_mask | (~torch.isfinite(G_t))
 
-    # counts / sums over observed entries
-    n_obs = (~miss).sum(dim=1, keepdim=True)
-    sum_obs = torch.where(miss, torch.zeros_like(G_t), G_t).sum(dim=1, keepdim=True)
+    # Monomorphic filter
+    mono = (G_t == G_t[:, [0]]).all(dim=1)
+    keep_mask = ~mono
 
-    # avoid div-by-zero; rows with n_obs==0 will be flagged below
+    if keep_mask.sum().item() == 0:
+        return G_t.new_empty((0, G_t.shape[1])), keep_mask, miss_mask
+
+    G_kept = G_t[keep_mask]
+    miss_kept = miss_mask[keep_mask]
+    
+    # Mean-impute on kept rows
+    n_obs = (~miss_kept).sum(dim=1, keepdim=True)
+    sum_obs = torch.where(miss_kept, torch.zeros_like(G_kept),
+                          G_kept).sum(dim=1, keepdim=True)
     mu = sum_obs / n_obs.clamp_min(1)
-    G_t = torch.where(miss, mu, G_t)
+    G_imputed = torch.where(miss_kept, mu, G_kept)
 
-    # mark rows with no observed data OR zero variance as not-keep
-    all_missing = (n_obs.squeeze(1) == 0)
-    keep = (~all_missing) & (G_t.var(dim=1, unbiased=False) > 0)
-
-    return G_t, keep, miss
+    return G_imputed, keep_mask, miss_mask
 
 
 def calculate_maf(G_t: torch.Tensor, *, ploidy: int = 2) -> torch.Tensor:

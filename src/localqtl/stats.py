@@ -23,10 +23,17 @@ __all__ = [
     "pval_from_corr_r2"
 ]
 
-def pval_from_corr_r2(r2, dof, log10: bool = False):
-    r2 = np.clip(r2, 0.0, 1.0 - 1e-12)
-    t = np.sqrt(dof * r2 / np.maximum(1.0 - r2, 1e-12))
-    return get_t_pval(t, dof, log10=log10)
+def pval_from_corr_r2(r2, dof, two_tailed: bool = True, log10: bool = False):
+    """
+    Convert R^2 to a (two-sided) p-value using Student's t with 'dof'.
+    Uses log-survival for numerical stability.
+    """
+    r2 = np.asarray(r2, dtype=np.float64)
+    dof = np.asarray(dof, dtype=np.float64)
+    # Guard edges so t is finite
+    r2 = np.clip(r2, 0.0, 1.0 - 1e-15)
+    t = np.sqrt(dof * r2 / np.maximum(1.0 - r2, 1e-15))
+    return get_t_pval(t, dof, two_tailed=two_tailed, log10=log10)
 
 
 def _beta_shape1_from_dof(r2_perm, dof):
@@ -75,7 +82,8 @@ def beta_approx_pval(r2_perm, r2_true, dof_init):
 def get_t_pval(t, df, two_tailed: bool = True, log10: bool = False):
     """
     Numerically stable p-values for Student's t.
-    t, df can be scalars or arrays (NumPy or torch). If log10=True, return -log10(p).
+    Accepts scalars/arrays and torch tensors.
+    If log10=True, returns -log10(p) (still via log-survival path).
     """
     try: # Accept torch
         if isinstance(t, torch.Tensor):
@@ -88,16 +96,16 @@ def get_t_pval(t, df, two_tailed: bool = True, log10: bool = False):
     t = np.asarray(t, dtype=np.float64)
     df = np.asarray(df, dtype=np.float64)
 
-    # Compute one- or two-tailed p-value
+    # Use log-survival to avoid underflow at large |t|
+    log_sf = stats.t.logsf(np.abs(t), df)
+    log_p  = log_sf + (0.0 if not two_tailed else np.log(2.0))
+
     if log10:
-        logp = stats.t.logsf(np.abs(t), df)
-        if two_tailed:
-            logp = np.log(2.0) + logp
-        return -(logp / np.log(10.0))
-    else:
-        p = stats.t.sf(np.abs(t), df)
-        p = 2.0 * p if two_tailed else p
-        return p
+        return -log_p / np.log(10.0)
+
+    p = np.exp(log_p)
+    p = np.minimum(p, 1.0)
+    return p
 
 
 def t_two_sided_pval_torch(t_abs: torch.Tensor, dof: int | torch.Tensor) -> torch.Tensor:
