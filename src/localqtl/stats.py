@@ -87,15 +87,29 @@ def beta_approx_pval(r2_perm, r2_true, dof_init):
     """
     r2_perm = np.asarray(r2_perm, dtype=np.float64)
     if r2_perm.size == 0 or not np.isfinite(r2_perm).all():
-        # Degenerate input: return NA-like outputs
-        return float("nan"), float("nan"), float("nan"), float("nan"), float("nan")
+        # Degenerate input: return NA-like outputs but keep DoF/p_true consistent
+        p_true = pval_from_corr_r2(np.array([r2_true]), dof_init)[0]
+        return (
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float(dof_init),
+            float(p_true),
+        )
 
     mu = r2_perm.mean()
     var = r2_perm.var(ddof=1)
     if not np.isfinite(mu) or not np.isfinite(var) or var <= 1e-12:
         # Use empirical tail as a safe fallback
         p_emp = (np.sum(r2_perm >= r2_true) + 1) / (r2_perm.size + 1)
-        return float(p_emp), float("nan"), float("nan")
+        p_true = pval_from_corr_r2(np.array([r2_true]), dof_init)[0]
+        return (
+            float(p_emp),
+            float("nan"),
+            float("nan"),
+            float(dof_init),
+            float(p_true),
+        )
 
     # Method-of-moments for Beta
     k = mu * (1.0 - mu) / var - 1.0
@@ -103,7 +117,8 @@ def beta_approx_pval(r2_perm, r2_true, dof_init):
     b = max((1.0 - mu) * k, 1e-6)
 
     p_beta = 1.0 - stats.beta.cdf(r2_true, a, b)
-    return float(p_beta), float(a), float(b), dof_init, 0
+    p_true = pval_from_corr_r2(np.array([r2_true]), dof_init)[0]
+    return float(p_beta), float(a), float(b), float(dof_init), float(p_true)
 
     
 def get_t_pval(t, df, two_tailed: bool = True, log10: bool = False):

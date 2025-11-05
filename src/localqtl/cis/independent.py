@@ -93,7 +93,7 @@ def _run_independent_core(
         "ma_count": np.float32,
         "af": np.float32,
         "true_dof": np.int32,
-        "pval_true_dof": np.int32,
+        "pval_true_dof": np.float32,
         "rank": np.int32,
     }
     buffers = allocate_result_buffers(expected_columns, dtype_map, signif_seed_df.shape[0])
@@ -150,26 +150,28 @@ def _run_independent_core(
 
         # Impute & filter (and optional MAF)
         G_imputed, keep_mask, _ = impute_mean_and_filter(G_t)
-        if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
+        if G_imputed.shape[0] == 0:
             continue
-        if maf_threshold and maf_threshold > 0:
-            keep_maf, _ = filter_by_maf(G_imputed, maf_threshold, ploidy=2)
-            keep_mask = keep_mask & keep_maf
-            if keep_mask.sum().item() == 0:
-                continue
-        mono_t = (G_imputed == G_imputed[:, [0]]).all(1)
-        if mono_t.any():
-            keep_mask = keep_mask & (~mono_t)
-            if keep_mask.sum().item() == 0:
-                continue
+
         mask_cpu = keep_mask.detach().cpu().numpy()
-        G_t = G_imputed[keep_mask].contiguous()
         v_idx = v_idx[mask_cpu]
         if H_t is not None:
-            H_t = H_t[keep_mask]
+            H_t = H_t[mask_cpu]
             if H_t.shape[2] > 1:
                 H_t = H_t[:, :, :-1]  # drop one ancestry channel
             H_t = H_t.contiguous()
+
+        G_t = G_imputed.contiguous()
+
+        if maf_threshold and maf_threshold > 0:
+            keep_maf, _ = filter_by_maf(G_t, maf_threshold, ploidy=2)
+            if keep_maf.sum().item() == 0:
+                continue
+            mask_cpu = keep_maf.detach().cpu().numpy()
+            G_t = G_t[keep_maf].contiguous()
+            v_idx = v_idx[mask_cpu]
+            if H_t is not None:
+                H_t = H_t[keep_maf].contiguous()
 
         perm_chunk_local = _auto_perm_chunk(G_t.shape[0], nperm)
         if perm_chunk is not None and perm_chunk > 0:
@@ -510,7 +512,7 @@ def _run_independent_core_group(
         "ma_count": np.float32,
         "af": np.float32,
         "true_dof": np.int32,
-        "pval_true_dof": np.int32,
+        "pval_true_dof": np.float32,
         "rank": np.int32,
     }
     buffers = allocate_result_buffers(expected_columns, dtype_map, seed_by_group_df.shape[0])
@@ -563,26 +565,28 @@ def _run_independent_core_group(
             H_t = to_device_tensor(H_block, device, dtype=torch.float32)
 
         G_imputed, keep_mask, _ = impute_mean_and_filter(G_t)
-        if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
+        if G_imputed.shape[0] == 0:
             continue
-        if maf_threshold and maf_threshold > 0:
-            keep_maf, _ = filter_by_maf(G_imputed, maf_threshold, ploidy=2)
-            keep_mask = keep_mask & keep_maf
-            if keep_mask.sum().item() == 0:
-                continue
-        mono_t = (G_imputed == G_imputed[:, [0]]).all(1)
-        if mono_t.any():
-            keep_mask = keep_mask & (~mono_t)
-            if keep_mask.sum().item() == 0:
-                continue
+
         mask_cpu = keep_mask.detach().cpu().numpy()
-        G_t = G_imputed[keep_mask].contiguous()
         v_idx = v_idx[mask_cpu]
         if H_t is not None:
-            H_t = H_t[keep_mask]
+            H_t = H_t[mask_cpu]
             if H_t.shape[2] > 1:
                 H_t = H_t[:, :, :-1]
             H_t = H_t.contiguous()
+
+        G_t = G_imputed.contiguous()
+
+        if maf_threshold and maf_threshold > 0:
+            keep_maf, _ = filter_by_maf(G_t, maf_threshold, ploidy=2)
+            if keep_maf.sum().item() == 0:
+                continue
+            mask_cpu = keep_maf.detach().cpu().numpy()
+            G_t = G_t[keep_maf].contiguous()
+            v_idx = v_idx[mask_cpu]
+            if H_t is not None:
+                H_t = H_t[keep_maf].contiguous()
 
         perm_chunk_local = _auto_perm_chunk(G_t.shape[0], nperm)
         if perm_chunk is not None and perm_chunk > 0:
