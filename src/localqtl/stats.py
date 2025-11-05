@@ -242,62 +242,95 @@ def nominal_pvals_tensorqtl(
 
 def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
                       qvalue_lambda: Optional[Union[float, Sequence[float]]] = None,
-                      logger: Optional[SimpleLogger] = None) -> pd.DataFrame:
-    """Annotate permutation results with q-values, p-value threshold"""
+                      logger: Optional[SimpleLogger] = None, lean: float = 0.6) -> pd.DataFrame:
+    """
+    Annotate permutation results with q-values, p-value threshold.
+
+    This is slightly-conservative q-value estimate.
+    """
     logger = logger or SimpleLogger()
 
     if res_df.empty:
         logger.write("Computing q-values: Input is empty, returning unchanged.")
         return res_df.copy()
 
-    # Choose p-value column
-    use_beta = ("pval_beta" in res_df.columns) and (~res_df["pval_beta"].isna()).any()
-    pcol = "pval_beta" if use_beta else "pval_perm"
-    logger.write(f"Computing q-values on '{pcol}' ({res_df.shape[0]} phenotypes).")
+    have_beta = ("pval_beta" in res_df)
+    have_perm = ("pval_perm" in res_df)
 
-    # Optional correlation report (only if we have >2 finite pairs)
-    if "pval_perm" in res_df.columns and "pval_beta" in res_df.columns:
-        mask = res_df["pval_perm"].notna() & res_df["pval_beta"].notna()
-        if mask.sum() >= 3:
-            r = stats.pearsonr(res_df.loc[mask, "pval_perm"], res_df.loc[mask, "pval_beta"])[0]
+    p_beta = res_df["pval_beta"].to_numpy(float) if have_beta else None
+    p_perm = res_df["pval_perm"].to_numpy(float) if have_perm else None
+
+    # Build p-values for qvalue: beta where available, else perm
+    if have_beta and np.isfinite(p_beta).any():
+        if not have_perm:
+            raise ValueError("pval_perm required to backfill missing pval_beta.")
+        p_for_q = np.where(np.isfinite(p_beta), p_beta, p_perm)
+        pcol_used = "beta with perm fallback"
+    elif have_perm:
+        p_for_q = p_perm
+        pcol_used = "pval_perm"
+    else:
+        raise ValueError("No valid p-values found (need pval_beta and/or pval_perm).")
+
+    logger.write(f"Computing q-values on '{pcol_used}' ({res_df.shape[0]} phenotypes).")
+
+    # Optional sanity check on correlation, if both exist
+    if have_beta and have_perm:
+        mask_corr = np.isfinite(p_beta) & np.isfinite(p_perm)
+        if mask_corr.sum() >= 3:
+            r = stats.pearsonr(p_perm[mask_corr], p_beta[mask_corr])[0]
             logger.write(f"  * Corr(p_perm, p_beta) = {r:.4f}")
         else:
             logger.write("  * Skipping corr(p_perm, p_beta): insufficient non-NaN values.")
 
-    # Compute q-values
-    p = res_df[pcol].to_numpy(dtype=float)
-    if not np.all(np.isfinite(p)):
-        logger.write("  * WARNING: non-finite p-values found; replacing with 1.0 for q-value calc.")
-        p = np.where(np.isfinite(p), p, 1.0)
+    # Exclude non-finite from the qvalue fit; set their q=1 after
+    mask = np.isfinite(p_for_q)
+    if (~mask).any():
+        logger.write(f"  * Excluding {(~mask).sum()} non-finite p-values from qvalue fit; setting their q=1.")
 
-    if qvalue_lambda is not None:
-        logger.write(f'  * Calculating q-values with lambda = {qvalue_lambda:.3f}')
+    # Lambda policy: mildly conservative default if not provided
+    if qvalue_lambda is None:
+        qvalue_lambda = np.linspace(0.8, 0.99, 20)
+        logger.write("  * Using conservative lambda grid: [0.8..0.99]")
+    else:
+        logger.write(f"  * Using provided lambda: {qvalue_lambda}")
+        
+    # Run qvalue
+    q_all = np.ones_like(p_for_q, dtype=float)
+    qres = qvalue(p_for_q[mask], lambda_=qvalue_lambda)
+    q_all[mask] = qres["qvalues"]
+    res_df["qval"] = q_all
 
-    qvals_res = qvalue(p, lambda_=qvalue_lambda)
-    qvals, pi0 = qvals_res["qvalues"], qvals_res["pi0"]
-
-    res_df['qval'] = qvals
-    logger.write(f'  * Proportion of significant phenotypes (1-pi0): {1-pi0:.2f}')
+    pi0 = float(qres["pi0"])
+    logger.write(f"  * Proportion of significant phenotypes (1-pi0): {1 - pi0:.2f}")
     logger.write(f"  * QTL phenotypes @ FDR {fdr:.2f}: {(res_df['qval'] <= fdr).sum()}")
 
-    # Nominal threshold per phenotype via Beta params
+   # Phenotype-wise nominal threshold via Beta params (slightly conservative p*)
     res_df["pval_nominal_threshold"] = np.nan
+    use_beta = have_beta and ("beta_shape1" in res_df) and ("beta_shape2" in res_df)
     if use_beta:
-        have_params = res_df["beta_shape1"].notna() & res_df["beta_shape2"].notna()
-        if have_params.any():
-            lb = res_df.loc[(res_df["qval"] <= fdr) & have_params, "pval_beta"].sort_values()
-            ub = res_df.loc[(res_df["qval"] >  fdr) & have_params, "pval_beta"].sort_values()
-            if not lb.empty:
-                # global threshold p* between last sig and first non-sig (tensorQTL convention)
-                p_star = lb.iloc[-1] if ub.empty else 0.5 * (lb.iloc[-1] + ub.iloc[0])
-                # phenotype-wise nominal cutoff from Beta quantile
-                from scipy.stats import beta as beta_dist
-                idx = have_params[have_params].index
-                res_df.loc[idx, "pval_nominal_threshold"] = beta_dist.ppf(
-                    p_star, a=res_df.loc[idx, "beta_shape1"], b=res_df.loc[idx, "beta_shape2"]
-                )
-                logger.write(f"  * min p-value threshold @ FDR {fdr:.2f}: {p_star:.6g} (beta-quantile per phenotype)")
-        else:
-            logger.write("  * No beta parameters present; skipping nominal threshold computation.")
+        beta1 = res_df["beta_shape1"].to_numpy(float)
+        beta2 = res_df["beta_shape2"].to_numpy(float)
+        valid_beta = np.isfinite(p_beta) & np.isfinite(beta1) & np.isfinite(beta2)
+
+        lb = res_df.loc[(res_df["qval"] <= fdr) & valid_beta, "pval_beta"].sort_values()
+        ub = res_df.loc[(res_df["qval"] >  fdr) & valid_beta, "pval_beta"].sort_values()
+        if not lb.empty:
+            if ub.empty:
+                p_star = lb.iloc[-1]
+            else:
+                # lean toward upper (non-significant) boundary for a mild bump
+                last_sig = lb.iloc[-1]
+                first_nonsig = ub.iloc[0]
+                lean = float(np.clip(lean, 0.5, 1.0))  # 0.5 midpoint (tQTL), ->1.0 upper bound
+                p_star = (1.0 - lean) * last_sig + lean * first_nonsig
+
+            from scipy.stats import beta as beta_dist
+            idx = res_df.index[valid_beta]
+            res_df.loc[idx, "pval_nominal_threshold"] = beta_dist.ppf(
+                p_star, a=res_df.loc[idx, "beta_shape1"], b=res_df.loc[idx, "beta_shape2"]
+            )
+            where = "upper-lean" if ub.size and lean > 0.5 else "midpoint"
+            logger.write(f"  * beta nominal threshold p*: {p_star:.6g} ({where}, lean={lean:.2f})")
 
     return res_df
