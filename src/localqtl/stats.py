@@ -244,7 +244,7 @@ def nominal_pvals_tensorqtl(
 
 def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
                       qvalue_lambda: Optional[Union[float, Sequence[float]]] = None,
-                      logger: Optional[SimpleLogger] = None, lean: float = 0.6) -> pd.DataFrame:
+                      logger: Optional[SimpleLogger] = None) -> pd.DataFrame:
     """
     Annotate permutation results with q-values, p-value threshold.
 
@@ -281,7 +281,7 @@ def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
         mask_corr = np.isfinite(p_beta) & np.isfinite(p_perm)
         if mask_corr.sum() >= 3:
             r = stats.pearsonr(p_perm[mask_corr], p_beta[mask_corr])[0]
-            logger.write(f"  * Corr(p_perm, p_beta) = {r:.4f}")
+            logger.write(f'  * Correlation between Beta-approximated and empirical p-values: {r:.4f}')
         else:
             logger.write("  * Skipping corr(p_perm, p_beta): insufficient non-NaN values.")
 
@@ -291,11 +291,10 @@ def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
         logger.write(f"  * Excluding {(~mask).sum()} non-finite p-values from qvalue fit; setting their q=1.")
 
     # Lambda policy: mildly conservative default if not provided
-    if qvalue_lambda is None:
-        qvalue_lambda = np.linspace(0.8, 0.99, 20)
-        logger.write("  * Using conservative lambda grid: [0.8..0.99]")
+    if qvalue_lambda is not None:
+        logger.write(f'  * Calculating q-values with lambda = {qvalue_lambda:.3f}')
     else:
-        logger.write(f"  * Using provided lambda: {qvalue_lambda}")
+        qvalue_lambda = np.arange(0, 0.96, 0.05) # Default range
         
     # Run qvalue
     q_all = np.ones_like(p_for_q, dtype=float)
@@ -319,20 +318,17 @@ def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
         ub = res_df.loc[(res_df["qval"] >  fdr) & valid_beta, "pval_beta"].sort_values()
         if not lb.empty:
             if ub.empty:
-                p_star = lb.iloc[-1]
+                pthreshold = lb.iloc[-1]
             else:
-                # lean toward upper (non-significant) boundary for a mild bump
-                last_sig = lb.iloc[-1]
+                last_sig   = lb.iloc[-1]
                 first_nonsig = ub.iloc[0]
-                lean = float(np.clip(lean, 0.5, 1.0))  # 0.5 midpoint (tQTL), ->1.0 upper bound
-                p_star = (1.0 - lean) * last_sig + lean * first_nonsig
+                pthreshold = (last_sig + first_nonsig) / 2
 
             from scipy.stats import beta as beta_dist
             idx = res_df.index[valid_beta]
             res_df.loc[idx, "pval_nominal_threshold"] = beta_dist.ppf(
-                p_star, a=res_df.loc[idx, "beta_shape1"], b=res_df.loc[idx, "beta_shape2"]
+                pthreshold, a=res_df.loc[idx, "beta_shape1"], b=res_df.loc[idx, "beta_shape2"]
             )
-            where = "upper-lean" if ub.size and lean > 0.5 else "midpoint"
-            logger.write(f"  * beta nominal threshold p*: {p_star:.6g} ({where}, lean={lean:.2f})")
+            logger.write(f'  * min p-value threshold @ FDR {fdr}: {pthreshold:.6g}')
 
     return res_df
