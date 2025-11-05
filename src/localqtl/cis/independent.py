@@ -36,7 +36,6 @@ __all__ = [
 torch.backends.cuda.matmul.fp32_precision = 'tf32'
 torch.backends.cudnn.conv.fp32_precision = 'tf32'
 
-
 def _auto_perm_chunk(n_variants: int, nperm: int, safety: float = 0.65) -> int:
     if not torch.cuda.is_available():
         return min(nperm, 2048)
@@ -224,7 +223,7 @@ def _run_independent_core(
                 y_resid, G_resid, H_resid = residualize_batch(
                     y_t, G_t, H_t, rez_aug, center=True, group=False
                 )
-                k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
+                k_eff = rez_aug.k_eff if rez_aug is not None else 0
                 betas, ses, tstats, r2_perm = compute_perm_r2_max(
                     y_resid=y_resid,
                     G_resid=G_resid,
@@ -354,7 +353,7 @@ def _run_independent_core(
                     y_resid, G_resid, H_resid = residualize_batch(
                         y_t, G_t, H_t, rez_aug, center=True, group=False
                     )
-                    k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
+                    k_eff = rez_aug.k_eff if rez_aug is not None else 0
                     betas, ses, tstats, r2_perm = compute_perm_r2_max(
                         y_resid=y_resid,
                         G_resid=G_resid,
@@ -655,7 +654,7 @@ def _run_independent_core_group(
                 y_resid_list, G_resid, H_resid = residualize_batch(
                     y_stack, G_t, H_t, rez_aug, center=True, group=True
                 )
-                k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
+                k_eff = rez_aug.k_eff if rez_aug is not None else 0
                 num_var = int(G_resid.shape[0])
 
                 r2_perm_list: list[torch.Tensor] = []
@@ -798,7 +797,7 @@ def _run_independent_core_group(
                     y_resid_list, G_resid, H_resid = residualize_batch(
                         y_stack, G_t, H_t, rez_aug, center=True, group=True
                     )
-                    k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
+                    k_eff = rez_aug.k_eff if rez_aug is not None else 0
                     num_var = int(G_resid.shape[0])
 
                     r2_perm_list: list[torch.Tensor] = []
