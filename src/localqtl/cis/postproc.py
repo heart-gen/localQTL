@@ -99,7 +99,7 @@ def get_significant_pairs(res_df: pd.DataFrame,
 
     # Read & filter
     default_cols = ["phenotype_id", "variant_id", "pval_nominal",
-                    "start_distance", "end_distance", "pos"]
+                    "start_distance", "end_distance"]
     wanted_cols = columns or default_cols
     out = []
     chroms = sorted(paths.keys(), key=_chrom_sort_key)
