@@ -38,8 +38,10 @@ class Residualizer(object):
 
         if tensorqtl_flavor:
             self.dof = n_samples - 2 - C_t.shape[1]
+            self.k_eff = self.rank
         else:
             self.dof = n_samples - 2 - self.rank
+            self.k_eff = C_t.shape[1]
 
         if tensorqtl_flavor and self.rank < C_t.shape[1]:
             print(f"[warning] Covariate matrix has {C_t.shape[1] - self.rank} "

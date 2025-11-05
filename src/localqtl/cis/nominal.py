@@ -225,7 +225,8 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
             var_ids = idx_to_id[v_idx]
             var_pos = pos_arr[v_idx].astype(np.int32, copy=False)
             variant_cache[cache_key] = (var_ids, var_pos)
-        k_eff = rez.Q_t.shape[1] if rez is not None else 0
+
+        k_eff = rez.k_eff if rez is not None else 0
 
         # Per-phenotype regressions in this window
         for y_t, pid in y_iter:

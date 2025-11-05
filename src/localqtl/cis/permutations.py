@@ -148,7 +148,7 @@ def _run_permutation_core(
         y_resid_t, G_resid, H_resid = residualize_batch(y_t, G_t, H_t, rez, center=True)
 
         # Compute effective covariate rank for DoF
-        k_eff = rez.Q_t.shape[1] if rez is not None else 0
+        k_eff = rez.k_eff if rez is not None else 0
 
         # Nominal regression on GPU
         betas, ses, tstats = run_batch_regression(
@@ -400,7 +400,7 @@ def _run_permutation_core_group(
         n = int(Y_resid.shape[1])
         p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
         dof = max(n - p_pred, 1)
-        k_eff = rez.Q_t.shape[1] if rez is not None else 0
+        k_eff = rez.k_eff if rez is not None else 0
         ##dof = max(n - 2 - int(k_eff), 1)
         var_ids = idx_to_id[v_idx]
         var_pos = pos_arr[v_idx]
