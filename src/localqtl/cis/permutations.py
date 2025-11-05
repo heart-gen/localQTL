@@ -76,7 +76,7 @@ def _run_permutation_core(
         "ma_count": np.float32,
         "af": np.float32,
         "true_dof": np.int32,
-        "pval_true_dof": np.int32,
+        "pval_true_dof": np.float32,
     }
     buffers = allocate_result_buffers(expected_columns, dtype_map, _estimate_rows(ig, chrom))
     cursor = 0
@@ -303,7 +303,7 @@ def _run_permutation_core_group(
         "ma_count": np.float32,
         "af": np.float32,
         "true_dof": np.int32,
-        "pval_true_dof": np.int32,
+        "pval_true_dof": np.float32,
     }
     buffers = allocate_result_buffers(expected_columns, dtype_map,
                                       _estimate_rows(ig, chrom, grouped=True))
