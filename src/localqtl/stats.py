@@ -23,60 +23,100 @@ __all__ = [
     "pval_from_corr_r2"
 ]
 
+def get_t_pval(t, df, two_tailed: bool = True, log10: bool = False):
+    """
+    Numerically stable p-values for Student's t.
+    Accepts scalars/arrays and torch tensors.
+    If log10=True, returns -log10(p) (still via log-survival path).
+    """
+    t = np.asarray(t.detach().cpu() if isinstance(t, torch.Tensor) else t, dtype=np.float64)
+    df = np.asarray(df.detach().cpu() if isinstance(df, torch.Tensor) else df, dtype=np.float64)
+
+    # Use log-survival to avoid underflow at large |t|
+    log_sf = stats.t.logsf(np.abs(t), df)
+    log_p  = log_sf + (0.0 if not two_tailed else np.log(2.0))
+    if log10:
+        return -log_p / np.log(10.0)
+    return np.minimum(np.exp(log_p), 1.0)
+
+
 def pval_from_corr_r2(r2, dof, two_tailed: bool = True, log10: bool = False):
     """
-    Convert R^2 to a (two-sided) p-value using Student's t with 'dof'.
-    Uses log-survival for numerical stability.
+    Convert R^2 to p-value using Student's t-distribution.
     """
-    r2 = np.asarray(r2, dtype=np.float64)
+    r2 = np.clip(np.asarray(r2, dtype=np.float64), 0.0, 1.0 - 1e-15)
     dof = np.asarray(dof, dtype=np.float64)
-    # Guard edges so t is finite
-    r2 = np.clip(r2, 0.0, 1.0 - 1e-15)
     t = np.sqrt(dof * r2 / np.maximum(1.0 - r2, 1e-15))
     return get_t_pval(t, dof, two_tailed=two_tailed, log10=log10)
 
 
-def _beta_shape1_from_dof(r2_perm, dof):
+def _approx_beta_alpha(r2_perm, dof):
+    """Estimate shape1 (alpha) for Beta using p-value distribution."""
     p = pval_from_corr_r2(r2_perm, dof)
     m, v = p.mean(), p.var()
-    return m * (m * (1.0 - m) / v - 1.0)
+    if not np.isfinite(v) or v <= 1e-12:
+        return 1.0 
+    return max(m * (m * (1.0 - m) / v - 1.0), 1e-6)
 
 
 def _solve_true_dof(r2_perm, dof_init, tol=1e-4):
-    f = lambda x: np.log(_beta_shape1_from_dof(r2_perm, np.exp(x)))
+    """Estimate best-fitting DoF for mapping R^2 -> p-values -> Beta dist."""
+    r2_perm = np.asarray(r2_perm, dtype=np.float64)
+    if r2_perm.size == 0 or not np.all(np.isfinite(r2_perm)):
+        return float(dof_init)
+
     try:
+        f = lambda log_dof: np.log(_approx_beta_alpha(r2_perm, np.exp(log_dof)))
         log_dof = scipy.optimize.newton(f, np.log(dof_init), tol=tol, maxiter=50)
-        return float(np.exp(log_dof))
+        dof_est = float(np.exp(log_dof))
+        return dof_est if np.isfinite(dof_est) else float(dof_init)
     except Exception:
         res = scipy.optimize.minimize(
-            lambda x: abs(_beta_shape1_from_dof(r2_perm, x[0]) - 1.0),
+            lambda x: abs(_approx_beta_alpha(r2_perm, x[0]) - 1.0),
             x0=[dof_init], method="Nelder-Mead", tol=tol,
         )
-        return float(res.x[0])
+        dof_est = float(res.x[0])
+        return dof_est if res.success and np.isfinite(dof_est) else float(dof_init)
 
 
 def _beta_mle_on_p(p):
+    """Fit Beta(a, b) by maximum likelihood on [0, 1] p-values."""
+    p = np.clip(p, 1e-15, 1 - 1e-15)
     m, v = p.mean(), p.var()
-    a0 = m * (m * (1.0 - m) / v - 1.0)
-    b0 = a0 * (1.0/m - 1.0)
+    a0 = max(m * (m * (1.0 - m) / v - 1.0), 1e-6)
+    b0 = max(a0 * (1.0 / m - 1.0), 1e-6)
+
     def nll(ab):
         a, b = ab
         if a <= 0 or b <= 0: return np.inf
         return -((a-1)*np.log(p).sum() + (b-1)*np.log(1.0-p).sum() - len(p)*betaln(a,b))
-    a,b = scipy.optimize.minimize(nll, x0=[a0, b0], method="Nelder-Mead").x
+    result = scipy.optimize.minimize(nll, x0=[a0, b0], method="Nelder-Mead")
+    a, b = result.x
     return float(a), float(b)
 
 
-def beta_approx_pval(r2_perm, r2_true, dof_init):
+def beta_approx_pval(r2_perm, r2_true, dof_init, log10=False):
     """
-    Fit Beta(a,b) to permutation R^2 using tensorQTL method.
+    Compute beta-approximate p-value from R^2 using tensorQTL-like method.
     """
+    r2_perm = np.asarray(r2_perm, dtype=np.float64)
+    r2_true = float(r2_true)
+    dof_init = float(dof_init)
+
+    if r2_perm.size == 0 or not np.all(np.isfinite(r2_perm)):
+        p_true = pval_from_corr_r2([r2_true], dof_init, log10=log10)[0]
+        return float("nan"), float("nan"), float("nan"), dof_init, p_true
+
     true_dof = _solve_true_dof(r2_perm, dof_init)
     p_perm = pval_from_corr_r2(r2_perm, true_dof)
-    a,b = _beta_mle_on_p(p_perm)
-    p_true = pval_from_corr_r2(np.array([r2_true]), true_dof)[0]
+    a, b = _beta_mle_on_p(p_perm)
+    p_true = pval_from_corr_r2([r2_true], true_dof, log10=False)[0]
     p_beta = stats.beta.cdf(p_true, a, b)
-    return p_beta, a, b, true_dof, p_true
+    return (
+        -np.log10(p_beta) if log10 else p_beta,
+        a, b, true_dof,
+        -np.log10(p_true) if log10 else p_true
+    )
 
 
 def beta_approx_pval_old(r2_perm, r2_true, dof_init):
@@ -121,35 +161,6 @@ def beta_approx_pval_old(r2_perm, r2_true, dof_init):
     return float(p_beta), float(a), float(b), float(dof_init), float(p_true)
 
     
-def get_t_pval(t, df, two_tailed: bool = True, log10: bool = False):
-    """
-    Numerically stable p-values for Student's t.
-    Accepts scalars/arrays and torch tensors.
-    If log10=True, returns -log10(p) (still via log-survival path).
-    """
-    try: # Accept torch
-        if isinstance(t, torch.Tensor):
-            t = t.detach().cpu().numpy()
-        if isinstance(df, torch.Tensor):
-            df = df.detach().cpu().numpy()
-    except Exception:
-        pass
-
-    t = np.asarray(t, dtype=np.float64)
-    df = np.asarray(df, dtype=np.float64)
-
-    # Use log-survival to avoid underflow at large |t|
-    log_sf = stats.t.logsf(np.abs(t), df)
-    log_p  = log_sf + (0.0 if not two_tailed else np.log(2.0))
-
-    if log10:
-        return -log_p / np.log(10.0)
-
-    p = np.exp(log_p)
-    p = np.minimum(p, 1.0)
-    return p
-
-
 def t_two_sided_pval_torch(t_abs: torch.Tensor, dof: int | torch.Tensor) -> torch.Tensor:
     """
     Two-sided p-value for |t| with df degrees of freedom, returned on the same
