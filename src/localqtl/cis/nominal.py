@@ -182,23 +182,32 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
             H_t = None
 
         # Impute / filter
-        G_t, keep_mask, _ = impute_mean_and_filter(G_t)
-        if keep_mask.numel() == 0 or keep_mask.sum().item() == 0:
+        G_t, keep_mono, _ = impute_mean_and_filter(G_t)
+        if G_t.shape[0] == 0:
             continue
 
+        # Keep variant metadata / haps in sync with the monomorphic filter
+        v_idx = v_idx[keep_mono.detach().cpu().numpy()]
+        if H_t is not None:
+            H_t = H_t[keep_mono]
+            if H_t.shape[2] > 1:
+                H_t = H_t[:, :, :-1]
+
+        # Optional MAF filter on the *current* (already-imputed/trimmed) G_t
         if maf_threshold and maf_threshold > 0:
             keep_maf, _ = filter_by_maf(G_t, maf_threshold, ploidy=2)
-            keep_mask = keep_mask & keep_maf
-            if keep_mask.sum().item() == 0:
+            if keep_maf.sum().item() == 0:
                 continue
+            # Apply MAF mask consistently across tensors/indices
+            G_t   = G_t[keep_maf]
+            v_idx = v_idx[keep_maf.detach().cpu().numpy()]
+            if H_t is not None:
+                H_t = H_t[keep_maf]
 
-        # Mask consistently
-        G_t = G_t[keep_mask]
-        v_idx = v_idx[keep_mask.detach().cpu().numpy()]
+        # Sanity checks to catch any future drift
+        assert G_t.shape[0] == v_idx.shape[0], "G_t and v_idx out of sync"
         if H_t is not None:
-            H_t = H_t[keep_mask]
-            if H_t.shape[2] > 1:
-                H_t = H_t[:, :, :-1] 
+            assert H_t.shape[0] == G_t.shape[0], "G_t and H_t out of sync"
 
         # Allele statistics on imputed genotypes
         af_t, ma_samples_t, ma_count_t = allele_stats(G_t, ploidy=2)
