@@ -26,11 +26,10 @@ def _nominal_parquet_schema(include_perm: bool) -> pa.Schema:
     fields = [
         pa.field("phenotype_id", pa.string()),
         pa.field("variant_id", pa.string()),
-        pa.field("pos", pa.int32()),
         pa.field("start_distance", pa.int32()),
         pa.field("end_distance", pa.int32()),
-        pa.field("beta", pa.float32()),
-        pa.field("se", pa.float32()),
+        pa.field("slope", pa.float32()),
+        pa.field("slope_se", pa.float32()),
         pa.field("tstat", pa.float32()),
         pa.field("pval_nominal", pa.float32()),
         pa.field("af", pa.float32()),
@@ -72,11 +71,10 @@ def _allocate_buffers(expected_columns, include_perm: bool, target_rows: int) ->
     buffers: dict[str, np.ndarray] = {
         "phenotype_id":   np.empty(target, dtype=object),
         "variant_id":     np.empty(target, dtype=object),
-        "pos":            np.empty(target, dtype=np.int32),
         "start_distance": np.empty(target, dtype=np.int32),
         "end_distance":   np.empty(target, dtype=np.int32),
-        "beta":           np.empty(target, dtype=np.float32),
-        "se":             np.empty(target, dtype=np.float32),
+        "slope":           np.empty(target, dtype=np.float32),
+        "slope_se":             np.empty(target, dtype=np.float32),
         "tstat":          np.empty(target, dtype=np.float32),
         "pval_nominal":   np.empty(target, dtype=np.float32),
         "af":             np.empty(target, dtype=np.float32),
@@ -115,8 +113,8 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
 
     include_perm = nperm is not None and nperm > 0
     expected_columns = [
-        "phenotype_id", "variant_id", "pos", "start_distance",
-        "end_distance", "beta", "se", "tstat", "pval_nominal",
+        "phenotype_id", "variant_id", "start_distance",
+        "end_distance", "slope", "slope_se", "tstat", "pval_nominal",
         "af", "ma_samples", "ma_count",
     ]
     if include_perm:
@@ -265,7 +263,6 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
 
             buffers["phenotype_id"][row_slice] = str(pid)
             buffers["variant_id"][row_slice] = var_ids
-            buffers["pos"][row_slice] = var_pos
             np.subtract(var_pos, ig.phenotype_start[pid],
                         out=buffers["start_distance"][row_slice])
             np.subtract(var_pos, ig.phenotype_end[pid],
@@ -274,8 +271,8 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
             beta_np, se_np, tstat_np, pval_np, af_np = (floats[:, i] for i in range(5))
             ma_samples_np, ma_count_np = ints[:, 0], ints[:, 1]
 
-            buffers["beta"][row_slice] = beta_np
-            buffers["se"][row_slice] = se_np
+            buffers["slope"][row_slice] = beta_np
+            buffers["slope_se"][row_slice] = se_np
             buffers["tstat"][row_slice] = tstat_np
             buffers["pval_nominal"][row_slice] = pval_np
             buffers["af"][row_slice] = af_np
@@ -319,7 +316,7 @@ def map_nominal(
         out_dir: str = "./", out_prefix: str = "cis_nominal",
         compression: str = "snappy", return_df: bool = False,
         logger: SimpleLogger | None = None, verbose: bool = True,
-        preload_haplotypes: bool = True,
+        preload_haplotypes: bool = True, tensorqtl_flavor: bool = False,
     ) -> pd.DataFrame:
     """
     Nominal cis-QTL scan with optional permutations and local ancestry.
@@ -372,7 +369,8 @@ def map_nominal(
     # Residualize once using the filtered phenotypes from the generator
     Y = torch.tensor(ig.phenotype_df.values, dtype=torch.float32, device=device)
     with logger.time_block(" Residualizing phenotypes", sync=sync):
-        Y_resid, rez = residualize_matrix_with_covariates(Y, covariates_df, device)
+        Y_resid, rez = residualize_matrix_with_covariates(Y, covariates_df,
+                                                          device, tensorqtl_flavor)
 
     ig.phenotype_df = pd.DataFrame(
         Y_resid.cpu().numpy(), index=ig.phenotype_df.index, columns=ig.phenotype_df.columns

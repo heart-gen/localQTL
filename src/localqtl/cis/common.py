@@ -54,7 +54,8 @@ def dosage_vector_for_covariate(
 
 
 def residualize_matrix_with_covariates(
-        Y: torch.Tensor, C: Optional[pd.DataFrame], device: str
+        Y: torch.Tensor, C: Optional[pd.DataFrame], device: str,
+        tensorqtl_flavor: bool = False
 ) -> Tuple[torch.Tensor, Optional[Residualizer]]:
     """
     Residualize (features x samples) matrix Y against covariates C across samples.
@@ -64,7 +65,7 @@ def residualize_matrix_with_covariates(
         return Y, None
     dev = resolve_device(device)
     C_t = torch.tensor(C.values, dtype=torch.float32, device=dev)
-    rez = Residualizer(C_t)
+    rez = Residualizer(C_t, tensorqtl_flavor=tensorqtl_flavor)
     (Y_resid,) = rez.transform(move_to_device(Y, dev), center=True)
     return Y_resid, rez
 
