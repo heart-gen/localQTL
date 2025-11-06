@@ -1,4 +1,4 @@
-import torch
+import torch, warnings
 from ._torch_utils import move_to_device, resolve_device
 
 try:
@@ -38,8 +38,10 @@ class Residualizer(object):
 
         if tensorqtl_flavor:
             self.dof = n_samples - 2 - C_t.shape[1]
+            self.k_eff = self.rank
         else:
             self.dof = n_samples - 2 - self.rank
+            self.k_eff = C_t.shape[1]
 
         if tensorqtl_flavor and self.rank < C_t.shape[1]:
             print(f"[warning] Covariate matrix has {C_t.shape[1] - self.rank} "
@@ -156,7 +158,7 @@ def run_batch_regression(y, G, H=None, k_eff: int = 0, device="cuda"):
     G_exp = G.unsqueeze(-1)
 
     if H is not None:
-        H = move_to_device(H, device)  # (m × n × (k-1))
+        H = move_to_device(H, device)     # (m × n × (k-1))
         X = torch.cat([G_exp, H], dim=2)  # (m × n × p)
     else:
         X = G_exp  # (m × n × 1)
@@ -193,7 +195,8 @@ def run_batch_regression_with_permutations(
         y_perm: torch.Tensor | None = None, k_eff: int = 0, device: str = "cuda",
 ):
     """
-    Return nominal betas/ses/tstats for G~y, and per-permutation max r^2 across variants.
+    Return nominal betas/ses/tstats for G~y (+ H if present), and per-permutation
+    max r^2 across variants.
     No (chunk x chunk) allocations; memory scales with (m*n + (m+n)*chunk).
     """
     device = resolve_device(device)
@@ -205,45 +208,94 @@ def run_batch_regression_with_permutations(
 
     n = y.shape[0]
     m = G.shape[0]
-    dof = max(n - 1 - int(k_eff), 1)
 
-    # Nominal (vectorized)
     EPS = 1e-8
-    Gnorm2 = (G * G).sum(dim=1) + EPS          # (m,)
-    ynorm2 = (y * y).sum() + EPS               # scalar
-    Gy     = G @ y                             # (m,)
 
-    r      = Gy / torch.sqrt(Gnorm2 * ynorm2)  # (m,)
-    one_minus_r2 = 1.0 - r * r
-    t      = r * torch.sqrt(dof / torch.clamp(one_minus_r2, min=EPS))
-    beta   = Gy / Gnorm2                         # (m,)
-    se     = torch.abs(beta) / torch.clamp(t.float(), min=1e-8)
+    if H is None:
+        # Fast vectorized implementation (no H covariates)
+        dof = max(n - 1 - int(k_eff), 1)
+        Gnorm2 = (G * G).sum(dim=1) + EPS          # (m,)
+        ynorm2 = (y * y).sum() + EPS               # scalar
+        Gy     = G @ y                             # (m,)
 
-    betas  = beta.unsqueeze(1)                   # (m,1)
-    ses    = se.unsqueeze(1)                     # (m,1)
-    tstats = t.unsqueeze(1)                      # (m,1)
+        r      = Gy / torch.sqrt(Gnorm2 * ynorm2)  # (m,)
+        one_minus_r2 = 1.0 - r * r
+        t      = r * torch.sqrt(dof / torch.clamp(one_minus_r2, min=EPS))
+        beta   = Gy / Gnorm2                       # (m,)
+        se     = torch.abs(beta) / torch.clamp(t.float(), min=1e-8)
 
-    # Permutations (chunked)
-    r2_perm = None
-    if y_perm is not None:
-        Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS
-        use_amp = G.is_cuda and y_perm.is_cuda
-        if use_amp:
-            try:
-                with torch.amp.autocast("cuda", dtype=torch.float16):
-                    GYp = G @ y_perm             # (m, chunk)
-            except Exception:
-                # older Torch
-                with torch.cuda.amp.autocast(dtype=torch.float16):
-                    GYp = G @ y_perm
-        else:
-            GYp = G @ y_perm
+        betas  = beta.unsqueeze(1)                 # (m,1)
+        ses    = se.unsqueeze(1)                   # (m,1)
+        tstats = t.unsqueeze(1)                    # (m,1)
 
-        GYp = GYp.float()
-        denom = torch.sqrt(Gnorm2).unsqueeze(1) * torch.sqrt(Ypnorm2).unsqueeze(0)
-        R2 = (GYp / torch.clamp(denom, min=EPS)) ** 2
+        r2_perm = None
+        if y_perm is not None:
+            Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS
+            use_amp = G.is_cuda and y_perm.is_cuda
+            if use_amp:
+                try:
+                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                        GYp = G @ y_perm
+                except Exception:
+                    with torch.cuda.amp.autocast(dtype=torch.float16):
+                        GYp = G @ y_perm
+            else:
+                GYp = G @ y_perm
 
-        r2_vals, _ = _max_ignore_nan(R2, dim=0)
-        r2_perm = r2_vals.float()
+            GYp = GYp.float()
+            denom = torch.sqrt(Gnorm2).unsqueeze(1) * torch.sqrt(Ypnorm2).unsqueeze(0)
+            R2 = (GYp / torch.clamp(denom, min=EPS)) ** 2
 
-    return betas, ses, tstats, r2_perm
+            r2_vals, _ = _max_ignore_nan(R2, dim=0)
+            r2_perm = r2_vals.float()
+
+        return betas, ses, tstats, r2_perm
+    else:
+        # General OLS regression with H covariates
+        H = move_to_device(H, device)
+        G_exp = G.unsqueeze(-1)
+        X = torch.cat([G_exp, H], dim=2)
+        y_exp = y.unsqueeze(0).expand(m, -1).unsqueeze(-1)
+
+        m, n, p = X.shape
+        dof = n - int(k_eff) - p
+
+        # Compute XtX and Xty
+        XtX = torch.matmul(X.transpose(1, 2), X)
+        Xty = torch.matmul(X.transpose(1, 2), y_exp)
+
+        # Solve for betas
+        betas = torch.linalg.solve(XtX, Xty).squeeze(-1)
+        y_hat = torch.matmul(X, betas.unsqueeze(-1))
+        resid = y_exp - y_hat
+        sigma2 = (resid.transpose(1, 2) @ resid).squeeze() / dof
+
+        XtX_inv = torch.linalg.inv(XtX)
+        var_betas = XtX_inv * sigma2.view(-1, 1, 1)
+        ses = torch.sqrt(torch.diagonal(var_betas, dim1=1, dim2=2))
+        tstats = betas / ses
+
+        # r2 permutation
+        r2_perm = None
+        if y_perm is not None:
+            chunk = y_perm.shape[1]
+            Yp_exp = y_perm.unsqueeze(0).expand(m, -1, -1)
+
+            r2_perm = torch.empty(chunk, device=device)
+            for i in range(chunk):
+                ypi = y_perm[:, i]
+                ypi_exp = ypi.unsqueeze(0).expand(m, -1).unsqueeze(-1)
+
+                Xty_perm = torch.matmul(X.transpose(1, 2), ypi_exp)
+                beta_perm = torch.linalg.solve(XtX, Xty_perm).squeeze(-1)
+                y_hat_perm = torch.matmul(X, beta_perm.unsqueeze(-1))
+                resid_perm = ypi_exp - y_hat_perm
+                sigma2_perm = (resid_perm.transpose(1, 2) @ resid_perm).squeeze() / dof
+
+                # Compute total variance explained by full model
+                ss_total = ((ypi - ypi.mean()) ** 2).sum()
+                ss_resid = (resid_perm ** 2).sum(dim=1).squeeze()
+                r2 = 1.0 - (ss_resid / ss_total)
+                r2_perm[i] = torch.nan_to_num(r2.max(), nan=0.0)
+
+        return betas, ses, tstats, r2_perm
