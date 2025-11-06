@@ -1,6 +1,4 @@
-import warnings
-
-import torch
+import torch, warnings
 from ._torch_utils import move_to_device, resolve_device
 
 try:
@@ -160,7 +158,7 @@ def run_batch_regression(y, G, H=None, k_eff: int = 0, device="cuda"):
     G_exp = G.unsqueeze(-1)
 
     if H is not None:
-        H = move_to_device(H, device)  # (m × n × (k-1))
+        H = move_to_device(H, device)     # (m × n × (k-1))
         X = torch.cat([G_exp, H], dim=2)  # (m × n × p)
     else:
         X = G_exp  # (m × n × 1)
@@ -198,27 +196,22 @@ def run_batch_regression_with_permutations(
         use_partial_perm: bool = True,
 ):
     """
-    Return nominal betas/ses/tstats for G~y, and per-permutation max r^2 across variants.
-    When ``H`` is provided and ``use_partial_perm=True``, the permutation statistic is the
-    genotype partial t/R² conditional on ``H``. No (chunk x chunk) allocations; memory
-    scales with (m*n + (m+n)*chunk).
+    Efficient regression with optional covariates and permutation testing
+    using Gauss-Markov projection trick.
     """
     device = resolve_device(device)
-
     y = move_to_device(y, device)
     G = move_to_device(G, device)
     if y_perm is not None:
         y_perm = y_perm.to(device)
 
+    EPS = 1e-8
     n = y.shape[0]
     m = G.shape[0]
 
-    EPS = 1e-8
-
-    if H is None or not use_partial_perm:
+    if H is None:
+        # Fast vectorized implementation (no H covariates)
         dof = max(n - 1 - int(k_eff), 1)
-
-        # Nominal (vectorized correlation path)
         Gnorm2 = (G * G).sum(dim=1) + EPS          # (m,)
         ynorm2 = (y * y).sum() + EPS               # scalar
         Gy     = G @ y                             # (m,)
@@ -226,143 +219,67 @@ def run_batch_regression_with_permutations(
         r      = Gy / torch.sqrt(Gnorm2 * ynorm2)  # (m,)
         one_minus_r2 = 1.0 - r * r
         t      = r * torch.sqrt(dof / torch.clamp(one_minus_r2, min=EPS))
-        beta   = Gy / Gnorm2                         # (m,)
-        se     = torch.abs(beta) / torch.clamp(t.float(), min=EPS)
+        beta   = Gy / Gnorm2                       # (m,)
+        se     = torch.abs(beta) / torch.clamp(t.float(), min=1e-8)
 
-        betas  = beta.unsqueeze(1)                   # (m,1)
-        ses    = se.unsqueeze(1)                     # (m,1)
-        tstats = t.unsqueeze(1)                      # (m,1)
+        betas  = beta.unsqueeze(1)                 # (m,1)
+        ses    = se.unsqueeze(1)                   # (m,1)
+        tstats = t.unsqueeze(1)                    # (m,1)
 
-        # Permutations (chunked correlation path)
+        # Permutations
         r2_perm = None
         if y_perm is not None:
             Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS
-            use_amp = G.is_cuda and y_perm.is_cuda
-            if use_amp:
-                try:
-                    with torch.amp.autocast("cuda", dtype=torch.float16):
-                        GYp = G @ y_perm             # (m, chunk)
-                except Exception:
-                    # older Torch
-                    with torch.cuda.amp.autocast(dtype=torch.float16):
-                        GYp = G @ y_perm
-            else:
-                GYp = G @ y_perm
-
-            GYp = GYp.float()
+            GYp   = G @ y_perm
             denom = torch.sqrt(Gnorm2).unsqueeze(1) * torch.sqrt(Ypnorm2).unsqueeze(0)
-            R2 = (GYp / torch.clamp(denom, min=EPS)) ** 2
-
+            R2    = (GYp / torch.clamp(denom, min=EPS)) ** 2
             r2_vals, _ = _max_ignore_nan(R2, dim=0)
             r2_perm = r2_vals.float()
 
         return betas, ses, tstats, r2_perm
-
-    # Partial regression path (H provided)
-    H = move_to_device(H, device)
-    m, n, pH = H.shape
-    p = 1 + pH
-    dof = max(n - int(k_eff) - p, 1)
-
-    # Precompute XtX components
-    Gnorm2 = (G * G).sum(dim=1) + EPS          # (m,)
-    gTH = torch.einsum('mn,mnp->mp', G, H)     # (m, pH)
-    HtH = torch.einsum('mnp,mnq->mpq', H, H)   # (m, pH, pH)
-
-    XtX = torch.zeros((m, p, p), device=G.device, dtype=G.dtype)
-    XtX[:, 0, 0] = Gnorm2
-    XtX[:, 0, 1:] = gTH
-    XtX[:, 1:, 0] = gTH
-    XtX[:, 1:, 1:] = HtH
-
-    I = torch.eye(p, device=XtX.device, dtype=XtX.dtype).expand_as(XtX)
-    ridge = 1e-8
-    L = None
-    chol_success = False
-    for _ in range(6):
-        try:
-            L = torch.linalg.cholesky(XtX + ridge * I)
-            chol_success = True
-            break
-        except RuntimeError:
-            ridge *= 10
-
-    if chol_success:
-        XtX_inv_diag = torch.diagonal(torch.cholesky_inverse(L), dim1=1, dim2=2)
-
-        def _solve(Xty: torch.Tensor) -> torch.Tensor:
-            if Xty.dim() == 2:
-                return torch.cholesky_solve(Xty.unsqueeze(-1), L).squeeze(-1)
-            return torch.cholesky_solve(Xty, L)
     else:
-        warnings.warn(
-            "Cholesky decomposition failed for XtX; falling back to pseudo-inverse.",
-            RuntimeWarning,
-        )
-        XtX_inv = torch.linalg.pinv(XtX)
-        XtX_inv_diag = torch.diagonal(XtX_inv, dim1=1, dim2=2)
+        # Gauss-Markov Projection (with H covariates)
+        H = move_to_device(H, device)
 
-        def _solve(Xty: torch.Tensor) -> torch.Tensor:
-            if Xty.dim() == 2:
-                return torch.matmul(XtX_inv, Xty.unsqueeze(-1)).squeeze(-1)
-            return torch.matmul(XtX_inv, Xty)
+        betas = torch.empty((m, 1), device=device)
+        ses = torch.empty((m, 1), device=device)
+        tstats = torch.empty((m, 1), device=device)
+        r2_perm = torch.zeros((y_perm.shape[1],), device=device) if y_perm is not None else None
+        def project_out(v, Q):
+            return v - Q @ (Q.T @ v)
 
-    # Nominal statistics (batched)
-    gy = G @ y
-    Hy = torch.einsum('mnp,n->mp', H, y)
-    Xty_nom = torch.cat([gy.unsqueeze(1), Hy], dim=1)
-    beta_full = _solve(Xty_nom)
+        for i in range(m):
+            Hi = H[i]
+            Gi = G[i]
+            Qi, _ = torch.linalg.qr(Hi)
 
-    # Compute sigma^2 and t-stats
-    y_norm2 = (y * y).sum() + EPS
-    dot_term = (Xty_nom * beta_full).sum(dim=1)
-    quad_term = torch.einsum('mp,mpq,mq->m', beta_full, XtX, beta_full)
-    SSE = torch.clamp_min(y_norm2 - 2.0 * dot_term + quad_term, EPS)
-    sigma2 = SSE / float(dof)
-    var_diag = XtX_inv_diag * sigma2.unsqueeze(1)
-    ses = torch.sqrt(torch.clamp_min(var_diag, EPS))
-    betas = beta_full
-    tstats = betas / torch.clamp_min(ses, EPS)
+            # Residualize y and G[i]
+            y_resid  = project_out(y, Qi)
+            Gi_resid = project_out(Gi, Qi)
 
-    # Permutations (chunked)
-    r2_perm = None
-    if y_perm is not None:
-        if y_perm.dim() != 2 or y_perm.shape[0] != n:
-            raise ValueError("y_perm must have shape (n_samples, chunk)")
-        y_perm = y_perm.to(device)
-        y_norm_perm = (y_perm * y_perm).sum(dim=0) + EPS
-        use_amp = G.is_cuda and y_perm.is_cuda
-        if use_amp:
-            try:
-                with torch.amp.autocast("cuda", dtype=torch.float16):
-                    gy_perm = G @ y_perm
-                    Hy_perm = torch.einsum('mnp,nk->mpk', H, y_perm)
-            except Exception:
-                with torch.cuda.amp.autocast(dtype=torch.float16):
-                    gy_perm = G @ y_perm
-                    Hy_perm = torch.einsum('mnp,nk->mpk', H, y_perm)
-        else:
-            gy_perm = G @ y_perm
-            Hy_perm = torch.einsum('mnp,nk->mpk', H, y_perm)
+            Gnorm2 = (Gi_resid ** 2).sum() + EPS
+            ynorm2 = (y_resid ** 2).sum() + EPS
+            Gy     = Gi_resid @ y_resid
 
-        Xty_perm = torch.cat([gy_perm.unsqueeze(1), Hy_perm], dim=1).float()
-        beta_perm = _solve(Xty_perm)
+            r    = Gy / torch.sqrt(Gnorm2 * ynorm2)
+            one_minus_r2 = 1.0 - r * r            
+            dof  = max(n - Qi.shape[1] - 1 - int(k_eff), 1)
+            t    = r * torch.sqrt(dof / torch.clamp(one_minus_r2, min=EPS))
+            beta = Gy / Gnorm2
+            se   = torch.abs(beta) / torch.clamp(t.float(), min=1e-8)
 
-        dot_term_perm = (Xty_perm * beta_perm).sum(dim=1)
-        quad_term_perm = torch.einsum('mpc,mpq,mqc->mc', beta_perm, XtX, beta_perm)
-        SSE_perm = torch.clamp_min(
-            y_norm_perm.unsqueeze(0) - 2.0 * dot_term_perm + quad_term_perm,
-            EPS,
-        )
-        dof_perm = float(max(n - int(k_eff) - p, 1))
-        sigma2_perm = SSE_perm / dof_perm
-        se_g = torch.sqrt(
-            torch.clamp_min(XtX_inv_diag[:, 0:1] * sigma2_perm, EPS)
-        )
-        t_g = beta_perm[:, 0, :] / torch.clamp_min(se_g, EPS)
-        t_sq = t_g.double().pow(2)
-        r2 = (t_sq / (t_sq + dof_perm)).to(torch.float32)
-        r2_vals, _ = _max_ignore_nan(r2, dim=0)
-        r2_perm = r2_vals.float()
+            betas[i, 0]  = beta
+            ses[i, 0]    = se
+            tstats[i, 0] = t
 
-    return betas, ses, tstats, r2_perm
+            # Permutations
+            if y_perm is not None:
+                Yp_resid = project_out(y_perm, Qi)
+                Ypnorm2  = (Yp_resid ** 2).sum(dim=0) + EPS
+                GiYp     = Gi_resid @ Yp_resid
+                denom    = torch.sqrt(Gnorm2 * Ypnorm2)
+                R2 = (GiYp / torch.clamp(denom, min=EPS)) ** 2
+                r2_vals, _ = _max_ignore_nan(R2.unsqueeze(0), dim=0)
+                r2_perm  = torch.maximum(r2_perm, r2_vals.float())
+
+        return betas, ses, tstats, r2_perm
