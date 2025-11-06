@@ -193,6 +193,7 @@ def run_batch_regression(y, G, H=None, k_eff: int = 0, device="cuda"):
 def run_batch_regression_with_permutations(
         y: torch.Tensor, G: torch.Tensor, H: torch.Tensor | None = None,
         y_perm: torch.Tensor | None = None, k_eff: int = 0, device: str = "cuda",
+        use_partial_perm: bool = True,
 ):
     """
     Efficient regression with optional covariates and permutation testing

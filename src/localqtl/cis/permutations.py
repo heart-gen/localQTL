@@ -148,7 +148,7 @@ def _run_permutation_core(
         y_resid_t, G_resid, H_resid = residualize_batch(y_t, G_t, H_t, rez, center=True)
 
         # Compute effective covariate rank for DoF
-        k_eff = rez.Q_t.shape[1] if rez is not None else 0
+        k_eff = rez.k_eff if rez is not None else 0
 
         # Nominal regression on GPU
         betas, ses, tstats = run_batch_regression(
@@ -158,8 +158,7 @@ def _run_permutation_core(
         # Partial R^2 for genotype predictor
         n = int(y_resid_t.shape[0])
         p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-        dof = max(n - p_pred, 1)
-        ##dof = max(n - 2 - int(k_eff), 1)
+        dof = max(n - int(k_eff) - p_pred, 1)
         t_g = tstats[:, 0]
         t_sq = t_g.double().pow(2)
         r2_nominal_vec = (t_sq / (t_sq + dof)).to(torch.float32)
@@ -191,10 +190,7 @@ def _run_permutation_core(
             _, _, _, r2_block = run_batch_regression_with_permutations(
                 y=y_resid_t, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
             )
-            r2_perm_max[off:off + chunk] = torch.maximum(
-                r2_perm_max[off:off + chunk],
-                r2_block.to(torch.float32)
-            )
+            r2_perm_max[off:off + chunk] = r2_block.to(torch.float32)
 
         r2_perm_np = r2_perm_max.detach().cpu().numpy()
 
@@ -399,9 +395,8 @@ def _run_permutation_core_group(
         # Design meta
         n = int(Y_resid.shape[1])
         p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-        dof = max(n - p_pred, 1)
-        k_eff = rez.Q_t.shape[1] if rez is not None else 0
-        ##dof = max(n - 2 - int(k_eff), 1)
+        k_eff = rez.k_eff if rez is not None else 0
+        dof = max(n - int(k_eff) - p_pred, 1)
         var_ids = idx_to_id[v_idx]
         var_pos = pos_arr[v_idx]
 
@@ -446,10 +441,7 @@ def _run_permutation_core_group(
                 _, _, _, r2_block = run_batch_regression_with_permutations(
                     y=y_t, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
                 )
-                r2_perm_global_max[off:off + chunk] = torch.maximum(
-                    r2_perm_global_max[off:off + chunk],
-                    r2_block.to(torch.float32)
-                )
+                r2_perm_global_max[off:off + chunk] = r2_block.to(torch.float32)
 
         r2_perm_max = r2_perm_global_max.detach().cpu().numpy()
 

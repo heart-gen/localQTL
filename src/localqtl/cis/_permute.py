@@ -61,9 +61,7 @@ def compute_perm_r2_max(
         )
         if nominal_b is None and return_nominal:
             nominal_b, nominal_s, nominal_t = betas, ses, tstats
-        r2_perm_max[off:off + chunk] = torch.maximum(
-            r2_perm_max[off:off + chunk], r2_block.to(torch.float32),
-        )
+        r2_perm_max[off:off + chunk] = r2_block.to(torch.float32)
     if return_nominal:
         return nominal_b, nominal_s, nominal_t, r2_perm_max
     return None, None, None, r2_perm_max
