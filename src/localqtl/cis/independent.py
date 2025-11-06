@@ -33,6 +33,7 @@ from .common import (
 __all__ = [
     "map_independent",
 ]
+
 def _auto_perm_chunk(n_variants: int, nperm: int, safety: float = 0.65) -> int:
     if not torch.cuda.is_available():
         return min(nperm, 2048)
@@ -466,8 +467,6 @@ def _run_independent_core(
             )
 
     return buffers_to_dataframe(expected_columns, buffers, cursor)
-
-
 
 
 def _run_independent_core_group(
