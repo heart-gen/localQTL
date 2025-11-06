@@ -924,7 +924,7 @@ def map_independent(
         window: int = 1_000_000, missing: float = -9.0, random_tiebreak: bool = False,
         device: str = "auto", beta_approx: bool = True, seed: int | None = None,
         logger: SimpleLogger | None = None, verbose: bool = True,
-        preload_haplotypes: bool = True,
+        preload_haplotypes: bool = True, tensorqtl_flavor: bool = False,
 ) -> pd.DataFrame:
     """Entry point: build IG; derive seed/threshold from cis_df; dispatch to grouped/ungrouped core.
 
@@ -1015,12 +1015,13 @@ def map_independent(
                 beta_approx=beta_approx, seed=seed, chrom=chrom,
                 perm_ix_t=perm_ix_t, perm_chunk=perm_chunk,
                 logger=logger, total_items=chrom_total, item_label=item_label,
+                tensorqtl_flavor=tensorqtl_flavor,
             )
     else:
         if "group_id" not in signif_df.columns:
             raise ValueError("cis_df must contain 'group_id' for grouped mapping.")
         seed_by_group_df = (signif_df.sort_values(["group_id", "pval_beta"])
-                                      .groupby("group_id", sort=False).head(1))
+                                     .groupby("group_id", sort=False).head(1))
         group_counts: dict[str, int] = {}
         total_items = 0
         for _, row in seed_by_group_df.iterrows():
@@ -1042,6 +1043,7 @@ def map_independent(
                 beta_approx=beta_approx, seed=seed, chrom=chrom,
                 perm_ix_t=perm_ix_t, perm_chunk=perm_chunk,
                 logger=logger, total_items=chrom_total, item_label=item_label,
+                tensorqtl_flavor=tensorqtl_flavor,
             )
 
     if logger.verbose:
