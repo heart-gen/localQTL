@@ -58,7 +58,7 @@ def _approx_beta_alpha(r2_perm, dof):
     m, v = p.mean(), p.var()
     if not np.isfinite(v) or v <= 1e-12:
         return 1.0 
-    return max(m * (m * (1.0 - m) / v - 1.0), 1e-6)
+    return max(m * (m * (1.0 - m) / v - 1.0), 1e-15)
 
 
 def _solve_true_dof(r2_perm, dof_init, tol=1e-4):
@@ -85,8 +85,8 @@ def _beta_mle_on_p(p):
     """Fit Beta(a, b) by maximum likelihood on [0, 1] p-values."""
     p = np.clip(p, 1e-15, 1 - 1e-15)
     m, v = p.mean(), p.var()
-    a0 = max(m * (m * (1.0 - m) / v - 1.0), 1e-6)
-    b0 = max(a0 * (1.0 / m - 1.0), 1e-6)
+    a0 = max(m * (m * (1.0 - m) / v - 1.0), 1e-15)
+    b0 = max(a0 * (1.0 / m - 1.0), 1e-15)
 
     def nll(ab):
         a, b = ab
