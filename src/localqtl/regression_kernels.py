@@ -38,8 +38,10 @@ class Residualizer(object):
 
         if tensorqtl_flavor:
             self.dof = n_samples - 2 - C_t.shape[1]
+            self.k_eff = C_t.shape[1]
         else:
             self.dof = n_samples - 2 - self.rank
+            self.k_eff = self.rank
 
         if tensorqtl_flavor and self.rank < C_t.shape[1]:
             print(f"[warning] Covariate matrix has {C_t.shape[1] - self.rank} "
@@ -188,7 +190,7 @@ def run_batch_regression(y, G, H=None, k_eff: int = 0, device="cuda"):
 
 
 @torch.no_grad()
-def run_batch_regression_with_permutations_withH(
+def run_batch_regression_with_permutations(
         y: torch.Tensor, G: torch.Tensor, H: torch.Tensor | None = None,
         y_perm: torch.Tensor | None = None, k_eff: int = 0, device: str = "cuda",
 ):
