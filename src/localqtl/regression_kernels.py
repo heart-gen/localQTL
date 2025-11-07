@@ -190,10 +190,9 @@ def run_batch_regression(y, G, H=None, k_eff: int = 0, device="cuda"):
 
 
 @torch.no_grad()
-def run_batch_regression_with_permutations(
+def run_batch_regression_with_permutations_withH(
         y: torch.Tensor, G: torch.Tensor, H: torch.Tensor | None = None,
         y_perm: torch.Tensor | None = None, k_eff: int = 0, device: str = "cuda",
-        use_partial_perm: bool = True,
 ):
     """
     Efficient regression with optional covariates and permutation testing
@@ -252,6 +251,7 @@ def run_batch_regression_with_permutations(
             Hi = H[i]
             Gi = G[i]
             Qi, _ = torch.linalg.qr(Hi)
+            dof  = max(n - Qi.shape[1] - 1 - int(k_eff), 1)
 
             # Residualize y and G[i]
             y_resid  = project_out(y, Qi)
@@ -263,7 +263,6 @@ def run_batch_regression_with_permutations(
 
             r    = Gy / torch.sqrt(Gnorm2 * ynorm2)
             one_minus_r2 = 1.0 - r * r            
-            dof  = max(n - Qi.shape[1] - 1 - int(k_eff), 1)
             t    = r * torch.sqrt(dof / torch.clamp(one_minus_r2, min=EPS))
             beta = Gy / Gnorm2
             se   = torch.abs(beta) / torch.clamp(t.float(), min=1e-8)
@@ -283,3 +282,53 @@ def run_batch_regression_with_permutations(
                 r2_perm  = torch.maximum(r2_perm, r2_vals.float())
 
         return betas, ses, tstats, r2_perm
+
+
+@torch.no_grad()
+def run_batch_regression_with_permutations(
+        y: torch.Tensor, G: torch.Tensor, H: torch.Tensor | None = None,
+        y_perm: torch.Tensor | None = None, k_eff: int = 0, device: str = "cuda",
+):
+    """
+    Efficient regression with optional covariates and permutation testing
+    using Gauss-Markov projection trick.
+    """
+    device = resolve_device(device)
+    y = move_to_device(y, device)
+    G = move_to_device(G, device)
+    if y_perm is not None:
+        y_perm = y_perm.to(device)
+
+    EPS = 1e-8
+    n = y.shape[0]
+    m = G.shape[0]
+
+    if H is None:
+        print("    ** tensorQTL-flavor analysis")
+    # Fast vectorized implementation (no H covariates)
+    dof = max(n - 1 - int(k_eff), 1)
+    Gnorm2 = (G * G).sum(dim=1) + EPS          # (m,)
+    ynorm2 = (y * y).sum() + EPS               # scalar
+    Gy     = G @ y                             # (m,)
+
+    r      = Gy / torch.sqrt(Gnorm2 * ynorm2)  # (m,)
+    one_minus_r2 = 1.0 - r * r
+    t      = r * torch.sqrt(dof / torch.clamp(one_minus_r2, min=EPS))
+    beta   = Gy / Gnorm2                       # (m,)
+    se     = torch.abs(beta) / torch.clamp(t.float(), min=1e-8)
+
+    betas  = beta.unsqueeze(1)                 # (m,1)
+    ses    = se.unsqueeze(1)                   # (m,1)
+    tstats = t.unsqueeze(1)                    # (m,1)
+
+    # Permutations
+    r2_perm = None
+    if y_perm is not None:
+        Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS
+        GYp   = G @ y_perm
+        denom = torch.sqrt(Gnorm2).unsqueeze(1) * torch.sqrt(Ypnorm2).unsqueeze(0)
+        R2    = (GYp / torch.clamp(denom, min=EPS)) ** 2
+        r2_vals, _ = _max_ignore_nan(R2, dim=0)
+        r2_perm = r2_vals.float()
+
+    return betas, ses, tstats, r2_perm
