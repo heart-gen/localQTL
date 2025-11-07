@@ -190,7 +190,10 @@ def _run_permutation_core(
             _, _, _, r2_block = run_batch_regression_with_permutations(
                 y=y_resid_t, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
             )
-            r2_perm_max[off:off + chunk] = r2_block.to(torch.float32)
+            r2_perm_max[off:off + chunk] = torch.maximum(
+                r2_perm_max[off:off + chunk],
+                r2_block.to(torch.float32)
+            )
 
         r2_perm_np = r2_perm_max.detach().cpu().numpy()
 
@@ -441,7 +444,10 @@ def _run_permutation_core_group(
                 _, _, _, r2_block = run_batch_regression_with_permutations(
                     y=y_t, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
                 )
-                r2_perm_global_max[off:off + chunk] = r2_block.to(torch.float32)
+                r2_perm_global_max[off:off + chunk] = torch.maximum(
+                    r2_perm_global_max[off:off + chunk],
+                    r2_block.to(torch.float32)
+                )
 
         r2_perm_max = r2_perm_global_max.detach().cpu().numpy()
 
