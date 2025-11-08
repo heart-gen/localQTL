@@ -190,6 +190,10 @@ def run_batch_regression(y, G, H=None, k_eff: int = 0, device="cuda"):
     return betas, ses, tstats
 
 
+def _is_cuda(*tensors):
+    return all(getattr(t, "is_cuda", False) for t in tensors if t is not None)
+
+
 @torch.no_grad()
 def run_batch_regression_with_permutations(
         y: torch.Tensor, G: torch.Tensor, H: torch.Tensor | None = None,
@@ -208,7 +212,6 @@ def run_batch_regression_with_permutations(
     EPS = 1e-8
     n = y.shape[0]
     m = G.shape[0]
-    use_amp = (device.startswith("cuda"))
 
     if H is None:
         # Fast vectorized implementation (no H covariates)
@@ -231,7 +234,7 @@ def run_batch_regression_with_permutations(
         r2_perm = None
         if y_perm is not None:
             Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS
-            if use_amp:
+            if _is_cuda(G, y_perm):
                 try:
                     with torch.amp.autocast("cuda", dtype=torch.float16):
                         GYp = G @ y_perm             # (m, chunk)
@@ -264,7 +267,7 @@ def run_batch_regression_with_permutations(
         Hg = torch.einsum("mnp,mn->mp", H, G)    # (m, pH)
 
         # Precompute common variables
-        with (torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else torch.no_grad()):
+        with (torch.amp.autocast("cuda", dtype=torch.float16) if _is_cuda(G, H) else torch.no_grad()):
             # S = H^T H  (m, pH, pH)
             S = torch.einsum("mnp,mnq->mpq", H, H).to(torch.float32)
 
