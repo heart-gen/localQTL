@@ -38,8 +38,10 @@ class Residualizer(object):
 
         if tensorqtl_flavor:
             self.dof = n_samples - 2 - C_t.shape[1]
+            self.k_eff = C_t.shape[1]
         else:
             self.dof = n_samples - 2 - self.rank
+            self.k_eff = self.rank
 
         if tensorqtl_flavor and self.rank < C_t.shape[1]:
             print(f"[warning] Covariate matrix has {C_t.shape[1] - self.rank} "
@@ -197,53 +199,98 @@ def run_batch_regression_with_permutations(
     No (chunk x chunk) allocations; memory scales with (m*n + (m+n)*chunk).
     """
     device = resolve_device(device)
-
     y = move_to_device(y, device)
     G = move_to_device(G, device)
     if y_perm is not None:
         y_perm = y_perm.to(device)
 
+    EPS = 1e-8
     n = y.shape[0]
     m = G.shape[0]
-    dof = max(n - 1 - int(k_eff), 1)
 
-    # Nominal (vectorized)
-    EPS = 1e-8
-    Gnorm2 = (G * G).sum(dim=1) + EPS          # (m,)
-    ynorm2 = (y * y).sum() + EPS               # scalar
-    Gy     = G @ y                             # (m,)
+    if H is None:
+        # Fast vectorized implementation (no H covariates)
+        dof = max(n - 1 - int(k_eff), 1)
+        Gnorm2 = (G * G).sum(dim=1) + EPS          # (m,)
+        ynorm2 = (y * y).sum() + EPS               # scalar
+        Gy     = G @ y                             # (m,)
 
-    r      = Gy / torch.sqrt(Gnorm2 * ynorm2)  # (m,)
-    one_minus_r2 = 1.0 - r * r
-    t      = r * torch.sqrt(dof / torch.clamp(one_minus_r2, min=EPS))
-    beta   = Gy / Gnorm2                         # (m,)
-    se     = torch.abs(beta) / torch.clamp(t.float(), min=1e-8)
+        r      = Gy / torch.sqrt(Gnorm2 * ynorm2)  # (m,)
+        one_minus_r2 = 1.0 - r * r
+        t      = r * torch.sqrt(dof / torch.clamp(one_minus_r2, min=EPS))
+        beta   = Gy / Gnorm2                         # (m,)
+        se     = torch.abs(beta) / torch.clamp(t.float(), min=1e-8)
 
-    betas  = beta.unsqueeze(1)                   # (m,1)
-    ses    = se.unsqueeze(1)                     # (m,1)
-    tstats = t.unsqueeze(1)                      # (m,1)
+        betas  = beta.unsqueeze(1)                   # (m,1)
+        ses    = se.unsqueeze(1)                     # (m,1)
+        tstats = t.unsqueeze(1)                      # (m,1)
 
-    # Permutations (chunked)
-    r2_perm = None
-    if y_perm is not None:
-        Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS
-        use_amp = G.is_cuda and y_perm.is_cuda
-        if use_amp:
-            try:
-                with torch.amp.autocast("cuda", dtype=torch.float16):
-                    GYp = G @ y_perm             # (m, chunk)
-            except Exception:
-                # older Torch
-                with torch.cuda.amp.autocast(dtype=torch.float16):
-                    GYp = G @ y_perm
-        else:
-            GYp = G @ y_perm
+        # Permutations (chunked)
+        r2_perm = None
+        if y_perm is not None:
+            Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS
+            use_amp = G.is_cuda and y_perm.is_cuda
+            if use_amp:
+                try:
+                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                        GYp = G @ y_perm             # (m, chunk)
+                except Exception:
+                    # older Torch
+                    with torch.cuda.amp.autocast(dtype=torch.float16):
+                        GYp = G @ y_perm
+            else:
+                GYp = G @ y_perm
 
-        GYp = GYp.float()
-        denom = torch.sqrt(Gnorm2).unsqueeze(1) * torch.sqrt(Ypnorm2).unsqueeze(0)
-        R2 = (GYp / torch.clamp(denom, min=EPS)) ** 2
+            GYp = GYp.float()
+            denom = torch.sqrt(Gnorm2).unsqueeze(1) * torch.sqrt(Ypnorm2).unsqueeze(0)
+            R2 = (GYp / torch.clamp(denom, min=EPS)) ** 2
+            r2_vals, _ = _max_ignore_nan(R2, dim=0)
+            r2_perm = r2_vals.float()
 
-        r2_vals, _ = _max_ignore_nan(R2, dim=0)
-        r2_perm = r2_vals.float()
+        return betas, ses, tstats, r2_perm
+    else:
+        # Gauss-Markov Projection (with H covariates)
+        H = move_to_device(H, device)
 
-    return betas, ses, tstats, r2_perm
+        betas = torch.empty((m, 1), device=device)
+        ses = torch.empty((m, 1), device=device)
+        tstats = torch.empty((m, 1), device=device)
+        r2_perm = torch.zeros((y_perm.shape[1],), device=device) if y_perm is not None else None
+        def project_out(v, Q):
+            return v - Q @ (Q.T @ v)
+
+        for i in range(m):
+            Hi = H[i]
+            Gi = G[i]
+            Qi, _ = torch.linalg.qr(Hi)
+            dof  = max(n - Qi.shape[1] - 1 - int(k_eff), 1)
+
+            # Residualize y and G[i]
+            y_resid  = project_out(y, Qi)
+            Gi_resid = project_out(Gi, Qi)
+
+            Gnorm2 = (Gi_resid ** 2).sum() + EPS
+            ynorm2 = (y_resid ** 2).sum() + EPS
+            Gy     = Gi_resid @ y_resid
+
+            r    = Gy / torch.sqrt(Gnorm2 * ynorm2)
+            one_minus_r2 = 1.0 - r * r            
+            t    = r * torch.sqrt(dof / torch.clamp(one_minus_r2, min=EPS))
+            beta = Gy / Gnorm2
+            se   = torch.abs(beta) / torch.clamp(t.float(), min=1e-8)
+
+            betas[i, 0]  = beta
+            ses[i, 0]    = se
+            tstats[i, 0] = t
+
+            # Permutations
+            if y_perm is not None:
+                Yp_resid = project_out(y_perm, Qi)
+                Ypnorm2  = (Yp_resid ** 2).sum(dim=0) + EPS
+                GiYp     = Gi_resid @ Yp_resid
+                denom    = torch.sqrt(Gnorm2 * Ypnorm2)
+                R2 = (GiYp / torch.clamp(denom, min=EPS)) ** 2
+                r2_vals, _ = _max_ignore_nan(R2.unsqueeze(0), dim=0)
+                r2_perm  = torch.maximum(r2_perm, r2_vals.float())
+
+        return betas, ses, tstats, r2_perm

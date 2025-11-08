@@ -4,7 +4,8 @@ import pandas as pd
 from typing import Optional
 
 try:
-    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.fp32_precision = 'tf32'
+    torch.backends.cudnn.conv.fp32_precision = 'tf32'
 except Exception:
     pass
 
@@ -32,10 +33,6 @@ from .common import (
 __all__ = [
     "map_independent",
 ]
-
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
 
 def _auto_perm_chunk(n_variants: int, nperm: int, safety: float = 0.65) -> int:
     if not torch.cuda.is_available():
