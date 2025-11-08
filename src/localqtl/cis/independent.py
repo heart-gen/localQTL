@@ -34,18 +34,16 @@ __all__ = [
     "map_independent",
 ]
 
-def _auto_perm_chunk(n_variants: int, nperm: int, safety: float = 0.65) -> int:
-    if not torch.cuda.is_available():
+def _auto_perm_chunk(n_variants: int, nperm: int, pH: int = 0, safety: float = 0.5) -> int:
+    if not torch.cuda.is_available() or n_variants <= 0:
         return min(nperm, 2048)
     free, _ = torch.cuda.mem_get_info()
-    # r2 buffer ~ [n_variants x chunk] float32
-    bytes_per = 4
-    if n_variants <= 0:
+    bytes_per_col = 4 * n_variants * (3 + 2 * max(pH, 0))
+    if bytes_per_col <= 0:
         return min(nperm, 2048)
-    max_chunk = max(1, min(nperm, int(free * safety) // (n_variants * bytes_per)))
-    # round down to power of two for kernel efficiency
-    p2 = 1 << (max_chunk.bit_length() - 1)
-    return max(1, p2)
+    max_chunk = int((free * safety) // bytes_per_col)
+    p2 = 1 << (max_chunk.bit_length() - 1) # round down to power of two
+    return max(1, min(nperm, p2))
 
 
 def _nanmax(x: torch.Tensor, dim: int):
@@ -170,7 +168,8 @@ def _run_independent_core(
             if H_t is not None:
                 H_t = H_t[keep_maf].contiguous()
 
-        perm_chunk_local = _auto_perm_chunk(G_t.shape[0], nperm)
+        pH = 0 if H_t is None else int(H_t.shape[2])
+        perm_chunk_local = _auto_perm_chunk(G_t.shape[0], nperm, pH=pH)
         if perm_chunk is not None and perm_chunk > 0:
             perm_chunk_local = min(perm_chunk_local, int(perm_chunk))
 
@@ -234,6 +233,7 @@ def _run_independent_core(
                 )
 
                 p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
+                n = int(y_resid.shape[0])
                 dof = max(int(n) - int(k_eff) - int(p_pred), 1)
                 t_g = tstats[:, 0].double()
                 t2 = t_g.pow(2)
@@ -585,7 +585,8 @@ def _run_independent_core_group(
             if H_t is not None:
                 H_t = H_t[keep_maf].contiguous()
 
-        perm_chunk_local = _auto_perm_chunk(G_t.shape[0], nperm)
+        pH = 0 if H_t is None else int(H_t.shape[2])
+        perm_chunk_local = _auto_perm_chunk(G_t.shape[0], nperm, pH=pH)
         if perm_chunk is not None and perm_chunk > 0:
             perm_chunk_local = min(perm_chunk_local, int(perm_chunk))
 
@@ -655,7 +656,8 @@ def _run_independent_core_group(
                 k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
                 num_var = int(G_resid.shape[0])
 
-                r2_perm_list: list[torch.Tensor] = []
+                r2_perm_global = torch.full((int(perm_ix_group.shape[0]),), -float("inf"),
+                            device=G_t.device, dtype=torch.float32)
                 best_r2_t = torch.tensor(float("-inf"), device=G_t.device)
 
                 for j, (pid_inner, y_resid) in enumerate(zip(ids_list, y_resid_list)):
@@ -694,10 +696,10 @@ def _run_independent_core_group(
                         best_se = float(ses[ix, 0].item())
                         best_t = float(t_g[ix].item())
                         best_dof = int(dof)
-                    r2_perm_list.append(r2_perm_vec)
+                    r2_perm_global = torch.maximum(r2_perm_global, r2_perm_vec)
 
                 if best_ix_var >= 0:
-                    r2_perm_max = torch.stack(r2_perm_list, dim=0).max(dim=0).values
+                    r2_perm_max = r2_perm_global
                     pval_perm = (
                         (r2_perm_max >= best_r2_t).sum().add_(1).float() / (r2_perm_max.numel() + 1)
                     ).item()
