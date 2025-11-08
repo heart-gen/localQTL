@@ -920,9 +920,9 @@ def map_independent(
         group_s: Optional[pd.Series] = None, maf_threshold: float = 0.0,
         fdr: float = 0.05, fdr_col: str = "qval", nperm: int = 10_000,
         window: int = 1_000_000, missing: float = -9.0, random_tiebreak: bool = False,
-        device: str = "auto", beta_approx: bool = True, seed: int | None = None,
-        logger: SimpleLogger | None = None, verbose: bool = True,
-        preload_haplotypes: bool = True,
+        device: str = "auto", beta_approx: bool = True, perm_chunk: int = 2048,
+        seed: int | None = None, logger: SimpleLogger | None = None,
+        verbose: bool = True, preload_haplotypes: bool = True,
 ) -> pd.DataFrame:
     """Entry point: build IG; derive seed/threshold from cis_df; dispatch to grouped/ungrouped core.
 
@@ -993,7 +993,6 @@ def map_independent(
 
     n_samples = int(ig.phenotype_df.shape[1])
     perm_ix_t = make_perm_ix(n_samples, nperm, device, seed)
-    perm_chunk = 2048
 
     if group_s is None:
         if "phenotype_id" not in signif_df.columns:

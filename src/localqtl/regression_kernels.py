@@ -11,6 +11,7 @@ __all__ = [
     "Residualizer",
     "run_batch_regression",
     "run_batch_regression_with_permutations",
+    "perm_chunk_r2", "prep_ctx_for_perm",
 ]
 
 class Residualizer(object):
@@ -207,6 +208,7 @@ def run_batch_regression_with_permutations(
     EPS = 1e-8
     n = y.shape[0]
     m = G.shape[0]
+    use_amp = (device.startswith("cuda"))
 
     if H is None:
         # Fast vectorized implementation (no H covariates)
@@ -229,7 +231,6 @@ def run_batch_regression_with_permutations(
         r2_perm = None
         if y_perm is not None:
             Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS
-            use_amp = G.is_cuda and y_perm.is_cuda
             if use_amp:
                 try:
                     with torch.amp.autocast("cuda", dtype=torch.float16):
@@ -251,46 +252,142 @@ def run_batch_regression_with_permutations(
     else:
         # Gauss-Markov Projection (with H covariates)
         H = move_to_device(H, device)
+        assert H.dim() == 3, "H must be (m, n, pH)"
+        m, n, pH = H.shape
 
-        betas = torch.empty((m, 1), device=device)
-        ses = torch.empty((m, 1), device=device)
-        tstats = torch.empty((m, 1), device=device)
-        r2_perm = torch.zeros((y_perm.shape[1],), device=device) if y_perm is not None else None
-        def project_out(v, Q):
-            return v - Q @ (Q.T @ v)
+        do = max(n - (1 + pH) - int(k_eff), 1)
 
-        for i in range(m):
-            Hi = H[i]
-            Gi = G[i]
-            Qi, _ = torch.linalg.qr(Hi)
-            dof  = max(n - Qi.shape[1] - 1 - int(k_eff), 1)
+        Gy = (G @ y)                             # (m,)
+        G2 = (G * G).sum(dim=1) + EPS            # (m,)
+        y2 = (y * y).sum() + EPS                 # scalar
+        Hy = torch.einsum("mnp,n->mp", H, y)     # (m, pH)
+        Hg = torch.einsum("mnp,mn->mp", H, G)    # (m, pH)
 
-            # Residualize y and G[i]
-            y_resid  = project_out(y, Qi)
-            Gi_resid = project_out(Gi, Qi)
+        # Precompute common variables
+        with (torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else torch.no_grad()):
+            # S = H^T H  (m, pH, pH)
+            S = torch.einsum("mnp,mnq->mpq", H, H).to(torch.float32)
 
-            Gnorm2 = (Gi_resid ** 2).sum() + EPS
-            ynorm2 = (y_resid ** 2).sum() + EPS
-            Gy     = Gi_resid @ y_resid
+        # Cholesky with gentle regularization
+        I = torch.eye(pH, device=device, dtype=torch.float32).expand_as(S)
+        L, info = torch.linalg.cholesky_ex(S)
+        if (info != 0).any():
+            S = S + (1e-6 * I)
+            L = torch.linalg.cholesky(S)
 
-            r    = Gy / torch.sqrt(Gnorm2 * ynorm2)
-            one_minus_r2 = 1.0 - r * r            
-            t    = r * torch.sqrt(dof / torch.clamp(one_minus_r2, min=EPS))
-            beta = Gy / Gnorm2
-            se   = torch.abs(beta) / torch.clamp(t.float(), min=1e-8)
+        # Solve S * alpha = RHS in batch
+        alpha_y = torch.cholesky_solve(Hy.unsqueeze(-1), L).squeeze(-1)
+        alpha_g = torch.cholesky_solve(Hg.unsqueeze(-1), L).squeeze(-1)
 
-            betas[i, 0]  = beta
-            ses[i, 0]    = se
-            tstats[i, 0] = t
+        # Norms after projecting out H (variant-specific!)
+        y_resid2 = (y2 - (Hy * alpha_y).sum(dim=1)) + EPS        # (m,)
+        G_resid2 = (G2 - (Hg * alpha_g).sum(dim=1)) + EPS        # (m,)
 
-            # Permutations
-            if y_perm is not None:
-                Yp_resid = project_out(y_perm, Qi)
-                Ypnorm2  = (Yp_resid ** 2).sum(dim=0) + EPS
-                GiYp     = Gi_resid @ Yp_resid
-                denom    = torch.sqrt(Gnorm2 * Ypnorm2)
-                R2 = (GiYp / torch.clamp(denom, min=EPS)) ** 2
-                r2_vals, _ = _max_ignore_nan(R2.unsqueeze(0), dim=0)
-                r2_perm  = torch.maximum(r2_perm, r2_vals.float())
+        # Cross term after projection: <G_resid, y_resid> = Gy - Hg^T alpha_y
+        Gy_resid = (Gy - (Hg * alpha_y).sum(dim=1))              # (m,)
+
+        # Nominal partial correlation -> t, beta, se
+        r = Gy_resid / torch.sqrt(G_resid2 * y_resid2)
+        r = torch.clamp(r, min=-1 + 1e-7, max=1 - 1e-7)
+        t = r * torch.sqrt(torch.tensor(dof, device=device, dtype=torch.float32) /
+                           torch.clamp(1.0 - r * r, min=EPS))
+        beta = Gy_resid / G_resid2
+        se   = torch.abs(beta) / torch.clamp(t, min=1e-8)
+
+        betas  = beta.view(m, 1)
+        ses    = se.view(m, 1)
+        tstats = t.view(m, 1)
+
+        # Permutations
+        r2_perm = None
+        if y_perm is not None:
+            y_perm = y_perm.to(device, non_blocking=True)        # (n, chunk)
+            Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS         # (chunk,)
+            U = torch.einsum("mnp,nc->mpc", H, y_perm).to(torch.float32)
+            alpha_perm = torch.cholesky_solve(U, L)
+            T0 = (G @ y_perm).to(torch.float32)
+            T1 = torch.einsum("mp,mpc->mc", Hg, alpha_perm)
+            # Numerator dot after projection
+            GiYp_proj = T0 - T1                                  # (m, chunk)
+            Yp_resid2 = (Ypnorm2.unsqueeze(0)
+                         - (U * Alpha_perm).sum(dim=1)) + EPS    # (m, chunk)
+            denom = torch.sqrt(G_resid2).unsqueeze(1) * torch.sqrt(Yp_resid2)
+            R2 = (GiYp_proj / torch.clamp(denom, min=EPS)) ** 2  # (m, chunk)
+            # max across variants for each permutation
+            r2_perm = torch.nan_to_num(R2, nan=0.0).amax(dim=0).to(torch.float32)
 
         return betas, ses, tstats, r2_perm
+
+
+@torch.no_grad()
+def prep_ctx_for_perm(y: torch.Tensor, G: torch.Tensor, H: torch.Tensor, k_eff: int):
+    """
+    Precompute all variant-wise quantities for permutations when H is present.
+    Returns a ctx dict with Cholesky factor and cached pieces, plus nominal stats.
+    Shapes: y(n,), G(m,n), H(m,n,pH)
+    """
+    device = y.device
+    m, n, pH = H.shape
+    EPS = 1e-8
+    dof = max(n - (1 + pH) - int(k_eff), 1)
+
+    S = torch.einsum("mnp,mnq->mpq", H, H).to(torch.float32)
+    I = torch.eye(pH, device=device, dtype=torch.float32).expand_as(S)
+    L, info = torch.linalg.cholesky_ex(S)
+    if (info != 0).any():
+        S = S + (1e-6 * I)
+        L = torch.linalg.cholesky(S)
+
+    Gy = (G @ y)
+    G2 = (G * G).sum(dim=1) + EPS
+    y2 = (y * y).sum() + EPS
+    Hy = torch.einsum("mnp,n->mp", H, y)
+    Hg = torch.einsum("mnp,mn->mp", H, G)
+
+    alpha_y = torch.cholesky_solve(Hy.unsqueeze(-1), L).squeeze(-1)
+    alpha_g = torch.cholesky_solve(Hg.unsqueeze(-1), L).squeeze(-1)
+
+    y_resid2 = (y2 - (Hy * alpha_y).sum(dim=1)) + EPS
+    G_resid2 = (G2 - (Hg * alpha_g).sum(dim=1)) + EPS
+    Gy_resid = (Gy - (Hg * alpha_y).sum(dim=1))
+
+    # nominal stats
+    r = Gy_resid / torch.sqrt(G_resid2 * y_resid2)
+    r = torch.clamp(r, min=-1 + 1e-7, max=1 - 1e-7)
+    t = r * torch.sqrt(torch.tensor(dof, device=device, dtype=torch.float32) /
+                       torch.clamp(1.0 - r * r, min=EPS))
+    beta = Gy_resid / G_resid2
+    se = torch.abs(beta) / torch.clamp(t, min=1e-8)
+
+    ctx = {
+        "L": L, "Hg": Hg, "G_resid2": G_resid2, "dof": dof,
+    }
+    betas  = beta.view(m, 1)
+    ses    = se.view(m, 1)
+    tstats = t.view(m, 1)
+    return ctx, betas, ses, tstats
+
+
+@torch.no_grad()
+def perm_chunk_r2(ctx: dict, H: torch.Tensor, G: torch.Tensor, y_perm: torch.Tensor) -> torch.Tensor:
+    """
+    Compute max R^2 across variants for a permutation chunk (n x chunk),
+    using precomputed ctx from prep_ctx_for_perm.
+    Returns (chunk,) on the same device.
+    """
+    EPS = 1e-8
+    L, Hg, G_resid2 = ctx["L"], ctx["Hg"], ctx["G_resid2"]
+
+    # U = H^T y_perm: (m,pH,chunk); Alpha solves S*Alpha = U via Cholesky
+    U = torch.einsum("mnp,nc->mpc", H, y_perm).to(torch.float32)
+    _alpha = torch.cholesky_solve(U, L)
+
+    T0 = (G @ y_perm).to(torch.float32)
+    T1 = torch.einsum("mp,mpc->mc", Hg, _alpha)
+    GiYp_proj = T0 - T1
+
+    Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS
+    Yp_resid2 = (Ypnorm2.unsqueeze(0) - (U * _alpha).sum(dim=1)) + EPS
+
+    R2 = (GiYp_proj ** 2) / (G_resid2.unsqueeze(1) * Yp_resid2)
+    return torch.nan_to_num(R2, nan=0.0).amax(dim=0).to(torch.float32)

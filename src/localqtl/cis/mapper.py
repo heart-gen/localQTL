@@ -93,7 +93,7 @@ class CisMapper:
 
     def map_permutations(
             self, nperm: int = 10_000, beta_approx: bool = True,
-            maf_threshold: Optional[float] = None,
+            perm_chunk: int = 4096, maf_threshold: Optional[float] = None,
             seed: Optional[int] = None
     ) -> pd.DataFrame:
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
@@ -111,6 +111,7 @@ class CisMapper:
             nperm=nperm,
             device=self.device,
             beta_approx=beta_approx,
+            perm_chunk=perm_chunk,
             seed=seed,
             logger=self.logger,
             tensorqtl_flavor=self.tensorqtl_flavor,
@@ -119,9 +120,10 @@ class CisMapper:
 
     def map_independent(
             self, cis_df: pd.DataFrame, fdr: float = 0.05, fdr_col: str = "qval",
-            nperm: int = 10_000, maf_threshold: Optional[float] = None,
-            random_tiebreak: bool = False, seed: Optional[int] = None,
-            missing_val: float = -9.0, beta_approx: bool = True,
+            nperm: int = 10_000, perm_chunk: int = 4096,
+            random_tiebreak: bool = False, missing_val: float = -9.0,
+            beta_approx: bool = True, seed: Optional[int] = None,
+            maf_threshold: Optional[float] = None,
     ) -> pd.DataFrame:
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
         return _map_independent(
@@ -143,6 +145,7 @@ class CisMapper:
             random_tiebreak=random_tiebreak,
             device=self.device,
             beta_approx=beta_approx,
+            perm_chunk=perm_chunk,
             seed=seed,
             logger=self.logger,
             tensorqtl_flavor=self.tensorqtl_flavor,

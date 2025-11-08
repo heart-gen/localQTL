@@ -4,7 +4,8 @@ import pandas as pd
 from typing import Optional
 
 try:
-    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.fp32_precision = 'tf32'
+    torch.backends.cudnn.conv.fp32_precision = 'tf32'
 except Exception:
     pass
 
@@ -521,7 +522,7 @@ def map_permutations(
         haplotypes: Optional[object] = None, loci_df: Optional[pd.DataFrame] = None,
         group_s: Optional[pd.Series] = None, maf_threshold: float = 0.0,
         window: int = 1_000_000, nperm: int = 10_000, device: str = "cuda",
-        beta_approx: bool = True, seed: int | None = None,
+        perm_chunk: int = 4096, beta_approx: bool = True, seed: int | None = None,
         logger: SimpleLogger | None = None, verbose: bool = True,
         preload_haplotypes: bool = True, tensorqtl_flavor: bool = False,
 ) -> pd.DataFrame:
@@ -588,7 +589,6 @@ def map_permutations(
 
     n_samples = int(ig.phenotype_df.shape[1])
     perm_ix_t = make_perm_ix(n_samples, nperm, device, seed)
-    perm_chunk = 2048
 
     # Core either grouped or single-phenotype
     phenotype_counts = ig.phenotype_pos_df['chr'].value_counts().to_dict()
