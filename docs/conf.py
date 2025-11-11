@@ -1,28 +1,35 @@
-import os, sys
-from datetime import datetime
+import os, sys, pathlib
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+sys.path.insert(0, str(ROOT / "src"))
 
 project = "localQTL"
-copyright = f"{datetime.now():%Y}, localQTL"
-author = "localQTL contributors"
-
-sys.path.insert(0, os.path.abspath("../src"))
-
 extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.autosummary",
     "sphinx.ext.napoleon",
-    "sphinx.ext.viewcode",
+    "myst_parser",
+    "sphinx_autodoc_typehints",
+    "numpydoc",
 ]
 
-autosummary_generate = True
-
-templates_path = ["_templates"]
-exclude_patterns: list[str] = []
-
-html_theme = "alabaster"
-
-source_suffix = {
-    ".rst": "restructuredtext",
+autosummary_generate = True  # Generate stub pages from autosummary
+autodoc_default_options = {
+    "members": True,
+    "undoc-members": True,
+    "inherited-members": True,
+    "show-inheritance": True,
 }
 
-master_doc = "index"
+# Mock heavy deps not available on RTD
+autodoc_mock_imports = [
+    "torch", "cupy", "cudf", "rfmix-reader", 
+    "pyarrow", "dask_cuda", "numba", "pandas_plink",
+    "dask"
+]
+
+# Optional: keep type hints in descriptions for cleaner sigs
+autodoc_typehints = "description"
+napoleon_google_docstring = True
+napoleon_numpy_docstring = True
