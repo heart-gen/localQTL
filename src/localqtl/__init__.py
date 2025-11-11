@@ -1,9 +1,15 @@
-"""Top-level package exports for :mod:`localqtl`.
+"""
+Top-level package exports for :mod:`localqtl`.
 
 This module re-exports the most commonly used classes/functions so that they
 remain accessible from ``localqtl`` after the project was reorganized into a
 package with dedicated submodules (``cis``, ``preproc``, ``finemap`` …).
 """
+import os
+
+_IS_RTD = os.environ.get("READTHEDOCS") == "True"
+if _IS_RTD:
+    os.environ.setdefault("LOCALQTL_NO_GPU", "1")
 
 from . import cis
 from . import finemap
