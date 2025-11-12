@@ -1,13 +1,14 @@
 import torch
 import numpy as np
 import pandas as pd
-from typing import Optional
+from typing import Mapping, Optional, Sequence, Union
 
 from ..utils import SimpleLogger, pick_device
 from ..stats import calculate_qvalues as _calculate_qvalues
 from .nominal import map_nominal as _map_nominal
 from .permutations import map_permutations as _map_permutations
 from .independent import map_independent as _map_independent
+from .postproc import get_significant_pairs as _get_significant_pairs
 
 __all__ = [
     "CisMapper",
@@ -160,5 +161,29 @@ class CisMapper:
         return _calculate_qvalues(
             perm_df, fdr=fdr,
             qvalue_lambda=qvalue_lambda,
+            logger=self.logger,
+        )
+
+    def get_significant_pairs(
+            self,
+            res_df: pd.DataFrame,
+            nominal_files: Optional[Union[str, Mapping[str, str]]] = None,
+            group_s: Optional[pd.Series] = None,
+            fdr: float = 0.05,
+            columns: Optional[Sequence[str]] = None,
+    ) -> pd.DataFrame:
+        """Thin wrapper around :func:`get_significant_pairs` using stored configuration."""
+        gs = self.group_s if group_s is None else group_s
+        if nominal_files is None:
+            out_dir = self.out_dir.rstrip("/")
+            if not out_dir:
+                out_dir = "."
+            nominal_files = f"{out_dir}/{self.out_prefix}*.parquet"
+        return _get_significant_pairs(
+            res_df=res_df,
+            nominal_files=nominal_files,
+            group_s=gs,
+            fdr=fdr,
+            columns=columns,
             logger=self.logger,
         )
