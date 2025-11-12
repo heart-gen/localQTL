@@ -313,7 +313,7 @@ def run_batch_regression_with_permutations(
             # Numerator dot after projection
             GiYp_proj = T0 - T1                                  # (m, chunk)
             Yp_resid2 = (Ypnorm2.unsqueeze(0)
-                         - (U * Alpha_perm).sum(dim=1)) + EPS    # (m, chunk)
+                         - (U * alpha_perm).sum(dim=1)) + EPS    # (m, chunk)
             denom = torch.sqrt(G_resid2).unsqueeze(1) * torch.sqrt(Yp_resid2)
             R2 = (GiYp_proj / torch.clamp(denom, min=EPS)) ** 2  # (m, chunk)
             # max across variants for each permutation
