@@ -258,7 +258,7 @@ def run_batch_regression_with_permutations(
         assert H.dim() == 3, "H must be (m, n, pH)"
         m, n, pH = H.shape
 
-        do = max(n - (1 + pH) - int(k_eff), 1)
+        dof = max(n - (1 + pH) - int(k_eff), 1)
 
         Gy = (G @ y)                             # (m,)
         G2 = (G * G).sum(dim=1) + EPS            # (m,)
