@@ -99,9 +99,12 @@ mapper = CisMapper(
     phenotype_pos_df=phenotype_pos_df,
     covariates_df=covariates_df,
     window=500_000,
+    maf_threshold=0.01,
+    out_dir="./",
+    out_prefix="cis_nominal",
 )
 
-mapper.map_nominal(nperm=1_000)
+mapper.map_nominal(nperm=0)
 perm_df = mapper.map_permutations(nperm=1_000, beta_approx=True)
 perm_df = mapper.calculate_qvalues(perm_df, fdr=0.05)
 lead_df = mapper.map_independent(cis_df=perm_df, fdr=0.05)
@@ -123,10 +126,12 @@ variant_df = plink.bim.set_index("snp")[["chrom", "pos"]]
 phenotype_df, phenotype_pos_df = read_phenotype_bed("data/phenotypes.bed")
 covariates_df = None  # optional
 
-# Local ancestry from RFMix
+# Local ancestry from RFMix (and align to genotype samples)
+select_samples = genotype_df.columns.values
 rfmix = RFMixReader(
     prefix_path="data/rfmix/prefix",   # directory with per-chrom outputs + fb.tsv
     binary_path="data/rfmix",          # where prebuilt binaries live (if used)
+    select_samples=select_samples,     # optional for automatic sample alignment (recommended)
     verbose=True
 )
 
@@ -135,14 +140,6 @@ rfmix = RFMixReader(
 # For 2 ancestries, the reader exposes the ancestry channel selected internally.
 H = rfmix.load_haplotypes()
 loci_df = rfmix.loci_df  # DataFrame with ['chrom','pos', 'ancestry', 'hap', 'index'] (indexed by 'hap')
-
-# Align samples to the RFMix order (recommended)
-# Keep only intersection and put everything in the same order as rfmix.sample_ids.
-keep = [sid for sid in rfmix.sample_ids if sid in genotype_df.columns]
-genotype_df = genotype_df[keep]
-phenotype_df = phenotype_df[keep]
-if covariates_df is not None:
-    covariates_df = covariates_df.loc[keep]
 
 # (Optional) Ensure chromosome dtype matches between variant_df and loci_df
 variant_df["chrom"] = variant_df["chrom"].astype(str)
@@ -159,7 +156,10 @@ mapper = CisMapper(
     haplotypes=H,          # <-- enable local ancestry-aware mode
     loci_df=loci_df,       # <-- positions that align to H
     window=1_000_000,
+    maf_threshold=0.01,
     device="auto",
+    out_dir="./",
+    out_prefix="cis_nominal",
 )
 
 # Run nominal scans and permutations as usual; ancestry-awareness is automatic
@@ -179,7 +179,7 @@ print(lead_df.head())
 
 * `H` (from `RFMixReader.load_haplotypes()`) is ancestry dosages with shape `(variants, samples, ancestries)` for ≥3 ancestries; for 2 ancestries the reader exposes the configured channel.
 * `loci_df` rows correspond 1:1 to `H`'s and be joinable (by `chrom`/`pos`) to `variant_df` used for genotypes.
-* Sample order in `genotype_df`, `phenotype_df`, and `covariates_df` should match `rfmix.sample_ids` (reindex as shown).
+* Sample order in `genotype_df`, `phenotype_df`, and `covariates_df` should match `H` (reindex as shown).
 * The cis-mapping helpers default to ``preload_haplotypes=True`` so ancestry blocks are staged as contiguous tensors on the requested device (GPU or CPU). Override this flag when working under strict memory constraints.
 
 ## Testing
