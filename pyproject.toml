@@ -27,7 +27,7 @@ dask-cudf-cu12 = "^25.10.0"
 pandas-plink-ng = "^2.3.2.post1"
 
 [tool.poetry.urls]
-homepage = "https://github.com/heart-gen/localQTL"
+homepage = "https://localqtl.readthedocs.io/en/latest/"
 repository = "https://github.com/heart-gen/localQTL"
 "Bug Tracker" = "https://github.com/heart-gen/localQTL/issues"
 
