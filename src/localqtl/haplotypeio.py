@@ -141,7 +141,7 @@ class RFMixReader:
             loci_df["index"] = np.arange(loci_df.shape[0])
             self.loci_df = loci_df.set_index("hap")
             self.loci_dfs = {c: g[["pos", "index"]].sort_values("pos").reset_index(drop=True)
-                            for c, g in self.loci_df.reset_index().groupby("chrom", sort=False)}
+                            for c, g in self.loci_df.reset_index().groupby("chrom", sort=False, observed=True)}
             self.haplotypes = A0
         else: # >2 ancestries
             loci_dfs = []
@@ -158,7 +158,7 @@ class RFMixReader:
 
             self.loci_df = pd.concat(loci_dfs).set_index("hap")
             self.loci_dfs = {c: g[["pos", "index", "ancestry"]].sort_values("pos").reset_index(drop=True)
-                            for c, g in self.loci_df.reset_index().groupby("chrom", sort=False)}
+                            for c, g in self.loci_df.reset_index().groupby("chrom", sort=False, observed=True)}
             self.haplotypes = self.admix  # dask array
 
     def load_haplotypes(self):
@@ -261,7 +261,7 @@ class FlareReader:
             loci_df["index"] = np.arange(loci_df.shape[0])
             self.loci_df = loci_df.set_index("hap")
             self.loci_dfs = {c: g[["pos", "index"]].sort_values("pos").reset_index(drop=True)
-                            for c, g in self.loci_df.reset_index().groupby("chrom", sort=False)}
+                            for c, g in self.loci_df.reset_index().groupby("chrom", sort=False, observed=True)}
             self.haplotypes = A0
         else: # >2 ancestries
             loci_dfs = []
@@ -278,7 +278,7 @@ class FlareReader:
 
             self.loci_df = pd.concat(loci_dfs).set_index("hap")
             self.loci_dfs = {c: g[["pos", "index", "ancestry"]].sort_values("pos").reset_index(drop=True)
-                            for c, g in self.loci_df.reset_index().groupby("chrom", sort=False)}
+                            for c, g in self.loci_df.reset_index().groupby("chrom", sort=False, observed=True)}
             self.haplotypes = self.admix  # dask array
 
     def load_haplotypes(self):
@@ -406,7 +406,7 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
 
         # Per-chrom nearest join (with optional tolerance)
         maps = []
-        for c, vgrp in vreset.groupby("chrom", sort=False):
+        for c, vgrp in vreset.groupby("chrom", sort=False, observed=True):
             lgrp = loci_base[loci_base["chrom"] == c].sort_values("pos")
             if lgrp.empty:
                 tmp = vgrp.copy(); tmp["index"] = np.nan; maps.append(tmp); continue
