@@ -52,9 +52,9 @@ dev = [
 docs = [
     "sphinx (>=8,<9)",
     "furo (>=2025.9.25,<2026.0.0)",
-    "myst-parser (>=4.0.1,<5.0.0)",
     "sphinx-autodoc-typehints (>=3.5.2,<4.0.0)",
     "numpydoc (>=1.9.0,<2.0.0)",
     "sphinx-copybutton (>=0.5.2,<0.6.0)",
-    "sphinx-design (>=0.6.1,<0.7.0)"
+    "sphinx-design (>=0.6.1,<0.7.0)",
+    "sphinx-rtd-theme (>=3.0.2,<4.0.0)"
 ]
