@@ -16,7 +16,7 @@ import pandas as pd
 import torch
 from typing import List, Optional, Union
 
-from rfmix_reader import read_rfmix
+from rfmix_reader import read_rfmix, read_flare
 
 from .utils import gpu_available
 from .genotypeio import InputGeneratorCis, background
@@ -37,6 +37,7 @@ else:
 # Public exports
 __all__ = [
     "RFMixReader",
+    "FlareReader",
     "InputGeneratorCisWithHaps",
 ]
 
@@ -44,7 +45,8 @@ __all__ = [
 # Local ancestry readers
 # ----------------------------
 class RFMixReader:
-    """Read and align RFMix local ancestry to variant grid.
+    """
+    Read and align RFMix local ancestry to variant grid.
 
     Parameters
     ----------
@@ -76,17 +78,136 @@ class RFMixReader:
     """
 
     def __init__(
-        self, prefix_path: str, #variant_df: pd.DataFrame,
+        self, prefix_path: str,
         select_samples: Optional[List[str]] = None,
         exclude_chrs: Optional[List[str]] = None,
         binary_path: str = "./binary_files",
         verbose: bool = True, dtype=np.int8
     ):
-        # self.zarr_dir = f"{prefix_path}"
         bin_dir = f"{binary_path}"
 
         self.loci, self.g_anc, self.admix = read_rfmix(prefix_path,
                                                        binary_dir=bin_dir,
+                                                       verbose=verbose)
+        if self.admix.ndim != 3:
+            n_vars, total = self.admix.shape
+            n_pops = total // len(self.g_anc.sample_id.unique())
+            n_samp = total // n_pops
+            self.admix = self.admix.reshape(n_vars, n_samp, n_pops)
+
+        # Guard unknown shapes
+        if any(dim is None for dim in self.admix.shape):
+            raise ValueError(
+                "Ancestry array has unknown dimensions; expected (variants, samples, ancestries)."
+            )
+
+        # Build loci table
+        self.loci = _to_pandas(self.loci).rename(columns={"chromosome": "chrom",
+                                                          "physical_position": "pos"})
+        self.loci["i"] = np.arange(len(self.loci), dtype=int)
+        self.loci["hap"] = self.loci["chrom"].astype(str) + "_" + self.loci["pos"].astype(str)
+
+        # Subset samples
+        self.sample_ids = _get_sample_ids(self.g_anc)
+        if select_samples is not None:
+            ix = [self.sample_ids.index(i) for i in select_samples]
+            self.admix = self.admix[:, ix, :]
+            if hasattr(self.g_anc, "to_arrow"):
+                self.g_anc = self.g_anc.loc[ix].reset_index(drop=True)
+            else:
+                self.g_anc = self.g_anc.iloc[ix].reset_index(drop=True)
+            self.sample_ids = _get_sample_ids(self.g_anc)
+
+        # Exclude chromosomes if requested
+        if exclude_chrs is not None and len(exclude_chrs) > 0:
+            loci_pd = _to_pandas(self.loci)
+            mask_pd = ~loci_pd["chrom"].isin(exclude_chrs).values
+            self.admix = self.admix[mask_pd, :, :]
+            keep_idx = np.nonzero(mask_pd)[0]
+            self.loci = loci_pd.iloc[keep_idx].reset_index(drop=True)
+            self.loci["i"] = self.loci.index
+
+        # Dimensions
+        self.n_samples = int(self.admix.shape[1])
+        self.n_pops = int(self.admix.shape[2])
+
+        # Build hap tables
+        if self.n_pops == 2:
+            A0 = self.admix[:, :, [0]]
+            loci_ids = (self.loci["chrom"].astype(str) + "_" + self.loci["pos"].astype(str) + "_A0")
+            loci_df = _to_pandas(self.loci)[["chrom", "pos"]].copy()
+            loci_df["ancestry"] = 0
+            loci_df["hap"] = _to_pandas(loci_ids)
+            loci_df["index"] = np.arange(loci_df.shape[0])
+            self.loci_df = loci_df.set_index("hap")
+            self.loci_dfs = {c: g[["pos", "index"]].sort_values("pos").reset_index(drop=True)
+                            for c, g in self.loci_df.reset_index().groupby("chrom", sort=False)}
+            self.haplotypes = A0
+        else: # >2 ancestries
+            loci_dfs = []
+            loci_pd = _to_pandas(self.loci)
+            for anc in range(self.n_pops):
+                loci_df_anc = loci_pd[["chrom", "pos"]].copy()
+                loci_df_anc["ancestry"] = anc
+                loci_df_anc["hap"] = (
+                    loci_df_anc["chrom"].astype(str) + "_" + loci_df_anc["pos"].astype(str) + f"_A{anc}"
+                )
+                # Global index along flattened (variants*ancestries) axis
+                loci_df_anc["index"] = np.arange(loci_df_anc.shape[0]) + anc * self.loci.shape[0]
+                loci_dfs.append(loci_df_anc)
+
+            self.loci_df = pd.concat(loci_dfs).set_index("hap")
+            self.loci_dfs = {c: g[["pos", "index", "ancestry"]].sort_values("pos").reset_index(drop=True)
+                            for c, g in self.loci_df.reset_index().groupby("chrom", sort=False)}
+            self.haplotypes = self.admix  # dask array
+
+    def load_haplotypes(self):
+        """Force-load haplotype ancestry into memory as NumPy array."""
+        return self.haplotypes.compute()
+
+
+class FlareReader:
+    """
+    Read and align FLARE local ancestry to variant grid.
+
+    Parameters
+    ----------
+    prefix_path : str
+        Directory containing FLARE per-chrom outputs.
+    chunk_size : int
+        Number of records to read per chunk.
+    select_samples : list[str], optional
+        Subset of sample IDs to keep (order preserved).
+    exclude_chrs : list[str], optional
+        Chromosomes to exclude from imputed matrices.
+    verbose : bool
+    dtype : numpy dtype
+
+    Attributes
+    ----------
+    loci : cuDF
+        Imputed loci aligned to variants (columns: ['chrom','pos','i','hap']).
+    admix : dask.array
+        Dask array with shape (loci, samples, ancestries)
+    g_anc : cuDF or pd.DataFrame
+        Sample metadata table from FLARE (contains 'sample_id', 'chrom').
+    sample_ids : list[str]
+    n_pops : int
+    loci_df : pd.DataFrame
+        Ancestry dosage aligned to hap_df.
+    haplotypes : dask.array
+        Haplotype-level ancestry matrix (variants x samples [x ancestries]).
+    """
+
+    def __init__(
+        self, prefix_path: str,
+        chunk_size: np.int32 = 1_000_000,
+        select_samples: Optional[List[str]] = None,
+        exclude_chrs: Optional[List[str]] = None,
+        verbose: bool = True, dtype=np.int8
+    ):
+        self.loci, self.g_anc, self.admix = read_flare(prefix_path,
+                                                       chunk_size=chunk_size,
                                                        verbose=verbose)
         if self.admix.ndim != 3:
             n_vars, total = self.admix.shape
