@@ -653,6 +653,7 @@ def _run_independent_core_group(
                 y_resid_list, G_resid, H_resid = residualize_batch(
                     y_stack, G_t, H_t, rez_aug, center=True, group=True
                 )
+                n = int(G_resid.shape[1])
                 k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
                 num_var = int(G_resid.shape[0])
 
@@ -797,6 +798,7 @@ def _run_independent_core_group(
                     y_resid_list, G_resid, H_resid = residualize_batch(
                         y_stack, G_t, H_t, rez_aug, center=True, group=True
                     )
+                    n = int(G_resid.shape[1])
                     k_eff = rez_aug.Q_t.shape[1] if rez_aug is not None else 0
                     num_var = int(G_resid.shape[0])
 
@@ -849,7 +851,7 @@ def _run_independent_core_group(
                         r2_perm_np = r2_perm_max.detach().cpu().numpy()
                         if beta_approx:
                             pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
-                                r2_perm_np, best_r2_val, dof_init=dof
+                                r2_perm_np, best_r2_val, dof_init=best_dof
                             )
                         else:
                             pval_beta = a_hat = b_hat = true_dof = p_true =  np.nan
