@@ -4,7 +4,7 @@ import pandas as pd
 from typing import Optional, Sequence
 
 try:
-    torch.set_float32_matmul_precision("high")
+    torch.backends.fp32_precision = "ieee"
 except Exception:
     pass
 
