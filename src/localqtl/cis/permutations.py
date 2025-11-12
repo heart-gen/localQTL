@@ -617,11 +617,11 @@ def map_permutations(
             results.append(chrom_df)
             if logger.verbose:
                 elapsed = time.time() - chrom_start
-                logger.write(f"    Chromosome {chrom} completed in {elapsed:.2f}s")
+                logger.write(f"    Chromosome {chrom} completed in {elapsed / 60:.2f} min")
 
     if logger.verbose:
         elapsed = time.time() - overall_start
-        logger.write(f"    Completed permutation scan in {elapsed:.2f}s")
+        logger.write(f"    Completed permutation scan in {elapsed / 60:.2f} min")
 
     if results:
         return pd.concat(results, axis=0, ignore_index=True)
