@@ -1,9 +1,11 @@
+import os
+from contextlib import nullcontext
+
 import torch
 from ._torch_utils import move_to_device, resolve_device
 
 try:
-    torch.backends.cuda.matmul.fp32_precision = 'tf32'
-    torch.backends.cudnn.conv.fp32_precision = 'tf32'
+    torch.set_float32_matmul_precision("high")
 except Exception:
     pass
 
@@ -13,6 +15,33 @@ __all__ = [
     "run_batch_regression_with_permutations",
     "perm_chunk_r2", "prep_ctx_for_perm",
 ]
+
+_DEFAULT_MIXED_PRECISION = os.environ.get("LOCALQTL_MIXED_PRECISION", "bf16").lower()
+
+
+def _resolve_amp_dtype(device: torch.device, mode: str | None) -> torch.dtype | None:
+    if device.type != "cuda":
+        return None
+    if mode is None:
+        mode = _DEFAULT_MIXED_PRECISION
+    mode = mode.lower()
+    if mode not in {"bf16", "fp16", "off"}:
+        mode = "bf16"
+    if mode == "off":
+        return None
+    if mode == "bf16" and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    if torch.cuda.is_available():
+        return torch.float16
+    return None
+
+
+def _autocast_ctx(device: torch.device, mode: str | None):
+    dtype = _resolve_amp_dtype(device, mode)
+    if dtype is None:
+        return nullcontext()
+    return torch.amp.autocast("cuda", dtype=dtype)
+
 
 class Residualizer(object):
     """
@@ -29,12 +58,10 @@ class Residualizer(object):
         if keep.any():
             C_use = C_centered[:, keep]
             self.Q_t, _ = torch.linalg.qr(C_use, mode='reduced')
-            self.P = self.Q_t @ self.Q_t.T
             self.rank = int(self.Q_t.shape[1])
         else:
             # No informative covariates remain; act as identity residualizer.
             self.Q_t = C_t.new_zeros((n_samples, 0))
-            self.P = None
             self.rank = 0
 
         if tensorqtl_flavor:
@@ -62,7 +89,8 @@ class Residualizer(object):
                 M_t = M_t - M_t.mean(1, keepdim=True)
             if self.rank == 0:
                 return (M_t,)
-            return (M_t - M_t @ self.P,)
+            MQ = M_t @ self.Q_t
+            return (M_t - MQ @ self.Q_t.T,)
 
         # Concatenate features along rows
         M_cat = torch.cat(matrices, dim=0)
@@ -78,8 +106,9 @@ class Residualizer(object):
                 start = end
             return tuple(out)
 
-        # Project once with cached P
-        M_cat_resid = M_cat - M_cat @ self.P
+        # Project once with cached Q_t (skinny projection)
+        MQ = M_cat @ self.Q_t
+        M_cat_resid = M_cat - MQ @ self.Q_t.T
 
         # Split back into original blocks
         out = []
@@ -104,6 +133,10 @@ class Residualizer(object):
         if max_corr > atol:
             print(f"Warning: residuals not fully orthogonal (max={max_corr:.2e})")
         return max_corr
+
+    @property
+    def P(self):
+        raise AttributeError("Residualizer no longer exposes .P; use Q_t with skinny projection.")
 
 
 def _max_ignore_nan(x: torch.Tensor, dim: int):
@@ -198,6 +231,7 @@ def _is_cuda(*tensors):
 def run_batch_regression_with_permutations(
         y: torch.Tensor, G: torch.Tensor, H: torch.Tensor | None = None,
         y_perm: torch.Tensor | None = None, k_eff: int = 0, device: str = "cuda",
+        mixed_precision: str | None = None,
 ):
     """
     Return nominal betas/ses/tstats for G~y, and per-permutation max r^2 across variants.
@@ -207,7 +241,7 @@ def run_batch_regression_with_permutations(
     y = move_to_device(y, device)
     G = move_to_device(G, device)
     if y_perm is not None:
-        y_perm = y_perm.to(device)
+        y_perm = move_to_device(y_perm, device)
 
     EPS = 1e-8
     n = y.shape[0]
@@ -216,9 +250,10 @@ def run_batch_regression_with_permutations(
     if H is None:
         # Fast vectorized implementation (no H covariates)
         dof = max(n - 1 - int(k_eff), 1)
-        Gnorm2 = (G * G).sum(dim=1) + EPS          # (m,)
-        ynorm2 = (y * y).sum() + EPS               # scalar
-        Gy     = G @ y                             # (m,)
+        with _autocast_ctx(device, mixed_precision) if _is_cuda(G, y) else nullcontext():
+            Gnorm2 = (G * G).sum(dim=1) + EPS          # (m,)
+            ynorm2 = (y * y).sum() + EPS               # scalar
+            Gy     = G @ y                             # (m,)
 
         r      = Gy / torch.sqrt(Gnorm2 * ynorm2)  # (m,)
         one_minus_r2 = 1.0 - r * r
@@ -235,13 +270,8 @@ def run_batch_regression_with_permutations(
         if y_perm is not None:
             Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS
             if _is_cuda(G, y_perm):
-                try:
-                    with torch.amp.autocast("cuda", dtype=torch.float16):
-                        GYp = G @ y_perm             # (m, chunk)
-                except Exception:
-                    # older Torch
-                    with torch.cuda.amp.autocast(dtype=torch.float16):
-                        GYp = G @ y_perm
+                with _autocast_ctx(device, mixed_precision):
+                    GYp = G @ y_perm             # (m, chunk)
             else:
                 GYp = G @ y_perm
 
@@ -267,7 +297,7 @@ def run_batch_regression_with_permutations(
         Hg = torch.einsum("mnp,mn->mp", H, G)    # (m, pH)
 
         # Precompute common variables
-        with (torch.amp.autocast("cuda", dtype=torch.float16) if _is_cuda(G, H) else torch.no_grad()):
+        with (_autocast_ctx(device, mixed_precision) if _is_cuda(G, H) else nullcontext()):
             # S = H^T H  (m, pH, pH)
             S = torch.einsum("mnp,mnq->mpq", H, H).to(torch.float32)
 
@@ -306,10 +336,11 @@ def run_batch_regression_with_permutations(
         if y_perm is not None:
             y_perm = y_perm.to(device, non_blocking=True)        # (n, chunk)
             Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS         # (chunk,)
-            U = torch.einsum("mnp,nc->mpc", H, y_perm).to(torch.float32)
-            alpha_perm = torch.cholesky_solve(U, L)
-            T0 = (G @ y_perm).to(torch.float32)
-            T1 = torch.einsum("mp,mpc->mc", Hg, alpha_perm)
+            with _autocast_ctx(device, mixed_precision) if _is_cuda(G, y_perm, H) else nullcontext():
+                U = torch.einsum("mnp,nc->mpc", H, y_perm).to(torch.float32)
+                alpha_perm = torch.cholesky_solve(U, L)
+                T0 = (G @ y_perm).to(torch.float32)
+                T1 = torch.einsum("mp,mpc->mc", Hg, alpha_perm)
             # Numerator dot after projection
             GiYp_proj = T0 - T1                                  # (m, chunk)
             Yp_resid2 = (Ypnorm2.unsqueeze(0)
@@ -323,7 +354,8 @@ def run_batch_regression_with_permutations(
 
 
 @torch.no_grad()
-def prep_ctx_for_perm(y: torch.Tensor, G: torch.Tensor, H: torch.Tensor, k_eff: int):
+def prep_ctx_for_perm(y: torch.Tensor, G: torch.Tensor, H: torch.Tensor, k_eff: int,
+                      mixed_precision: str | None = None):
     """
     Precompute all variant-wise quantities for permutations when H is present.
     Returns a ctx dict with Cholesky factor and cached pieces, plus nominal stats.
@@ -334,7 +366,8 @@ def prep_ctx_for_perm(y: torch.Tensor, G: torch.Tensor, H: torch.Tensor, k_eff: 
     EPS = 1e-8
     dof = max(n - (1 + pH) - int(k_eff), 1)
 
-    S = torch.einsum("mnp,mnq->mpq", H, H).to(torch.float32)
+    with _autocast_ctx(device, mixed_precision) if _is_cuda(G, H, y) else nullcontext():
+        S = torch.einsum("mnp,mnq->mpq", H, H).to(torch.float32)
     I = torch.eye(pH, device=device, dtype=torch.float32).expand_as(S)
     L, info = torch.linalg.cholesky_ex(S)
     if (info != 0).any():
@@ -344,8 +377,9 @@ def prep_ctx_for_perm(y: torch.Tensor, G: torch.Tensor, H: torch.Tensor, k_eff: 
     Gy = (G @ y)
     G2 = (G * G).sum(dim=1) + EPS
     y2 = (y * y).sum() + EPS
-    Hy = torch.einsum("mnp,n->mp", H, y)
-    Hg = torch.einsum("mnp,mn->mp", H, G)
+    with _autocast_ctx(device, mixed_precision) if _is_cuda(G, H, y) else nullcontext():
+        Hy = torch.einsum("mnp,n->mp", H, y)
+        Hg = torch.einsum("mnp,mn->mp", H, G)
 
     alpha_y = torch.cholesky_solve(Hy.unsqueeze(-1), L).squeeze(-1)
     alpha_g = torch.cholesky_solve(Hg.unsqueeze(-1), L).squeeze(-1)
@@ -372,7 +406,8 @@ def prep_ctx_for_perm(y: torch.Tensor, G: torch.Tensor, H: torch.Tensor, k_eff: 
 
 
 @torch.no_grad()
-def perm_chunk_r2(ctx: dict, H: torch.Tensor, G: torch.Tensor, y_perm: torch.Tensor) -> torch.Tensor:
+def perm_chunk_r2(ctx: dict, H: torch.Tensor, G: torch.Tensor, y_perm: torch.Tensor,
+                  mixed_precision: str | None = None) -> torch.Tensor:
     """
     Compute max R^2 across variants for a permutation chunk (n x chunk),
     using precomputed ctx from prep_ctx_for_perm.
@@ -382,11 +417,12 @@ def perm_chunk_r2(ctx: dict, H: torch.Tensor, G: torch.Tensor, y_perm: torch.Ten
     L, Hg, G_resid2 = ctx["L"], ctx["Hg"], ctx["G_resid2"]
 
     # U = H^T y_perm: (m,pH,chunk); Alpha solves S*Alpha = U via Cholesky
-    U = torch.einsum("mnp,nc->mpc", H, y_perm).to(torch.float32)
-    _alpha = torch.cholesky_solve(U, L)
+    with _autocast_ctx(y_perm.device, mixed_precision) if _is_cuda(H, G, y_perm) else nullcontext():
+        U = torch.einsum("mnp,nc->mpc", H, y_perm).to(torch.float32)
+        _alpha = torch.cholesky_solve(U, L)
 
-    T0 = (G @ y_perm).to(torch.float32)
-    T1 = torch.einsum("mp,mpc->mc", Hg, _alpha)
+        T0 = (G @ y_perm).to(torch.float32)
+        T1 = torch.einsum("mp,mpc->mc", Hg, _alpha)
     GiYp_proj = T0 - T1
 
     Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS
