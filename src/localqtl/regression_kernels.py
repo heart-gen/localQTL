@@ -16,7 +16,7 @@ __all__ = [
     "perm_chunk_r2", "prep_ctx_for_perm",
 ]
 
-_DEFAULT_MIXED_PRECISION = os.environ.get("LOCALQTL_MIXED_PRECISION", "bf16").lower()
+_DEFAULT_MIXED_PRECISION = os.environ.get("LOCALQTL_MIXED_PRECISION", "fp16").lower()
 
 def _resolve_amp_dtype(device: torch.device, mode: str | None) -> torch.dtype | None:
     if device.type != "cuda":
@@ -24,12 +24,10 @@ def _resolve_amp_dtype(device: torch.device, mode: str | None) -> torch.dtype | 
     if mode is None:
         mode = _DEFAULT_MIXED_PRECISION
     mode = mode.lower()
-    if mode not in {"bf16", "fp16", "off"}:
-        mode = "bf16"
+    if mode not in {"fp16", "off"}:
+        mode = "fp16"
     if mode == "off":
         return None
-    if mode == "bf16" and torch.cuda.is_bf16_supported():
-        return torch.bfloat16
     if torch.cuda.is_available():
         return torch.float16
     return None
@@ -289,11 +287,11 @@ def run_batch_regression_with_permutations(
 
         dof = max(n - (1 + pH) - int(k_eff), 1)
 
-        Gy = (G @ y)                             # (m,)
-        G2 = (G * G).sum(dim=1) + EPS            # (m,)
-        y2 = (y * y).sum() + EPS                 # scalar
-        Hy = torch.einsum("mnp,n->mp", H, y)     # (m, pH)
-        Hg = torch.einsum("mnp,mn->mp", H, G)    # (m, pH)
+        Gy = (G @ y)
+        G2 = (G * G).sum(dim=1) + EPS
+        y2 = (y * y).sum() + EPS
+        Hy = torch.einsum("mnp,n->mp", H, y).to(torch.float32)
+        Hg = torch.einsum("mnp,mn->mp", H, G).to(torch.float32)
 
         # Precompute common variables
         with (_autocast_ctx(device, mixed_precision) if _is_cuda(G, H) else nullcontext()):
