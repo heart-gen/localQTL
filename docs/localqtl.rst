@@ -18,7 +18,9 @@ Overview
 adding GPU-first execution paths and local ancestry-aware inputs. The
 functional API and helper classes combine familiar cis-QTL primitives with
 utilities for loading haplotypes, aligning samples, and streaming results to
-Parquet sinks.
+Parquet sinks. Beyond the cis-mapping entry points the codebase ships device
+selection helpers, structured loggers, and streaming writers that mirror the
+defaults used by the CLI examples and automated tests.
 
 Features
 --------
@@ -27,8 +29,9 @@ The library exposes the same functionality outlined in the README while adding
 documentation-only call-outs for common production workflows:
 
 - **GPU-accelerated pipelines** via ``torch``, with automatic fallbacks to CPU
-  when CUDA devices are unavailable. See the
-  `feature summary <../README.md#features>`_ for a concise checklist.
+  when CUDA devices are unavailable (``localqtl.utils.pick_device`` drives
+  device selection). See the `feature summary <../README.md#features>`_ for a
+  concise checklist.
 - **Modular cis-QTL mapping helpers** such as
   :func:`localqtl.cis.map_nominal`, :func:`localqtl.cis.map_permutations`, and
   :func:`localqtl.cis.map_independent`, plus the orchestration-friendly
@@ -39,7 +42,9 @@ documentation-only call-outs for common production workflows:
 - **Local ancestry-aware inputs** via :class:`localqtl.haplotypeio.RFMixReader`
   and :class:`localqtl.haplotypeio.InputGeneratorCisWithHaps`.
 - **Pure-Python statistics** (``scipy`` + ``py-qvalue``) that remove ``rpy2``
-  requirements and play nicely with containerised deployments.
+  requirements and play nicely with containerised deployments. The
+  :mod:`localqtl.stats` module exposes the q-value helpers used by the high-level
+  APIs.
 
 Installation
 ------------
@@ -117,6 +122,8 @@ autodoc cross-references:
        window=1_000_000,
        nperm=1_000,
        device="auto",
+       perm_chunk=4096,
+       seed=42,
    )
 
 ``map_nominal``, ``map_permutations``, and ``map_independent`` accept a
@@ -124,6 +131,10 @@ autodoc cross-references:
 are provided, enabling the flag stages haplotypes as contiguous tensors on the
 target device (GPU or CPU). Disable it if the additional memory pressure is a
 concern.
+
+The helper trio also mirrors tensorQTL's "tensor-friendly" outputs through the
+``tensorqtl_flavor`` switch. Setting the flag to ``True`` swaps Parquet streaming
+for tensorQTL-compatible TSV/Parquet naming conventions and column layouts.
 
 CisMapper orchestration
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -151,6 +162,10 @@ q-value corrections, and conditional analyses:
 
    # ``nperm`` defaults to ``None`` (alias ``0``) to mirror tensorQTL's
    # permutation-free nominal scans.
+
+    # Persist independent hits using the streaming Parquet sink employed under
+    # the hood by the functional APIs.
+    lead_df.to_parquet("lead_hits.parquet", compression="snappy")
 
 Local ancestry workflows
 ------------------------
@@ -226,35 +241,145 @@ fine-mapping or replication analyses:
 For additional preprocessing helpers, explore :mod:`localqtl.preproc` (MAF
 filters) and :mod:`localqtl.utils` (CUDA detection utilities).
 
+Device, logging, and reproducibility helpers
+--------------------------------------------
+
+:mod:`localqtl.utils` centralises the lightweight utilities that the mapping
+pipelines consume internally:
+
+.. code-block:: python
+
+   from localqtl.utils import gpu_available, pick_device, SimpleLogger, NullLogger, subseed
+
+   if not gpu_available():
+       print("Falling back to CPU execution")
+
+   device = pick_device("auto")  # returns "cuda" when a GPU is visible, else "cpu"
+   logger = SimpleLogger(verbose=True, timestamps=True)
+
+   with logger.time_block("residualizing phenotypes"):
+       ...
+
+   # Derive deterministic sub-seeds when distributing work across processes
+   worker_seed = subseed(base=1234, key="worker-0")
+
+``SimpleLogger`` mirrors the console logging behaviour of tensorQTL while adding
+context managers for timing blocks. ``NullLogger`` provides a drop-in silent
+replacement. ``pick_device`` implements the ``"auto"`` device semantics used by
+the cis-mapping functions and :class:`localqtl.cis.CisMapper`.
+
+Streaming output sinks
+----------------------
+
+The cis-mapping helpers stream association statistics through reusable Parquet
+writes that are also exposed as public classes:
+
+.. code-block:: python
+
+   import pyarrow as pa
+   from localqtl.iosinks import ParquetSink, AsyncParquetSink, RowGroupBuffer
+
+   schema = pa.schema([
+       ("phenotype_id", pa.string()),
+       ("variant_id", pa.string()),
+       ("pval_beta", pa.float64()),
+   ])
+
+   with ParquetSink("cis_hits.parquet", schema=schema) as sink:
+       sink.write({"phenotype_id": ["geneA"], "variant_id": ["rs1"], "pval_beta": [1e-8]})
+
+   # Or overlap Arrow compression + filesystem writes with GPU/CPU work
+   async_sink = AsyncParquetSink("cis_hits_async.parquet", schema=schema)
+   async_sink.write({"phenotype_id": ["geneA"], "variant_id": ["rs1"], "pval_beta": [1e-8]})
+   async_sink.close()
+
+``RowGroupBuffer`` batches rows before flushing them through ``ParquetSink``.
+The streaming classes share the exact code paths used by
+:func:`localqtl.cis.map_nominal` and :func:`localqtl.cis.map_permutations` when
+``return_df=False``.
+
+Statistics helpers
+------------------
+
+:mod:`localqtl.stats` contains the numerically stable routines that power the
+beta approximation used during permutation scans:
+
+.. code-block:: python
+
+   from localqtl.stats import calculate_qvalues, beta_approx_pval, pval_from_corr_r2
+
+   perm_df = mapper.map_permutations(nperm=1_000)
+   perm_df = calculate_qvalues(perm_df, fdr=0.05)
+
+   # Inspect the beta-approximation metadata already materialised by map_permutations
+   beta_meta = perm_df[["pval_beta", "beta_shape1", "beta_shape2", "true_dof"]].head()
+
+   # If you capture raw permutation maxima (e.g., via a custom hook), you can
+   # recompute the beta approximation with the standalone helper:
+   #   raw_perm_r2 = np.load("permutation_r2.npy")
+   #   p_beta, a_hat, b_hat, dof_est, p_true = beta_approx_pval(
+   #       r2_perm=raw_perm_r2,
+   #       r2_true=perm_df["r2_nominal"].max(),
+   #       dof_init=perm_df["true_dof"].iloc[0],
+   #   )
+
+   # Convert R^2 back to a two-sided p-value for downstream filtering
+   p_from_r2 = pval_from_corr_r2(r2=0.25, dof=perm_df["true_dof"].iloc[0])
+
 API reference
 -------------
 
-.. currentmodule:: localqtl
+Core mapping API
+~~~~~~~~~~~~~~~~
 
-.. autosummary::
-   :toctree: _autosummary
-   :nosignatures:
+* :func:`localqtl.cis.map_nominal`
+* :func:`localqtl.cis.map_permutations`
+* :func:`localqtl.cis.map_independent`
+* :class:`localqtl.cis.CisMapper`
+* :mod:`localqtl.cis`
 
-   map_nominal
-   map_permutations
-   map_independent
-   CisMapper
-   PlinkReader
-   RFMixReader
-   PgenReader
-   InputGeneratorCis
-   InputGeneratorCisWithHaps
-   read_phenotype_bed
-   gpu_available
-   cis
-   genotypeio
-   haplotypeio
-   iosinks
-   phenotypeio
-   preproc
-   finemap
-   stats
-   utils
+Genotype and phenotype I/O
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* :class:`localqtl.genotypeio.PlinkReader`
+* :class:`localqtl.genotypeio.InputGeneratorCis`
+* :class:`localqtl.haplotypeio.RFMixReader`
+* :class:`localqtl.haplotypeio.InputGeneratorCisWithHaps`
+* :func:`localqtl.phenotypeio.read_phenotype_bed`
+* :class:`localqtl.pgen.PgenReader`
+* :class:`localqtl.iosinks.ParquetSink`
+* :class:`localqtl.iosinks.AsyncParquetSink`
+* :class:`localqtl.iosinks.RowGroupBuffer`
+* :mod:`localqtl.genotypeio`
+* :mod:`localqtl.haplotypeio`
+* :mod:`localqtl.phenotypeio`
+* :mod:`localqtl.pgen`
+* :mod:`localqtl.iosinks`
+
+Execution utilities
+~~~~~~~~~~~~~~~~~~~
+
+* :class:`localqtl.utils.SimpleLogger`
+* :class:`localqtl.utils.NullLogger`
+* :func:`localqtl.utils.gpu_available`
+* :func:`localqtl.utils.pick_device`
+* :func:`localqtl.utils.subseed`
+* :mod:`localqtl.utils`
+
+Statistics and regression
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* :func:`localqtl.stats.calculate_qvalues`
+* :func:`localqtl.stats.beta_approx_pval`
+* :func:`localqtl.stats.pval_from_corr_r2`
+* :func:`localqtl.stats.get_t_pval`
+* :mod:`localqtl.stats`
+* :class:`localqtl.regression_kernels.Residualizer`
+* :func:`localqtl.regression_kernels.run_batch_regression`
+* :func:`localqtl.regression_kernels.run_batch_regression_with_permutations`
+* :func:`localqtl.regression_kernels.perm_chunk_r2`
+* :func:`localqtl.regression_kernels.prep_ctx_for_perm`
+* :mod:`localqtl.regression_kernels`
 
 Testing
 -------
