@@ -23,11 +23,23 @@ except Exception:
 
 meta = PYPROJECT.get("project") or PYPROJECT.get("tool", {}).get("poetry") or {}
 project = meta.get("name", "localQTL")
-authors = meta.get("authors", [])
-if isinstance(authors, list) and authors and isinstance(authors[0], dict):
-    author = ", ".join(a.get("name", "") for a in authors if isinstance(a, dict)) or "localQTL Developers"
-else:
-    author = meta.get("authors", "localQTL Developers")
+authors_meta = meta.get("authors", [])
+author = "localQTL Developers"
+
+if isinstance(authors_meta, list):
+    if authors_meta and isinstance(authors_meta[0], dict):
+        # PEP 621 style: [{'name': '...'}, {'name': '...'}]
+        names = [d.get("name") or d.get("email") or "" for d in authors_meta if isinstance(d, dict)]
+        names = [n for n in names if n]
+        if names:
+            author = ", ".join(names)
+    else:
+        # Poetry style: ["Full Name <email>", "Co Author <email>"]
+        names = [str(x) for x in authors_meta if x]
+        if names:
+            author = ", ".join(names)
+elif isinstance(authors_meta, str) and authors_meta.strip():
+    author = authors_meta.strip()
 
 current_year = datetime.utcnow().year
 copyright = f"{current_year}, {author}"
