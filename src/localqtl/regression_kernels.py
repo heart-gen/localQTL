@@ -5,7 +5,7 @@ import torch
 from ._torch_utils import move_to_device, resolve_device
 
 try:
-    torch.set_float32_matmul_precision("high")
+    torch.backends.fp32_precision = "ieee"
 except Exception:
     pass
 
@@ -17,7 +17,6 @@ __all__ = [
 ]
 
 _DEFAULT_MIXED_PRECISION = os.environ.get("LOCALQTL_MIXED_PRECISION", "bf16").lower()
-
 
 def _resolve_amp_dtype(device: torch.device, mode: str | None) -> torch.dtype | None:
     if device.type != "cuda":
