@@ -927,6 +927,7 @@ def map_independent(
         device: str = "auto", beta_approx: bool = True, perm_chunk: int = 2048,
         seed: int | None = None, logger: SimpleLogger | None = None,
         verbose: bool = True, preload_haplotypes: bool = True,
+        tensorqtl_flavor: bool = False,
 ) -> pd.DataFrame:
     """Entry point: build IG; derive seed/threshold from cis_df; dispatch to grouped/ungrouped core.
 
@@ -1016,6 +1017,7 @@ def map_independent(
                 beta_approx=beta_approx, seed=seed, chrom=chrom,
                 perm_ix_t=perm_ix_t, perm_chunk=perm_chunk,
                 logger=logger, total_items=chrom_total, item_label=item_label,
+                tensorqtl_flavor=tensorqtl_flavor,
             )
     else:
         if "group_id" not in signif_df.columns:
@@ -1043,6 +1045,7 @@ def map_independent(
                 beta_approx=beta_approx, seed=seed, chrom=chrom,
                 perm_ix_t=perm_ix_t, perm_chunk=perm_chunk,
                 logger=logger, total_items=chrom_total, item_label=item_label,
+                tensorqtl_flavor=tensorqtl_flavor,
             )
 
     if logger.verbose:
