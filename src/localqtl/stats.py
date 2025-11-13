@@ -290,12 +290,14 @@ def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
             if not lb.empty:
                 # global threshold p* between last sig and first non-sig (tensorQTL convention)
                 p_star = lb.iloc[-1] if ub.empty else 0.5 * (lb.iloc[-1] + ub.iloc[0])
+                p_star = np.clip(p_star, 1e-16, 1 - 1e-16) # Avoid edge cases
                 # phenotype-wise nominal cutoff from Beta quantile
                 from scipy.stats import beta as beta_dist
                 idx = have_params[have_params].index
-                res_df.loc[idx, "pval_nominal_threshold"] = beta_dist.ppf(
-                    p_star, a=res_df.loc[idx, "beta_shape1"], b=res_df.loc[idx, "beta_shape2"]
-                )
+                # Sanitize beta shapes
+                a = res_df.loc[idx, "beta_shape1"].clip(lower=1e-6, upper=1e6)
+                b = res_df.loc[idx, "beta_shape2"].clip(lower=1e-6, upper=1e6)
+                res_df.loc[idx, "pval_nominal_threshold"] = beta_dist.ppf(p_star, a=a, b=b)
                 logger.write(f"  * min p-value threshold @ FDR {fdr:.2f}: {p_star:.6g} (beta-quantile per phenotype)")
         else:
             logger.write("  * No beta parameters present; skipping nominal threshold computation.")
