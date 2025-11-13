@@ -157,7 +157,6 @@ def compute_perm_r2_max(
         torch.Tensor,
     ]:
     """Run chunked permutations from a stream, optionally returning nominal stats and r²."""
-    EPS = 1e-12
     device = y_resid.device
     device_str = device.type if isinstance(device, torch.device) else str(device)
     y_resid = y_resid.contiguous()
