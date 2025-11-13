@@ -40,6 +40,11 @@ def _autocast_ctx(device: torch.device, mode: str | None):
     return torch.amp.autocast("cuda", dtype=dtype)
 
 
+def _solve_chol(L: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """Solve L L^T x = B with dtype-safe casting for AMP."""
+    return torch.cholesky_solve(B.to(L.dtype), L)
+
+
 class Residualizer(object):
     """
     Residualizer for regressing out covariates from genotype/phenotype matrices.
@@ -306,8 +311,8 @@ def run_batch_regression_with_permutations(
             L = torch.linalg.cholesky(S)
 
         # Solve S * alpha = RHS in batch
-        alpha_y = torch.cholesky_solve(Hy.unsqueeze(-1), L).squeeze(-1)
-        alpha_g = torch.cholesky_solve(Hg.unsqueeze(-1), L).squeeze(-1)
+        alpha_y = _solve_chol(L, Hy.unsqueeze(-1)).squeeze(-1)
+        alpha_g = _solve_chol(L, Hg.unsqueeze(-1)).squeeze(-1)
 
         # Norms after projecting out H (variant-specific!)
         y_resid2 = (y2 - (Hy * alpha_y).sum(dim=1)) + EPS        # (m,)
@@ -333,9 +338,11 @@ def run_batch_regression_with_permutations(
         if y_perm is not None:
             y_perm = y_perm.to(device, non_blocking=True)        # (n, chunk)
             Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS         # (chunk,)
-            with _autocast_ctx(device, mixed_precision) if _is_cuda(G, y_perm, H) else nullcontext():
+            amp_needed = _is_cuda(G, y_perm, H)
+            with (_autocast_ctx(device, mixed_precision) if amp_needed else nullcontext()):
                 U = torch.einsum("mnp,nc->mpc", H, y_perm).to(torch.float32)
-                alpha_perm = torch.cholesky_solve(U, L)
+            alpha_perm = _solve_chol(L, U)
+            with (_autocast_ctx(device, mixed_precision) if amp_needed else nullcontext()):
                 T0 = (G @ y_perm).to(torch.float32)
                 T1 = torch.einsum("mp,mpc->mc", Hg, alpha_perm)
             # Numerator dot after projection
@@ -378,8 +385,11 @@ def prep_ctx_for_perm(y: torch.Tensor, G: torch.Tensor, H: torch.Tensor, k_eff: 
         Hy = torch.einsum("mnp,n->mp", H, y)
         Hg = torch.einsum("mnp,mn->mp", H, G)
 
-    alpha_y = torch.cholesky_solve(Hy.unsqueeze(-1), L).squeeze(-1)
-    alpha_g = torch.cholesky_solve(Hg.unsqueeze(-1), L).squeeze(-1)
+    Hy = Hy.to(L.dtype)
+    Hg = Hg.to(L.dtype)
+
+    alpha_y = _solve_chol(L, Hy.unsqueeze(-1)).squeeze(-1)
+    alpha_g = _solve_chol(L, Hg.unsqueeze(-1)).squeeze(-1)
 
     y_resid2 = (y2 - (Hy * alpha_y).sum(dim=1)) + EPS
     G_resid2 = (G2 - (Hg * alpha_g).sum(dim=1)) + EPS
@@ -414,10 +424,13 @@ def perm_chunk_r2(ctx: dict, H: torch.Tensor, G: torch.Tensor, y_perm: torch.Ten
     L, Hg, G_resid2 = ctx["L"], ctx["Hg"], ctx["G_resid2"]
 
     # U = H^T y_perm: (m,pH,chunk); Alpha solves S*Alpha = U via Cholesky
-    with _autocast_ctx(y_perm.device, mixed_precision) if _is_cuda(H, G, y_perm) else nullcontext():
+    amp_needed = _is_cuda(H, G, y_perm)
+    with (_autocast_ctx(y_perm.device, mixed_precision) if amp_needed else nullcontext()):
         U = torch.einsum("mnp,nc->mpc", H, y_perm).to(torch.float32)
-        _alpha = torch.cholesky_solve(U, L)
 
+    _alpha = _solve_chol(L, U)
+
+    with (_autocast_ctx(y_perm.device, mixed_precision) if amp_needed else nullcontext()):
         T0 = (G @ y_perm).to(torch.float32)
         T1 = torch.einsum("mp,mpc->mc", Hg, _alpha)
     GiYp_proj = T0 - T1
@@ -427,3 +440,29 @@ def perm_chunk_r2(ctx: dict, H: torch.Tensor, G: torch.Tensor, y_perm: torch.Ten
 
     R2 = (GiYp_proj ** 2) / (G_resid2.unsqueeze(1) * Yp_resid2)
     return torch.nan_to_num(R2, nan=0.0).amax(dim=0).to(torch.float32)
+
+
+if __name__ == "__main__" and os.environ.get("LOCALQTL_DEV_CHECK", "0") == "1":
+    torch.manual_seed(13)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    m, n, pH = 64, 128, 2
+    y = torch.randn(n, device=device, dtype=torch.float32)
+    G = torch.randn(m, n, device=device, dtype=torch.float32)
+    H = torch.randn(m, n, pH, device=device, dtype=torch.float32)
+    y_perm = torch.randn(n, 3, device=device, dtype=torch.float32)
+
+    ctx_amp, betas_amp, ses_amp, tstats_amp = prep_ctx_for_perm(
+        y, G, H, k_eff=0, mixed_precision="fp16"
+    )
+    ctx_fp32, betas_fp32, ses_fp32, tstats_fp32 = prep_ctx_for_perm(
+        y, G, H, k_eff=0, mixed_precision="off"
+    )
+
+    max_beta = (betas_amp - betas_fp32).abs().max().item()
+    max_se = (ses_amp - ses_fp32).abs().max().item()
+    max_t = (tstats_amp - tstats_fp32).abs().max().item()
+    worst = max(max_beta, max_se, max_t)
+    assert worst <= 1e-5, f"stat mismatch under AMP ({worst:.2e})"
+
+    perm_vals = perm_chunk_r2(ctx_amp, H, G, y_perm, mixed_precision="fp16")
+    assert torch.isfinite(perm_vals).all(), "Permutation path produced NaNs/inf"
