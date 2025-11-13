@@ -164,9 +164,11 @@ def _run_permutation_core(
         n = int(y_resid_t.shape[0])
         p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
         dof = max(n - k_eff - p_pred, 1)
-        t_g = tstats[:, 0]
-        t_sq = t_g.double().pow(2)
-        r2_nominal_vec = (t_sq / (t_sq + dof)).to(torch.float32)
+        EPS = 1e-12
+        yn2 = (y_resid_t * y_resid_t).sum() + EPS
+        g2  = (G_resid * G_resid).sum(dim=1) + EPS
+        gy  = G_resid @ y_resid_t
+        r2_nominal_vec = (gy * gy) / (g2 * yn2)
         r2_nominal_vec = torch.nan_to_num(r2_nominal_vec, nan=-1.0)
         ix = int(r2_nominal_vec.argmax().item())
 

@@ -157,7 +157,7 @@ def compute_perm_r2_max(
         torch.Tensor,
     ]:
     """Run chunked permutations from a stream, optionally returning nominal stats and r²."""
-
+    EPS = 1e-12
     device = y_resid.device
     device_str = device.type if isinstance(device, torch.device) else str(device)
     y_resid = y_resid.contiguous()
@@ -188,10 +188,14 @@ def compute_perm_r2_max(
                 device=device_str,
                 mixed_precision=mixed_precision,
             )
-            tvals = nominal_t[:, 0].double()
-            t2 = tvals.pow(2)
             dof = max(n_samples - 1 - int(k_eff), 1)
-            r2_nominal = (t2 / (t2 + float(dof))).to(torch.float32)
+            y32 = y_resid.to(torch.float32)
+            G32 = G_resid.to(torch.float32)
+            yn2 = (y32 * y32).sum() + EPS
+            g2  = (G32 * G32).sum(dim=1) + EPS
+            gy  = G32 @ y32
+            r2_nominal = (gy * gy) / (g2 * yn2)
+            r2_nominal = torch.nan_to_num(r2_nominal, nan=0.0).to(torch.float32)
 
         for sel in perm_stream.iter_chunks(target):
             chunk = sel.shape[0]
@@ -211,10 +215,15 @@ def compute_perm_r2_max(
         )
         if return_nominal:
             nominal_b, nominal_s, nominal_t = b_nom, s_nom, t_nom
-            tvals = t_nom[:, 0].double()
-            t2 = tvals.pow(2)
             dof = ctx.get("dof", max(n_samples - 1 - int(k_eff), 1))
-            r2_nominal = (t2 / (t2 + float(dof))).to(torch.float32)
+            y32 = y_resid.to(torch.float32)
+            G32 = G_resid.to(torch.float32)
+            yn2 = (y32 * y32).sum() + EPS
+            g2  = (G32 * G32).sum(dim=1) + EPS
+            gy  = G32 @ y32
+            r2_nominal = (gy * gy) / (g2 * yn2)
+            r2_nominal = torch.nan_to_num(r2_nominal, nan=0.0).to(torch.float32)
+
 
         for sel in perm_stream.iter_chunks(target):
             chunk = sel.shape[0]
