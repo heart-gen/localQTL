@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 GPU-enabled utilities to incorporate local ancestry (RFMix) into tensorQTL-style
 cis mapping. Provides:
@@ -18,21 +19,18 @@ from typing import List, Optional, Union
 
 from rfmix_reader.readers import read_rfmix, read_flare
 
-from .utils import gpu_available
+from .utils import select_array_module
 from .genotypeio import InputGeneratorCis, background
 
-if gpu_available():
-    import cudf
-    import cupy as cp
-    from cudf import DataFrame as cuDF
-    
-    get_array_module = cp.get_array_module
-else:
-    cp = np
-    cudf = pd
-    cuDF = pd.DataFrame
-    def get_array_module(x):
-        return np
+def _get_array_module(x):
+    try:
+        backend = select_array_module()
+        if hasattr(backend, "get_array_module"):
+            return backend.get_array_module(x)
+    except Exception:
+        pass
+    return np
+
 
 # Public exports
 __all__ = [
@@ -439,7 +437,7 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
         pair independently. Supports NumPy or CuPy arrays via arr_mod.
         """
         # Determine array module
-        mod = get_array_module(block)
+        mod = _get_array_module(block)
 
         loci_dim, sample_dim, ancestry_dim = block.shape
         block = block.reshape(loci_dim, -1)  # Shape: (loci, samples * ancestries)
