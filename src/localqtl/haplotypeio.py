@@ -16,7 +16,7 @@ import pandas as pd
 import torch
 from typing import List, Optional, Union
 
-from rfmix_reader import read_rfmix, read_flare
+from rfmix_reader.readers import read_rfmix, read_flare
 
 from .utils import gpu_available
 from .genotypeio import InputGeneratorCis, background
