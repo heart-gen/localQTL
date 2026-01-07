@@ -12,12 +12,11 @@ Notes
 - Avoids materialization; uses dask-backed arrays and cuDF slicing.
 - Compatible with original tensorQTL patterns while adding local ancestry.
 """
+import importlib
 import numpy as np
 import pandas as pd
 import torch
 from typing import List, Optional, Union
-
-from rfmix_reader.readers import read_rfmix, read_flare
 
 from .utils import select_array_module
 from .genotypeio import InputGeneratorCis, background
@@ -30,6 +29,10 @@ def _get_array_module(x):
     except Exception:
         pass
     return np
+
+def _get_rfmix_readers():
+    readers = importlib.import_module("rfmix_reader.readers")
+    return readers.read_rfmix, readers.read_flare
 
 
 # Public exports
@@ -84,6 +87,7 @@ class RFMixReader:
     ):
         bin_dir = f"{binary_path}"
 
+        read_rfmix, _ = _get_rfmix_readers()
         self.loci, self.g_anc, self.admix = read_rfmix(prefix_path,
                                                        binary_dir=bin_dir,
                                                        verbose=verbose)
@@ -204,6 +208,7 @@ class FlareReader:
         exclude_chrs: Optional[List[str]] = None,
         verbose: bool = True, dtype=np.int8
     ):
+        _, read_flare = _get_rfmix_readers()
         self.loci, self.g_anc, self.admix = read_flare(prefix_path,
                                                        chunk_size=chunk_size,
                                                        verbose=verbose)
