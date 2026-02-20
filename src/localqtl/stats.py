@@ -14,6 +14,7 @@ from scipy.special import betaln
 from py_qvalue import qvalue, pi0est
 from typing import Optional, Sequence, Union
 
+from .utils import SimpleLogger
 __all__ = [
     "beta_approx_pval",
     "get_t_pval",
@@ -229,14 +230,18 @@ def nominal_pvals_tensorqtl(
         dof = max(n - int(k_eff) - 2, 1)
         # t = r * sqrt(dof / (1 - r^2))
         t_from_r = r * torch.sqrt(torch.tensor(dof, dtype=r.dtype, device=r.device) / (1.0 - r2))
-        pvals = t_two_sided_pval_torch(t_from_r.abs(), dof)
+        t_cpu = t_from_r.abs().detach().cpu().numpy()
+        p_cpu = get_t_pval(t_cpu, dof, log10=False)
+        pvals = torch.as_tensor(p_cpu, device=t_from_r.device, dtype=torch.float32)
         return pvals, dof
     else:
         # multi-predictor: use genotype t-stat (column 0)
         p_pred = 1 + H_resid.shape[2]
         dof = max(n - int(k_eff) - p_pred, 1)
         t_g = tstats[:, 0].abs()
-        pvals = t_two_sided_pval_torch(t_g, dof)
+        t_cpu = t_g.detach().cpu().numpy()
+        p_cpu = get_t_pval(t_cpu, dof, log10=False)
+        pvals = torch.as_tensor(p_cpu, device=t_g.device, dtype=torch.float32)
         return pvals, dof
 
 
@@ -271,7 +276,10 @@ def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
         p = np.where(np.isfinite(p), p, 1.0)
 
     if qvalue_lambda is not None:
-        logger.write(f'  * Calculating q-values with lambda = {qvalue_lambda:.3f}')
+        if isinstance(qvalue_lambda, (list, tuple, np.ndarray)):
+            logger.write(f'  * Calculating q-values with lambda = {qvalue_lambda}')
+        else:
+            logger.write(f'  * Calculating q-values with lambda = {qvalue_lambda:.3f}')
 
     qvals_res = qvalue(p, lambda_=qvalue_lambda)
     qvals, pi0 = qvals_res["qvalues"], qvals_res["pi0"]

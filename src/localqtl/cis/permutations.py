@@ -29,6 +29,12 @@ __all__ = [
     "map_permutations",
 ]
 
+def _nanmax(x: torch.Tensor, dim: int):
+    if hasattr(torch, "nanmax"):
+        return torch.nanmax(x, dim=dim)
+    replace = torch.full_like(x, float("-inf"))
+    return torch.max(torch.where(torch.isnan(x), replace, x), dim=dim)
+
 def _estimate_rows(ig, chrom: str | None, grouped: bool = False) -> int:
     if chrom is None:
         if grouped and getattr(ig, "group_s", None) is not None:
@@ -445,15 +451,8 @@ def _run_permutation_core_group(
                 )
             else:
                 pval_beta = a_hat = b_hat = true_dof = p_true = np.nan
-            if not np.isfinite(pval_beta):
-                stop_pval = pval_perm
-            else:
-                stop_pval = float(pval_beta)
             pval_nominal = float(get_t_pval(best_t, best_dof))
         else:
-            stop_pval = float("inf")
-
-        if best_ix_var < 0 or stop_pval > signif_threshold:
             processed += 1
             continue
 
