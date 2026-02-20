@@ -13,7 +13,7 @@ from .._torch_utils import to_device_tensor
 from ..stats import beta_approx_pval, get_t_pval
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from ..preproc import impute_mean_and_filter, filter_by_maf
-from ..regression_kernels import Residualizer
+from ..regression_kernels import Residualizer, prep_ctx_for_perm, perm_chunk_r2
 from ._permute import PermutationStream, compute_perm_r2_max
 from ._buffer import (
     allocate_result_buffers,
@@ -23,12 +23,26 @@ from ._buffer import (
 from .common import (
     align_like_casefold,
     residualize_batch,
+    residualize_batch_interaction,
+    prepare_interaction_covariate,
     dosage_vector_for_covariate
 )
 
 __all__ = [
     "map_independent",
 ]
+
+def _interaction_columns(n_ancestries: int) -> list[str]:
+    cols: list[str] = []
+    for anc in range(n_ancestries):
+        suffix = f"anc{anc}"
+        cols.extend([
+            f"slope_gxh_{suffix}",
+            f"slope_se_gxh_{suffix}",
+            f"tstat_gxh_{suffix}",
+            f"pval_gxh_{suffix}",
+        ])
+    return cols
 
 def _auto_perm_chunk(n_variants: int, nperm: int, pH: int = 0, safety: float = 0.8) -> int:
     if not torch.cuda.is_available() or n_variants <= 0:
@@ -59,6 +73,8 @@ def _run_independent_core(
         total_items: int | None = None, item_label: str = "phenotypes",
         tensorqtl_flavor: bool = False, perm_indices_mode: str = "generator",
         mixed_precision: str | None = None, nperm_stage1: int | None = 2000,
+        ancestry_model: str | None = None, n_ancestries: int | None = None,
+        interaction_covariate_t: torch.Tensor | None = None,
 ) -> pd.DataFrame:
     """Forward–backward independent mapping for ungrouped phenotypes."""
     expected_columns = [
@@ -67,6 +83,10 @@ def _run_independent_core(
         "pval_perm", "pval_beta", "beta_shape1", "beta_shape2", "ma_samples",
         "ma_count", "af", "true_dof", "pval_true_dof", "rank",
     ]
+    interaction_columns: list[str] = []
+    if ancestry_model == "interaction" and n_ancestries is not None and n_ancestries > 0:
+        interaction_columns = _interaction_columns(int(n_ancestries))
+        expected_columns.extend(interaction_columns)
     dtype_map = {
         "phenotype_id": object,
         "variant_id": object,
@@ -89,6 +109,9 @@ def _run_independent_core(
         "pval_true_dof": np.float32,
         "rank": np.int32,
     }
+    if interaction_columns:
+        for col in interaction_columns:
+            dtype_map[col] = np.float32
     buffers = allocate_result_buffers(expected_columns, dtype_map, signif_seed_df.shape[0])
     cursor = 0
     processed = 0
@@ -173,6 +196,10 @@ def _run_independent_core(
                 if H_t is not None:
                     H_t = H_t[keep_maf]
 
+            interaction_mode = ancestry_model == "interaction" and H_t is not None
+            covar_interaction = interaction_covariate_t is not None
+            covar_interaction = interaction_covariate_t is not None
+
             pH = 0 if H_t is None else int(H_t.shape[2])
             perm_chunk_local = _auto_perm_chunk(G_t.shape[0], nperm, pH=pH)
             if perm_chunk is not None and perm_chunk > 0:
@@ -219,90 +246,290 @@ def _run_independent_core(
                 if extras:
                     extras_mat = torch.stack(extras, dim=1)
                     rez_extra = Residualizer(extras_mat, tensorqtl_flavor=tensorqtl_flavor)
-                    y_resid, G_resid, H_resid = residualize_batch(
-                        y0, G0, H0, rez_extra, center=True, group=False,
-                    )
+                    if interaction_mode:
+                        y_resid, G_resid, H_resid, I_resid = residualize_batch_interaction(
+                            y0, G0, H0, rez_extra, center=True, group=False,
+                        )
+                    else:
+                        y_resid, G_resid, H_resid = residualize_batch(
+                            y0, G0, H0, rez_extra, center=True, group=False,
+                        )
                 else:
-                    y_resid, G_resid, H_resid = y0, G0, H0
+                    if interaction_mode:
+                        y_resid, G_resid, H_resid, I_resid = residualize_batch_interaction(
+                            y0, G0, H0, None, center=True, group=False,
+                        )
+                    else:
+                        y_resid, G_resid, H_resid = y0, G0, H0
                 k_eff = k_base + (rez_extra.k_eff if rez_extra is not None else 0)
-                stream = PermutationStream(
-                    n_samples=int(y_resid.shape[0]),
-                    nperm=nperm,
-                    device=y_resid.device,
-                    chunk_size=max(1, perm_chunk_local),
-                    seed=perm_seed_base,
-                    mode=perm_indices_mode,
-                )
                 cap = nperm if stage1_cap is None else min(nperm, stage1_cap)
-                betas, ses, tstats, r2_nominal_vec, r2_perm_vals = compute_perm_r2_max(
-                    y_resid=y_resid,
-                    G_resid=G_resid,
-                    H_resid=H_resid,
-                    k_eff=k_eff,
-                    perm_stream=stream,
-                    max_permutations=cap,
-                    return_nominal=True,
-                    mixed_precision=mixed_precision,
-                )
-                if r2_nominal_vec is None:
-                    r2_nominal_vec = torch.zeros(G_resid.shape[0], device=y_resid.device, dtype=torch.float32)
-                r2_nominal_vec = torch.nan_to_num(r2_nominal_vec.to(torch.float32), nan=-1.0)
-                r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
-                ix = int(ix_t.item())
-                if random_tiebreak:
-                    ties = torch.nonzero(torch.isclose(r2_nominal_vec, r2_max_t, atol=1e-12), as_tuple=True)[0]
-                    if ties.numel() > 1:
-                        if gen is None:
-                            choice_tensor = torch.randint(0, ties.numel(), (1,), device=ties.device)
-                        else:
-                            choice_tensor = torch.randint(0, ties.numel(), (1,), device=ties.device, generator=gen)
-                        ix = int(ties[int(choice_tensor.item())].item())
-                        r2_max_t = r2_nominal_vec[ix]
+                if interaction_mode:
+                    if H_resid is None:
+                        raise ValueError("interaction model requires haplotypes.")
+                    pH = int(H_resid.shape[2])
+                    n_anc = int(n_ancestries) if n_ancestries is not None else pH
+                    H_cov = torch.cat([G_resid.unsqueeze(-1), H_resid], dim=2)
+                    n_samples_local = int(y_resid.shape[0])
+                    p_pred = 1 + int(H_cov.shape[2])
+                    dof = max(n_samples_local - int(k_eff) - int(p_pred), 1)
 
-                n_samples_local = int(y_resid.shape[0])
-                p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-                dof = max(n_samples_local - int(k_eff) - int(p_pred), 1)
+                    def _perm_chunks(stream: PermutationStream, count: int) -> list[torch.Tensor]:
+                        return list(stream.iter_chunks(count))
 
-                beta = float(betas[ix, 0].item())
-                se = float(ses[ix, 0].item())
-                tval = float(tstats[ix, 0].item())
-                r2_nom = float(r2_max_t.item())
-                pval_nominal = float(get_t_pval(tval, dof))
+                    def _r2_perm_from_chunks(
+                        y_vec: torch.Tensor,
+                        chunks: list[torch.Tensor],
+                        ctx_list: list[dict],
+                        g_list: list[torch.Tensor],
+                    ) -> torch.Tensor:
+                        if not chunks:
+                            return torch.empty((0,), device=y_vec.device, dtype=torch.float32)
+                        blocks = []
+                        n_samp = int(y_vec.shape[0])
+                        for sel in chunks:
+                            flat = sel.reshape(-1)
+                            y_perm = y_vec.index_select(0, flat).view(sel.shape[0], n_samp).transpose(0, 1)
+                            r2_max = None
+                            for ctx_k, g_k in zip(ctx_list, g_list):
+                                r2_block = perm_chunk_r2(ctx_k, H_cov, g_k, y_perm, mixed_precision=mixed_precision)
+                                r2_max = r2_block if r2_max is None else torch.maximum(r2_max, r2_block)
+                            blocks.append(r2_max.to(torch.float32))
+                        return torch.cat(blocks, dim=0)
 
-                r2_perm = r2_perm_vals
-                pval_perm = (
-                    (r2_perm >= r2_max_t).sum().add_(1).float() / (r2_perm.numel() + 1)
-                ).item()
+                    anc_results = []
+                    r2_perm = None
+                    best_r2 = -float("inf")
+                    best_ix = -1
+                    best_anc = -1
 
-                if beta_approx:
-                    r2_perm_np = r2_perm.detach().cpu().numpy()
-                    pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
-                        r2_perm_np, r2_nom, dof_init=dof,
+                    stream = PermutationStream(
+                        n_samples=int(y_resid.shape[0]),
+                        nperm=nperm,
+                        device=y_resid.device,
+                        chunk_size=max(1, perm_chunk_local),
+                        seed=perm_seed_base,
+                        mode=perm_indices_mode,
                     )
-                else:
-                    pval_beta = a_hat = b_hat = true_dof = p_true = np.nan
+                    stage_chunks = _perm_chunks(stream, cap)
 
-                stop_pval = float(pval_beta)
-                if not np.isfinite(stop_pval):
-                    stop_pval = pval_perm
+                    ctx_list: list[dict] = []
+                    g_list: list[torch.Tensor] = []
+
+                    for k in range(pH):
+                        ctx, betas, ses, tstats = prep_ctx_for_perm(
+                            y_resid, I_resid[:, :, k], H_cov, k_eff, mixed_precision=mixed_precision,
+                        )
+                        tvals = tstats[:, 0].double()
+                        t2 = tvals.pow(2)
+                        dof_ctx = ctx.get("dof", dof)
+                        r2_nominal_vec = (t2 / (t2 + float(dof_ctx))).to(torch.float32)
+                        r2_nominal_vec = torch.nan_to_num(r2_nominal_vec, nan=-1.0)
+                        r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
+                        ix = int(ix_t.item())
+                        if random_tiebreak:
+                            ties = torch.nonzero(torch.isclose(r2_nominal_vec, r2_max_t, atol=1e-12), as_tuple=True)[0]
+                            if ties.numel() > 1:
+                                if gen is None:
+                                    choice_tensor = torch.randint(0, ties.numel(), (1,), device=ties.device)
+                                else:
+                                    choice_tensor = torch.randint(0, ties.numel(), (1,), device=ties.device, generator=gen)
+                                ix = int(ties[int(choice_tensor.item())].item())
+                                r2_max_t = r2_nominal_vec[ix]
+
+                        anc_results.append((betas, ses, tstats))
+                        if r2_max_t > best_r2:
+                            best_r2 = float(r2_max_t.item())
+                            best_ix = ix
+                            best_anc = k
+                        ctx_list.append(ctx)
+                        g_list.append(I_resid[:, :, k])
+
+                    r2_perm = _r2_perm_from_chunks(y_resid, stage_chunks, ctx_list, g_list)
+
+                    slope_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
+                    slope_se_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
+                    tstat_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
+                    pval_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
+                    for k in range(pH):
+                        betas, ses, tstats = anc_results[k]
+                        slope_gxh[k] = float(betas[best_ix, 0].item())
+                        slope_se_gxh[k] = float(ses[best_ix, 0].item())
+                        tstat_gxh[k] = float(tstats[best_ix, 0].item())
+                        pval_gxh[k] = float(get_t_pval(tstat_gxh[k], dof))
+
+                    beta = float(slope_gxh[best_anc])
+                    se = float(slope_se_gxh[best_anc])
+                    tval = float(tstat_gxh[best_anc])
+                    r2_nom = float(best_r2)
+                    pval_nominal = float(get_t_pval(tval, dof))
+
+                    pval_perm = (
+                        (r2_perm >= torch.tensor(best_r2, device=r2_perm.device)).sum().add_(1).float() / (r2_perm.numel() + 1)
+                    ).item()
+
+                    if beta_approx:
+                        r2_perm_np = r2_perm.detach().cpu().numpy()
+                        pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
+                            r2_perm_np, r2_nom, dof_init=dof,
+                        )
+                    else:
+                        pval_beta = a_hat = b_hat = true_dof = p_true = np.nan
+
+                    stop_pval = float(pval_beta)
+                    if not np.isfinite(stop_pval):
+                        stop_pval = pval_perm
+                elif covar_interaction:
+                    c_t = interaction_covariate_t
+                    if c_t.device != G_resid.device:
+                        c_t = c_t.to(G_resid.device)
+                    I_t = G_resid * c_t
+                    c_rep = c_t.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
+                    if H_resid is None:
+                        H_cov = torch.cat([G_resid.unsqueeze(-1), c_rep], dim=2)
+                    else:
+                        H_cov = torch.cat([G_resid.unsqueeze(-1), H_resid, c_rep], dim=2)
+
+                    stream = PermutationStream(
+                        n_samples=int(y_resid.shape[0]),
+                        nperm=nperm,
+                        device=y_resid.device,
+                        chunk_size=max(1, perm_chunk_local),
+                        seed=perm_seed_base,
+                        mode=perm_indices_mode,
+                    )
+                    betas, ses, tstats, r2_nominal_vec, r2_perm_vals = compute_perm_r2_max(
+                        y_resid=y_resid,
+                        G_resid=I_t,
+                        H_resid=H_cov,
+                        k_eff=k_eff,
+                        perm_stream=stream,
+                        max_permutations=cap,
+                        return_nominal=True,
+                        mixed_precision=mixed_precision,
+                    )
+                    if r2_nominal_vec is None:
+                        r2_nominal_vec = torch.zeros(G_resid.shape[0], device=y_resid.device, dtype=torch.float32)
+                    r2_nominal_vec = torch.nan_to_num(r2_nominal_vec.to(torch.float32), nan=-1.0)
+                    r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
+                    ix = int(ix_t.item())
+                    if random_tiebreak:
+                        ties = torch.nonzero(torch.isclose(r2_nominal_vec, r2_max_t, atol=1e-12), as_tuple=True)[0]
+                        if ties.numel() > 1:
+                            if gen is None:
+                                choice_tensor = torch.randint(0, ties.numel(), (1,), device=ties.device)
+                            else:
+                                choice_tensor = torch.randint(0, ties.numel(), (1,), device=ties.device, generator=gen)
+                            ix = int(ties[int(choice_tensor.item())].item())
+                            r2_max_t = r2_nominal_vec[ix]
+
+                    n_samples_local = int(y_resid.shape[0])
+                    p_pred = 1 + int(H_cov.shape[2])
+                    dof = max(n_samples_local - int(k_eff) - int(p_pred), 1)
+
+                    beta = float(betas[ix, 0].item())
+                    se = float(ses[ix, 0].item())
+                    tval = float(tstats[ix, 0].item())
+                    r2_nom = float(r2_max_t.item())
+                    pval_nominal = float(get_t_pval(tval, dof))
+
+                    r2_perm = r2_perm_vals
+                    pval_perm = (
+                        (r2_perm >= r2_max_t).sum().add_(1).float() / (r2_perm.numel() + 1)
+                    ).item()
+
+                    if beta_approx:
+                        r2_perm_np = r2_perm.detach().cpu().numpy()
+                        pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
+                            r2_perm_np, r2_nom, dof_init=dof,
+                        )
+                    else:
+                        pval_beta = a_hat = b_hat = true_dof = p_true = np.nan
+
+                    stop_pval = float(pval_beta)
+                    if not np.isfinite(stop_pval):
+                        stop_pval = pval_perm
+                else:
+                    stream = PermutationStream(
+                        n_samples=int(y_resid.shape[0]),
+                        nperm=nperm,
+                        device=y_resid.device,
+                        chunk_size=max(1, perm_chunk_local),
+                        seed=perm_seed_base,
+                        mode=perm_indices_mode,
+                    )
+                    betas, ses, tstats, r2_nominal_vec, r2_perm_vals = compute_perm_r2_max(
+                        y_resid=y_resid,
+                        G_resid=G_resid,
+                        H_resid=H_resid,
+                        k_eff=k_eff,
+                        perm_stream=stream,
+                        max_permutations=cap,
+                        return_nominal=True,
+                        mixed_precision=mixed_precision,
+                    )
+                    if r2_nominal_vec is None:
+                        r2_nominal_vec = torch.zeros(G_resid.shape[0], device=y_resid.device, dtype=torch.float32)
+                    r2_nominal_vec = torch.nan_to_num(r2_nominal_vec.to(torch.float32), nan=-1.0)
+                    r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
+                    ix = int(ix_t.item())
+                    if random_tiebreak:
+                        ties = torch.nonzero(torch.isclose(r2_nominal_vec, r2_max_t, atol=1e-12), as_tuple=True)[0]
+                        if ties.numel() > 1:
+                            if gen is None:
+                                choice_tensor = torch.randint(0, ties.numel(), (1,), device=ties.device)
+                            else:
+                                choice_tensor = torch.randint(0, ties.numel(), (1,), device=ties.device, generator=gen)
+                            ix = int(ties[int(choice_tensor.item())].item())
+                            r2_max_t = r2_nominal_vec[ix]
+
+                    n_samples_local = int(y_resid.shape[0])
+                    p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
+                    dof = max(n_samples_local - int(k_eff) - int(p_pred), 1)
+
+                    beta = float(betas[ix, 0].item())
+                    se = float(ses[ix, 0].item())
+                    tval = float(tstats[ix, 0].item())
+                    r2_nom = float(r2_max_t.item())
+                    pval_nominal = float(get_t_pval(tval, dof))
+
+                    r2_perm = r2_perm_vals
+                    pval_perm = (
+                        (r2_perm >= r2_max_t).sum().add_(1).float() / (r2_perm.numel() + 1)
+                    ).item()
+
+                    if beta_approx:
+                        r2_perm_np = r2_perm.detach().cpu().numpy()
+                        pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
+                            r2_perm_np, r2_nom, dof_init=dof,
+                        )
+                    else:
+                        pval_beta = a_hat = b_hat = true_dof = p_true = np.nan
+
+                    stop_pval = float(pval_beta)
+                    if not np.isfinite(stop_pval):
+                        stop_pval = pval_perm
 
                 if r2_perm.numel() < nperm and stop_pval <= signif_threshold * 2:
                     remaining = nperm - r2_perm.numel()
                     if remaining > 0:
-                        _, _, _, _, extra_perm = compute_perm_r2_max(
-                            y_resid=y_resid,
-                            G_resid=G_resid,
-                            H_resid=H_resid,
-                            k_eff=k_eff,
-                            perm_stream=stream,
-                            max_permutations=remaining,
-                            return_nominal=False,
-                            mixed_precision=mixed_precision,
-                        )
+                        if interaction_mode:
+                            extra_chunks = _perm_chunks(stream, remaining)
+                            extra_perm = _r2_perm_from_chunks(y_resid, extra_chunks, ctx_list, g_list)
+                        else:
+                            _, _, _, _, extra_perm = compute_perm_r2_max(
+                                y_resid=y_resid,
+                                G_resid=G_resid,
+                                H_resid=H_resid,
+                                k_eff=k_eff,
+                                perm_stream=stream,
+                                max_permutations=remaining,
+                                return_nominal=False,
+                                mixed_precision=mixed_precision,
+                            )
                         if extra_perm.numel():
                             r2_perm = torch.cat([r2_perm, extra_perm])
                             pval_perm = (
-                                (r2_perm >= r2_max_t).sum().add_(1).float() / (r2_perm.numel() + 1)
+                                (r2_perm >= (best_r2 if interaction_mode else r2_max_t)).sum().add_(1).float() / (r2_perm.numel() + 1)
                             ).item()
                             if beta_approx:
                                 r2_perm_np = r2_perm.detach().cpu().numpy()
@@ -316,12 +543,12 @@ def _run_independent_core(
                                 stop_pval = pval_perm
 
                 return {
-                    "betas": betas,
-                    "ses": ses,
-                    "tstats": tstats,
-                    "r2_nominal_vec": r2_nominal_vec,
+                    "betas": None if interaction_mode else betas,
+                    "ses": None if interaction_mode else ses,
+                    "tstats": None if interaction_mode else tstats,
+                    "r2_nominal_vec": None if interaction_mode else r2_nominal_vec,
                     "r2_perm": r2_perm,
-                    "ix": ix,
+                    "ix": best_ix if interaction_mode else ix,
                     "beta": beta,
                     "se": se,
                     "tval": tval,
@@ -336,6 +563,14 @@ def _run_independent_core(
                     "stop_pval": float(stop_pval),
                     "num_var": int(G_resid.shape[0]),
                     "dof": int(dof),
+                    "slope_gxh": slope_gxh if interaction_mode else None,
+                    "slope_se_gxh": slope_se_gxh if interaction_mode else None,
+                    "tstat_gxh": tstat_gxh if interaction_mode else None,
+                    "pval_gxh": pval_gxh if interaction_mode else None,
+                    "perm_stream": stream if interaction_mode else None,
+                    "perm_ctx_list": ctx_list if interaction_mode else None,
+                    "perm_g_list": g_list if interaction_mode else None,
+                    "perm_chunks": stage_chunks if interaction_mode else None,
                 }
 
             forward_records: list[dict[str, object]] = []
@@ -388,6 +623,13 @@ def _run_independent_core(
                     "true_dof": eval_res["true_dof"],
                     "pval_true_dof": eval_res["p_true"],
                 })
+                if interaction_mode and interaction_columns:
+                    for anc_idx in range(len(interaction_columns) // 4):
+                        base = anc_idx * 4
+                        forward_records[-1][interaction_columns[base + 0]] = eval_res["slope_gxh"][anc_idx]
+                        forward_records[-1][interaction_columns[base + 1]] = eval_res["slope_se_gxh"][anc_idx]
+                        forward_records[-1][interaction_columns[base + 2]] = eval_res["tstat_gxh"][anc_idx]
+                        forward_records[-1][interaction_columns[base + 3]] = eval_res["pval_gxh"][anc_idx]
 
                 if var_id in var_in_frame and var_id in ig.genotype_df.index and var_id not in dosage_proj:
                     ensure_projected(var_id)
@@ -444,6 +686,13 @@ def _run_independent_core(
                             "pval_true_dof": eval_res["p_true"],
                             "rank": int(rk),
                         })
+                        if interaction_mode and interaction_columns:
+                            for anc_idx in range(len(interaction_columns) // 4):
+                                base = anc_idx * 4
+                                kept_records[-1][interaction_columns[base + 0]] = eval_res["slope_gxh"][anc_idx]
+                                kept_records[-1][interaction_columns[base + 1]] = eval_res["slope_se_gxh"][anc_idx]
+                                kept_records[-1][interaction_columns[base + 2]] = eval_res["tstat_gxh"][anc_idx]
+                                kept_records[-1][interaction_columns[base + 3]] = eval_res["pval_gxh"][anc_idx]
 
                 if not kept_records:
                     continue
@@ -478,6 +727,8 @@ def _run_independent_core_group(
         total_items: int | None = None, item_label: str = "phenotype groups",
         tensorqtl_flavor: bool = False, perm_indices_mode: str = "generator",
         mixed_precision: str | None = None, nperm_stage1: int | None = 2000,
+        ancestry_model: str | None = None, n_ancestries: int | None = None,
+        interaction_covariate_t: torch.Tensor | None = None,
 ) -> pd.DataFrame:
     """Forward-backward independent mapping for grouped phenotypes."""
     expected_columns = [
@@ -486,6 +737,10 @@ def _run_independent_core_group(
         "pval_nominal", "pval_perm", "pval_beta", "beta_shape1", "beta_shape2",
         "ma_samples", "ma_count", "af", "true_dof", "pval_true_dof", "rank",
     ]
+    interaction_columns: list[str] = []
+    if ancestry_model == "interaction" and n_ancestries is not None and n_ancestries > 0:
+        interaction_columns = _interaction_columns(int(n_ancestries))
+        expected_columns.extend(interaction_columns)
     dtype_map = {
         "group_id": object,
         "group_size": np.int32,
@@ -510,6 +765,9 @@ def _run_independent_core_group(
         "pval_true_dof": np.float32,
         "rank": np.int32,
     }
+    if interaction_columns:
+        for col in interaction_columns:
+            dtype_map[col] = np.float32
     buffers = allocate_result_buffers(expected_columns, dtype_map, seed_by_group_df.shape[0])
     cursor = 0
     processed = 0
@@ -597,6 +855,8 @@ def _run_independent_core_group(
                 if H_t is not None:
                     H_t = H_t[keep_maf]
 
+            interaction_mode = ancestry_model == "interaction" and H_t is not None
+
             pH = 0 if H_t is None else int(H_t.shape[2])
             perm_chunk_local = _auto_perm_chunk(G_t.shape[0], nperm, pH=pH)
             if perm_chunk is not None and perm_chunk > 0:
@@ -651,14 +911,405 @@ def _run_independent_core_group(
                 if extras:
                     extras_mat = torch.stack(extras, dim=1)
                     rez_extra = Residualizer(extras_mat, tensorqtl_flavor=tensorqtl_flavor)
-                    y_resid_list, G_resid, H_resid = residualize_batch(
-                        y_base_list, G0, H0, rez_extra, center=True, group=True,
-                    )
+                    if interaction_mode:
+                        y_resid_list, G_resid, H_resid, I_resid = residualize_batch_interaction(
+                            y_base_list, G0, H0, rez_extra, center=True, group=True,
+                        )
+                    else:
+                        y_resid_list, G_resid, H_resid = residualize_batch(
+                            y_base_list, G0, H0, rez_extra, center=True, group=True,
+                        )
                 else:
-                    y_resid_list, G_resid, H_resid = y_base_list, G0, H0
+                    if interaction_mode:
+                        y_resid_list, G_resid, H_resid, I_resid = residualize_batch_interaction(
+                            y_base_list, G0, H0, None, center=True, group=True,
+                        )
+                    else:
+                        y_resid_list, G_resid, H_resid = y_base_list, G0, H0
                 k_eff = k_base + (rez_extra.k_eff if rez_extra is not None else 0)
                 num_var = int(G_resid.shape[0])
                 stage_cap = nperm if stage1_cap is None else min(nperm, stage1_cap)
+
+                if interaction_mode:
+                    if H_resid is None:
+                        raise ValueError("interaction model requires haplotypes.")
+                    pH = int(H_resid.shape[2])
+                    n_anc = int(n_ancestries) if n_ancestries is not None else pH
+                    H_cov = torch.cat([G_resid.unsqueeze(-1), H_resid], dim=2)
+                    p_pred = 1 + int(H_cov.shape[2])
+
+                    def _perm_chunks(stream: PermutationStream, count: int) -> list[torch.Tensor]:
+                        return list(stream.iter_chunks(count))
+
+                    def _r2_perm_from_chunks(
+                        y_vec: torch.Tensor,
+                        chunks: list[torch.Tensor],
+                        ctx_list: list[dict],
+                        g_list: list[torch.Tensor],
+                    ) -> torch.Tensor:
+                        if not chunks:
+                            return torch.empty((0,), device=y_vec.device, dtype=torch.float32)
+                        blocks = []
+                        n_samp = int(y_vec.shape[0])
+                        for sel in chunks:
+                            flat = sel.reshape(-1)
+                            y_perm = y_vec.index_select(0, flat).view(sel.shape[0], n_samp).transpose(0, 1)
+                            r2_max = None
+                            for ctx_k, g_k in zip(ctx_list, g_list):
+                                r2_block = perm_chunk_r2(ctx_k, H_cov, g_k, y_perm, mixed_precision=mixed_precision)
+                                r2_max = r2_block if r2_max is None else torch.maximum(r2_max, r2_block)
+                            blocks.append(r2_max.to(torch.float32))
+                        return torch.cat(blocks, dim=0)
+
+                    per_pheno: list[dict[str, object]] = []
+                    r2_perm_tensors: list[torch.Tensor] = []
+                    best_tensor = torch.tensor(float("-inf"), device=G_resid.device, dtype=torch.float32)
+                    best_idx = -1
+
+                    for j, (pid_inner, y_resid) in enumerate(zip(ids_list, y_resid_list)):
+                        best_r2_pheno = -float("inf")
+                        best_ix_var_pheno = -1
+                        best_anc_pheno = -1
+                        anc_results: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+                        stream = PermutationStream(
+                            n_samples=int(y_resid.shape[0]),
+                            nperm=nperm,
+                            device=y_resid.device,
+                            chunk_size=max(1, perm_chunk_local),
+                            seed=perm_seed_base,
+                            mode=perm_indices_mode,
+                        )
+                        stage_chunks = _perm_chunks(stream, stage_cap)
+
+                        ctx_list: list[dict] = []
+                        g_list: list[torch.Tensor] = []
+
+                        for k in range(pH):
+                            ctx, betas, ses, tstats = prep_ctx_for_perm(
+                                y_resid, I_resid[:, :, k], H_cov, k_eff, mixed_precision=mixed_precision,
+                            )
+                            tvals = tstats[:, 0].double()
+                            t2 = tvals.pow(2)
+                            dof_ctx = ctx.get("dof", max(int(y_resid.shape[0]) - int(k_eff) - int(p_pred), 1))
+                            r2_nom_vec = (t2 / (t2 + float(dof_ctx))).to(torch.float32)
+                            r2_nom_vec = torch.nan_to_num(r2_nom_vec.to(torch.float32), nan=-1.0)
+                            r2_max_t, ix_t = _nanmax(r2_nom_vec, dim=0)
+                            ix = int(ix_t.item())
+                            anc_results.append((betas, ses, tstats))
+
+                            if r2_max_t > best_r2_pheno:
+                                best_r2_pheno = float(r2_max_t.item())
+                                best_ix_var_pheno = ix
+                                best_anc_pheno = k
+
+                            ctx_list.append(ctx)
+                            g_list.append(I_resid[:, :, k])
+
+                        r2_perm_pheno = _r2_perm_from_chunks(y_resid, stage_chunks, ctx_list, g_list)
+
+                        dof = max(int(y_resid.shape[0]) - int(k_eff) - int(p_pred), 1)
+                        slope_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
+                        slope_se_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
+                        tstat_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
+                        pval_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
+                        for k in range(pH):
+                            betas, ses, tstats = anc_results[k]
+                            slope_gxh[k] = float(betas[best_ix_var_pheno, 0].item())
+                            slope_se_gxh[k] = float(ses[best_ix_var_pheno, 0].item())
+                            tstat_gxh[k] = float(tstats[best_ix_var_pheno, 0].item())
+                            pval_gxh[k] = float(get_t_pval(tstat_gxh[k], dof))
+
+                        per_pheno.append({
+                            "pid": pid_inner,
+                            "ix": best_ix_var_pheno,
+                            "anc": best_anc_pheno,
+                            "tensor": best_r2_pheno,
+                            "r2_perm": r2_perm_pheno,
+                            "slope_gxh": slope_gxh,
+                            "slope_se_gxh": slope_se_gxh,
+                            "tstat_gxh": tstat_gxh,
+                            "pval_gxh": pval_gxh,
+                            "dof": dof,
+                            "stream": stream,
+                            "ctx_list": ctx_list,
+                            "g_list": g_list,
+                            "y_resid": y_resid,
+                        })
+                        r2_perm_tensors.append(r2_perm_pheno)
+
+                        if torch.tensor(best_r2_pheno, device=best_tensor.device) > best_tensor:
+                            best_tensor = torch.tensor(best_r2_pheno, device=best_tensor.device)
+                            best_idx = j
+
+                    r2_perm_max = torch.stack(r2_perm_tensors, dim=0).amax(dim=0)
+                    best_info = per_pheno[best_idx] if best_idx >= 0 else None
+                    pval_perm = float("inf")
+                    pval_beta = float("nan")
+                    a_hat = float("nan")
+                    b_hat = float("nan")
+                    p_true = float("nan")
+                    true_dof_val = float("nan")
+                    stop_pval = float("inf")
+
+                    if best_info is not None:
+                        pval_perm = (
+                            (r2_perm_max >= torch.tensor(best_info["tensor"], device=r2_perm_max.device)).sum().add_(1).float() / (r2_perm_max.numel() + 1)
+                        ).item()
+                        if beta_approx:
+                            r2_perm_np = r2_perm_max.detach().cpu().numpy()
+                            pval_beta, a_hat, b_hat, true_dof_val, p_true = beta_approx_pval(
+                                r2_perm_np, float(best_info["tensor"]), dof_init=best_info["dof"],
+                            )
+                        else:
+                            pval_beta = a_hat = b_hat = true_dof_val = p_true = np.nan
+                        stop_pval = float(pval_beta)
+                        if not np.isfinite(stop_pval):
+                            stop_pval = pval_perm
+
+                    if best_info is not None and stage_cap < nperm and stop_pval <= signif_threshold * 2:
+                        remaining = nperm - r2_perm_max.numel()
+                        if remaining > 0:
+                            updated_vectors: list[torch.Tensor] = []
+                            for info in per_pheno:
+                                extra_chunks = _perm_chunks(info["stream"], remaining)
+                                extra_perm = _r2_perm_from_chunks(
+                                    info["y_resid"], extra_chunks, info["ctx_list"], info["g_list"]
+                                )
+                                if extra_perm.numel():
+                                    info["r2_perm"] = torch.cat([info["r2_perm"], extra_perm])
+                                updated_vectors.append(info["r2_perm"])
+                            if updated_vectors:
+                                r2_perm_max = torch.stack(updated_vectors, dim=0).amax(dim=0)
+                                pval_perm = (
+                                    (r2_perm_max >= torch.tensor(best_info["tensor"], device=r2_perm_max.device)).sum().add_(1).float() / (r2_perm_max.numel() + 1)
+                                ).item()
+                                if beta_approx:
+                                    r2_perm_np = r2_perm_max.detach().cpu().numpy()
+                                    pval_beta, a_hat, b_hat, true_dof_val, p_true = beta_approx_pval(
+                                        r2_perm_np, float(best_info["tensor"]), dof_init=best_info["dof"],
+                                    )
+                                else:
+                                    pval_beta = a_hat = b_hat = true_dof_val = p_true = np.nan
+                                stop_pval = float(pval_beta)
+                                if not np.isfinite(stop_pval):
+                                    stop_pval = pval_perm
+
+                    if best_info is None:
+                        return {
+                            "best_ix_var": -1,
+                            "best_pheno_idx": -1,
+                            "stop_pval": float("inf"),
+                        }
+
+                    best_pid = per_pheno[best_idx]["pid"]
+                    best_ix = per_pheno[best_idx]["ix"]
+                    best_anc = per_pheno[best_idx]["anc"]
+                    best_beta = float(per_pheno[best_idx]["slope_gxh"][best_anc])
+                    best_se = float(per_pheno[best_idx]["slope_se_gxh"][best_anc])
+                    best_t = float(per_pheno[best_idx]["tstat_gxh"][best_anc])
+                    best_dof = per_pheno[best_idx]["dof"]
+                    best_r2 = float(per_pheno[best_idx]["tensor"])
+                    pval_nominal = float(get_t_pval(best_t, best_dof))
+
+                    true_dof_out = int(true_dof_val) if np.isfinite(true_dof_val) else int(best_dof)
+
+                    return {
+                        "best_ix_var": int(best_ix),
+                        "best_pheno_idx": int(best_idx),
+                        "best_pid": best_pid,
+                        "beta": best_beta,
+                        "se": best_se,
+                        "tval": best_t,
+                        "r2_nom": best_r2,
+                        "pval_nominal": pval_nominal,
+                        "pval_perm": float(pval_perm),
+                        "pval_beta": float(pval_beta),
+                        "a_hat": float(a_hat),
+                        "b_hat": float(b_hat),
+                        "p_true": float(p_true),
+                        "true_dof": true_dof_out,
+                        "stop_pval": float(stop_pval),
+                        "num_var": num_var,
+                        "dof": best_dof,
+                        "slope_gxh": per_pheno[best_idx]["slope_gxh"],
+                        "slope_se_gxh": per_pheno[best_idx]["slope_se_gxh"],
+                        "tstat_gxh": per_pheno[best_idx]["tstat_gxh"],
+                        "pval_gxh": per_pheno[best_idx]["pval_gxh"],
+                    }
+                if covar_interaction:
+                    c_t = interaction_covariate_t
+                    if c_t.device != G_resid.device:
+                        c_t = c_t.to(G_resid.device)
+                    I_t = G_resid * c_t
+                    c_rep = c_t.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
+                    if H_resid is None:
+                        H_cov = torch.cat([G_resid.unsqueeze(-1), c_rep], dim=2)
+                    else:
+                        H_cov = torch.cat([G_resid.unsqueeze(-1), H_resid, c_rep], dim=2)
+
+                    per_pheno: list[dict[str, object]] = []
+                    r2_perm_tensors: list[torch.Tensor] = []
+                    best_tensor = torch.tensor(float("-inf"), device=G_resid.device, dtype=torch.float32)
+                    best_idx = -1
+
+                    p_pred = 1 + int(H_cov.shape[2])
+
+                    for j, (pid_inner, y_resid) in enumerate(zip(ids_list, y_resid_list)):
+                        stream = PermutationStream(
+                            n_samples=int(y_resid.shape[0]),
+                            nperm=nperm,
+                            device=y_resid.device,
+                            chunk_size=max(1, perm_chunk_local),
+                            seed=perm_seed_base,
+                            mode=perm_indices_mode,
+                        )
+                        betas, ses, tstats, r2_nom_vec, r2_perm_stage1 = compute_perm_r2_max(
+                            y_resid=y_resid,
+                            G_resid=I_t,
+                            H_resid=H_cov,
+                            k_eff=k_eff,
+                            perm_stream=stream,
+                            max_permutations=stage_cap,
+                            return_nominal=True,
+                            mixed_precision=mixed_precision,
+                        )
+                        if r2_nom_vec is None:
+                            r2_nom_vec = torch.zeros(num_var, device=y_resid.device, dtype=torch.float32)
+                        r2_nom_vec = torch.nan_to_num(r2_nom_vec.to(torch.float32), nan=-1.0)
+                        r2_max_t, ix_t = _nanmax(r2_nom_vec, dim=0)
+                        ix = int(ix_t.item())
+                        if random_tiebreak:
+                            ties = torch.nonzero(torch.isclose(r2_nom_vec, r2_max_t, atol=1e-12), as_tuple=True)[0]
+                            if ties.numel() > 1:
+                                if gen is None:
+                                    choice_tensor = torch.randint(0, ties.numel(), (1,), device=ties.device)
+                                else:
+                                    choice_tensor = torch.randint(0, ties.numel(), (1,), device=ties.device, generator=gen)
+                                ix = int(ties[int(choice_tensor.item())].item())
+                                r2_max_t = r2_nom_vec[ix]
+
+                        dof = max(int(y_resid.shape[0]) - int(k_eff) - int(p_pred), 1)
+                        beta_val = float(betas[ix, 0].item())
+                        se_val = float(ses[ix, 0].item())
+                        tval = float(tstats[ix, 0].item())
+
+                        per_pheno.append({
+                            "pid": pid_inner,
+                            "stream": stream,
+                            "betas": betas,
+                            "ses": ses,
+                            "tstats": tstats,
+                            "r2_nominal_vec": r2_nom_vec,
+                            "ix": ix,
+                            "tensor": r2_max_t,
+                            "beta": beta_val,
+                            "se": se_val,
+                            "tval": tval,
+                            "dof": dof,
+                            "r2_perm": r2_perm_stage1,
+                        })
+                        r2_perm_tensors.append(r2_perm_stage1)
+
+                        if r2_max_t > best_tensor:
+                            best_tensor = r2_max_t
+                            best_idx = j
+
+                    r2_perm_max = torch.stack(r2_perm_tensors, dim=0).amax(dim=0)
+                    best_info = per_pheno[best_idx] if best_idx >= 0 else None
+                    pval_perm = float("inf")
+                    pval_beta = float("nan")
+                    a_hat = float("nan")
+                    b_hat = float("nan")
+                    p_true = float("nan")
+                    true_dof_val = float("nan")
+                    stop_pval = float("inf")
+
+                    if best_info is not None:
+                        pval_perm = (
+                            (r2_perm_max >= best_info["tensor"]).sum().add_(1).float() / (r2_perm_max.numel() + 1)
+                        ).item()
+                        if beta_approx:
+                            r2_perm_np = r2_perm_max.detach().cpu().numpy()
+                            pval_beta, a_hat, b_hat, true_dof_val, p_true = beta_approx_pval(
+                                r2_perm_np, float(best_info["tensor"].item()), dof_init=best_info["dof"],
+                            )
+                        else:
+                            pval_beta = a_hat = b_hat = true_dof_val = p_true = np.nan
+                        stop_pval = float(pval_beta)
+                        if not np.isfinite(stop_pval):
+                            stop_pval = pval_perm
+
+                    if best_info is not None and stage_cap < nperm and stop_pval <= signif_threshold * 2:
+                        remaining = nperm - r2_perm_max.numel()
+                        if remaining > 0:
+                            updated_vectors: list[torch.Tensor] = []
+                            for info in per_pheno:
+                                _, _, _, _, extra_perm = compute_perm_r2_max(
+                                    y_resid=y_resid_list[ids_list.index(info["pid"])],
+                                    G_resid=I_t,
+                                    H_resid=H_cov,
+                                    k_eff=k_eff,
+                                    perm_stream=info["stream"],
+                                    max_permutations=remaining,
+                                    return_nominal=False,
+                                    mixed_precision=mixed_precision,
+                                )
+                                if extra_perm.numel():
+                                    info["r2_perm"] = torch.cat([info["r2_perm"], extra_perm])
+                                updated_vectors.append(info["r2_perm"])
+                            if updated_vectors:
+                                r2_perm_max = torch.stack(updated_vectors, dim=0).amax(dim=0)
+                                pval_perm = (
+                                    (r2_perm_max >= best_info["tensor"]).sum().add_(1).float() / (r2_perm_max.numel() + 1)
+                                ).item()
+                                if beta_approx:
+                                    r2_perm_np = r2_perm_max.detach().cpu().numpy()
+                                    pval_beta, a_hat, b_hat, true_dof_val, p_true = beta_approx_pval(
+                                        r2_perm_np, float(best_info["tensor"].item()), dof_init=best_info["dof"],
+                                    )
+                                else:
+                                    pval_beta = a_hat = b_hat = true_dof_val = p_true = np.nan
+                                stop_pval = float(pval_beta)
+                                if not np.isfinite(stop_pval):
+                                    stop_pval = pval_perm
+
+                    if best_info is None:
+                        return {
+                            "best_ix_var": -1,
+                            "best_pheno_idx": -1,
+                            "stop_pval": float("inf"),
+                        }
+
+                    best_pid = per_pheno[best_idx]["pid"]
+                    best_ix = per_pheno[best_idx]["ix"]
+                    best_beta = per_pheno[best_idx]["beta"]
+                    best_se = per_pheno[best_idx]["se"]
+                    best_t = per_pheno[best_idx]["tval"]
+                    best_dof = per_pheno[best_idx]["dof"]
+                    best_r2 = float(per_pheno[best_idx]["tensor"].item())
+                    pval_nominal = float(get_t_pval(best_t, best_dof))
+
+                    true_dof_out = int(true_dof_val) if np.isfinite(true_dof_val) else int(best_dof)
+
+                    return {
+                        "best_ix_var": int(best_ix),
+                        "best_pheno_idx": int(best_idx),
+                        "best_pid": best_pid,
+                        "beta": best_beta,
+                        "se": best_se,
+                        "tval": best_t,
+                        "r2_nom": best_r2,
+                        "pval_nominal": pval_nominal,
+                        "pval_perm": float(pval_perm),
+                        "pval_beta": float(pval_beta),
+                        "a_hat": float(a_hat),
+                        "b_hat": float(b_hat),
+                        "p_true": float(p_true),
+                        "true_dof": true_dof_out,
+                        "stop_pval": float(stop_pval),
+                        "num_var": num_var,
+                        "dof": best_dof,
+                    }
 
                 per_pheno: list[dict[str, object]] = []
                 r2_perm_tensors: list[torch.Tensor] = []
@@ -880,6 +1531,13 @@ def _run_independent_core_group(
                     "ma_samples": ma_samples,
                     "ma_count": ma_count,
                 })
+                if interaction_mode and interaction_columns:
+                    for anc_idx in range(len(interaction_columns) // 4):
+                        base = anc_idx * 4
+                        forward_records[-1][interaction_columns[base + 0]] = eval_res["slope_gxh"][anc_idx]
+                        forward_records[-1][interaction_columns[base + 1]] = eval_res["slope_se_gxh"][anc_idx]
+                        forward_records[-1][interaction_columns[base + 2]] = eval_res["tstat_gxh"][anc_idx]
+                        forward_records[-1][interaction_columns[base + 3]] = eval_res["pval_gxh"][anc_idx]
 
                 if var_id in var_in_frame and var_id in geno_has_variant and var_id not in dosage_proj:
                     ensure_projected(var_id)
@@ -938,6 +1596,13 @@ def _run_independent_core_group(
                             "ma_count": ma_count,
                             "rank": int(rk),
                         })
+                        if interaction_mode and interaction_columns:
+                            for anc_idx in range(len(interaction_columns) // 4):
+                                base = anc_idx * 4
+                                kept_records[-1][interaction_columns[base + 0]] = eval_res["slope_gxh"][anc_idx]
+                                kept_records[-1][interaction_columns[base + 1]] = eval_res["slope_se_gxh"][anc_idx]
+                                kept_records[-1][interaction_columns[base + 2]] = eval_res["tstat_gxh"][anc_idx]
+                                kept_records[-1][interaction_columns[base + 3]] = eval_res["pval_gxh"][anc_idx]
 
                 if not kept_records:
                     continue
@@ -978,6 +1643,8 @@ def map_independent(
         verbose: bool = True, preload_haplotypes: bool = True,
         tensorqtl_flavor: bool = False, perm_indices_mode: str = "generator",
         mixed_precision: str | None = None, nperm_stage1: int | None = 2000,
+        ancestry_model: str = "main",
+        interaction_covariate: Optional[object] = None,
 ) -> pd.DataFrame:
     """Entry point: build IG; derive seed/threshold from cis_df; dispatch to grouped/ungrouped core.
 
@@ -1025,6 +1692,10 @@ def map_independent(
         logger.write(
             f"  * including local ancestry channels (K={K}, preload={'on' if preload_flag else 'off'})"
         )
+    if ancestry_model == "interaction":
+        logger.write("  * ancestry model: interaction (GxH)")
+    if interaction_covariate is not None:
+        logger.write("  * covariate interaction: GxC")
 
     # Build the appropriate input generator (no residualization up front)
     ig = (
@@ -1045,6 +1716,21 @@ def map_independent(
 
     if nperm is None or nperm <= 0:
         raise ValueError("nperm must be a positive integer for map_independent.")
+    if ancestry_model == "interaction" and haplotypes is None:
+        raise ValueError("ancestry_model='interaction' requires haplotypes.")
+    if ancestry_model == "interaction" and interaction_covariate is not None:
+        raise ValueError("interaction_covariate cannot be combined with ancestry_model='interaction'.")
+
+    covariates_use = covariates_df
+    if isinstance(interaction_covariate, str) and covariates_df is not None:
+        if interaction_covariate in covariates_df.columns:
+            covariates_use = covariates_df.drop(columns=[interaction_covariate])
+    interaction_vec = prepare_interaction_covariate(
+        interaction_covariate, covariates_df, phenotype_df.columns
+    )
+    interaction_cov_t = None
+    if interaction_vec is not None:
+        interaction_cov_t = torch.as_tensor(interaction_vec, dtype=torch.float32, device=device)
 
     if group_s is None:
         if "phenotype_id" not in signif_df.columns:
@@ -1055,9 +1741,10 @@ def map_independent(
         total_items = int(valid_ids.shape[0])
         item_label = "phenotypes"
 
+        n_anc = int(haplotypes.shape[2]) if haplotypes is not None else None
         def run_core(chrom: str | None, chrom_total: int | None) -> pd.DataFrame:
             return _run_independent_core(
-                ig=ig, variant_df=variant_df, covariates_df=covariates_df,
+                ig=ig, variant_df=variant_df, covariates_df=covariates_use,
                 signif_seed_df=signif_seed_df, signif_threshold=signif_threshold,
                 nperm=nperm, device=device, maf_threshold=maf_threshold,
                 random_tiebreak=random_tiebreak, missing=missing,
@@ -1068,6 +1755,9 @@ def map_independent(
                 perm_indices_mode=perm_indices_mode,
                 mixed_precision=mixed_precision,
                 nperm_stage1=nperm_stage1,
+                ancestry_model=ancestry_model,
+                n_ancestries=n_anc,
+                interaction_covariate_t=interaction_cov_t,
             )
     else:
         if "group_id" not in signif_df.columns:
@@ -1086,9 +1776,10 @@ def map_independent(
         phenotype_counts = group_counts
         item_label = "phenotype groups"
 
+        n_anc = int(haplotypes.shape[2]) if haplotypes is not None else None
         def run_core(chrom: str | None, chrom_total: int | None) -> pd.DataFrame:
             return _run_independent_core_group(
-                ig=ig, variant_df=variant_df, covariates_df=covariates_df,
+                ig=ig, variant_df=variant_df, covariates_df=covariates_use,
                 seed_by_group_df=seed_by_group_df, signif_threshold=signif_threshold,
                 nperm=nperm, device=device, maf_threshold=maf_threshold,
                 random_tiebreak=random_tiebreak, missing=missing,
@@ -1099,6 +1790,9 @@ def map_independent(
                 perm_indices_mode=perm_indices_mode,
                 mixed_precision=mixed_precision,
                 nperm_stage1=nperm_stage1,
+                ancestry_model=ancestry_model,
+                n_ancestries=n_anc,
+                interaction_covariate_t=interaction_cov_t,
             )
 
     if logger.verbose:

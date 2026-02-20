@@ -6,7 +6,7 @@ import pyarrow as pa
 from typing import Optional
 
 from ..utils import SimpleLogger
-from ..stats import nominal_pvals_tensorqtl
+from ..stats import nominal_pvals_tensorqtl, get_t_pval
 from ..iosinks import AsyncParquetSink
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from ..preproc import impute_mean_and_filter, allele_stats, filter_by_maf
@@ -14,7 +14,12 @@ from ..regression_kernels import (
     run_batch_regression,
     run_batch_regression_with_permutations
 )
-from .common import residualize_matrix_with_covariates, residualize_batch
+from .common import (
+    residualize_matrix_with_covariates,
+    residualize_batch,
+    residualize_batch_interaction,
+    prepare_interaction_covariate,
+)
 
 __all__ = [
     "map_nominal",
@@ -22,7 +27,23 @@ __all__ = [
 
 DEFAULT_ROW_GROUP_SIZE = 10_000_000
 
-def _nominal_parquet_schema(include_perm: bool) -> pa.Schema:
+def _interaction_columns(n_ancestries: int) -> list[str]:
+    cols: list[str] = []
+    for anc in range(n_ancestries):
+        suffix = f"anc{anc}"
+        cols.extend([
+            f"slope_gxh_{suffix}",
+            f"slope_se_gxh_{suffix}",
+            f"tstat_gxh_{suffix}",
+            f"pval_gxh_{suffix}",
+        ])
+    return cols
+
+def _nominal_parquet_schema(
+        include_perm: bool,
+        ancestry_model: str | None = None,
+        n_ancestries: int | None = None,
+) -> pa.Schema:
     fields = [
         pa.field("phenotype_id", pa.string()),
         pa.field("variant_id", pa.string()),
@@ -36,6 +57,9 @@ def _nominal_parquet_schema(include_perm: bool) -> pa.Schema:
         pa.field("ma_samples", pa.int32()),
         pa.field("ma_count", pa.int32()),
     ]
+    if ancestry_model == "interaction" and n_ancestries is not None and n_ancestries > 0:
+        for col in _interaction_columns(int(n_ancestries)):
+            fields.append(pa.field(col, pa.float32()))
     if include_perm:
         fields.append(pa.field("perm_max_r2", pa.float32()))
     return pa.schema(fields)
@@ -66,7 +90,12 @@ def _count_cis_pairs(ig, chrom: str | None = None) -> int:
     return int(total)
 
 
-def _allocate_buffers(expected_columns, include_perm: bool, target_rows: int) -> dict[str, np.ndarray]:
+def _allocate_buffers(
+        expected_columns,
+        include_perm: bool,
+        target_rows: int,
+        interaction_columns: Optional[list[str]] = None,
+) -> dict[str, np.ndarray]:
     target = max(int(target_rows), 0)
     buffers: dict[str, np.ndarray] = {
         "phenotype_id":   np.empty(target, dtype=object),
@@ -81,6 +110,9 @@ def _allocate_buffers(expected_columns, include_perm: bool, target_rows: int) ->
         "ma_samples":     np.empty(target, dtype=np.int32),
         "ma_count":       np.empty(target, dtype=np.int32),
     }
+    if interaction_columns:
+        for col in interaction_columns:
+            buffers[col] = np.empty(target, dtype=np.float32)
     if include_perm:
         buffers["perm_max_r2"] = np.empty(target, dtype=np.float32)
     return buffers
@@ -101,7 +133,10 @@ def _buffers_to_arrow(buffers: dict[str, np.ndarray], schema: pa.Schema, n_rows:
 def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float = 0.0,
                       chrom: str | None = None, sink: "ParquetSink | None" = None,
                       target_rows: int | None = None, logger: SimpleLogger | None = None,
-                      total_phenotypes: int | None = None):
+                      total_phenotypes: int | None = None,
+                      ancestry_model: str | None = None,
+                      n_ancestries: int | None = None,
+                      interaction_covariate_t: torch.Tensor | None = None):
     """
     Shared inner loop for nominal (and optional permutation) mapping.
     Handles both InputGeneratorCis (no haps) and InputGeneratorCisWithHaps (haps).
@@ -117,6 +152,10 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
         "end_distance", "slope", "slope_se", "tstat", "pval_nominal",
         "af", "ma_samples", "ma_count",
     ]
+    interaction_columns: list[str] = []
+    if ancestry_model == "interaction" and n_ancestries is not None and n_ancestries > 0:
+        interaction_columns = _interaction_columns(int(n_ancestries))
+        expected_columns.extend(interaction_columns)
     if include_perm:
         expected_columns.append("perm_max_r2")
 
@@ -126,7 +165,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
         else:
             target_rows = _count_cis_pairs(ig, chrom)
 
-    buffers = _allocate_buffers(expected_columns, include_perm, target_rows)
+    buffers = _allocate_buffers(expected_columns, include_perm, target_rows, interaction_columns)
     cursor = processed = 0
     variant_cache: dict[bytes, tuple[np.ndarray, np.ndarray]] = {}
 
@@ -138,6 +177,8 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
 
     progress_interval = max(1, total_phenotypes // 10) if total_phenotypes else 0
     chrom_label = f"{chrom}" if chrom is not None else "all chromosomes"
+    if include_perm and ancestry_model == "interaction":
+        logger.write("  [warning] interaction mode with nperm>0: perm_max_r2 not computed")
     for batch in ig.generate_data(chrom=chrom):
         if not group_mode: # Ungrouped
             if len(batch) == 4:
@@ -211,10 +252,18 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
         af_t, ma_samples_t, ma_count_t = allele_stats(G_t, ploidy=2)
  
         # Residualize in one call; returns y as list in group mode
-        y_resid, G_resid, H_resid = residualize_batch(
-            P_list if group_mode else P_list[0], G_t, H_t, rez, center=True,
-            group=group_mode
-        )
+        interaction_mode = ancestry_model == "interaction" and H_t is not None
+        covar_interaction = interaction_covariate_t is not None
+        if interaction_mode:
+            y_resid, G_resid, H_resid, I_resid = residualize_batch_interaction(
+                P_list if group_mode else P_list[0], G_t, H_t, rez, center=True,
+                group=group_mode
+            )
+        else:
+            y_resid, G_resid, H_resid = residualize_batch(
+                P_list if group_mode else P_list[0], G_t, H_t, rez, center=True,
+                group=group_mode
+            )
         y_iter = list(zip(y_resid, id_list)) if group_mode else [(y_resid, id_list[0])]
 
         # Variant metadata
@@ -229,35 +278,101 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
 
         # Per-phenotype regressions in this window
         for y_t, pid in y_iter:
-            if include_perm:
-                perms = [torch.randperm(y_t.shape[0], device=device) for _ in range(nperm)]
-                y_perm = torch.stack([y_t[idxp] for idxp in perms], dim=1) # (n x nperm)
-                betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
-                    y=y_t, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
-                )
-                pvals_t, _dof = nominal_pvals_tensorqtl(
-                    y_t=y_t, G_resid=G_resid, H_resid=H_resid, k_eff=k_eff, tstats=tstats
-                )
-                perm_max_r2 = r2_perm.max().item()
+            gxh_slope = gxh_se = gxh_t = gxh_p = None
+            if interaction_mode:
+                pH = int(H_resid.shape[2])
+                n_anc = int(n_ancestries) if n_ancestries is not None else pH
+                H_cov = torch.cat([G_resid.unsqueeze(-1), H_resid], dim=2)
+                n = int(y_t.shape[0])
+                p_pred = 1 + int(H_cov.shape[2])
+                dof = max(n - int(k_eff) - p_pred, 1)
+
+                gxh_slope = np.full((G_resid.shape[0], n_anc), np.nan, dtype=np.float32)
+                gxh_se = np.full_like(gxh_slope, np.nan)
+                gxh_t = np.full_like(gxh_slope, np.nan)
+                gxh_p = np.full_like(gxh_slope, np.nan)
+
+                for k in range(pH):
+                    betas_k, ses_k, tstats_k = run_batch_regression(
+                        y=y_t, G=I_resid[:, :, k], H=H_cov, k_eff=k_eff, device=device
+                    )
+                    gxh_slope[:, k] = betas_k[:, 0].detach().cpu().numpy()
+                    gxh_se[:, k] = ses_k[:, 0].detach().cpu().numpy()
+                    gxh_t[:, k] = tstats_k[:, 0].detach().cpu().numpy()
+                    gxh_p[:, k] = get_t_pval(gxh_t[:, k], dof)
+
+                best_k = np.nanargmax(np.abs(gxh_t[:, :pH]), axis=1)
+                row_ix = np.arange(gxh_t.shape[0])
+                slope = gxh_slope[row_ix, best_k]
+                slope_se = gxh_se[row_ix, best_k]
+                tstat = gxh_t[row_ix, best_k]
+                pvals = gxh_p[row_ix, best_k]
+                perm_max_r2 = np.nan if include_perm else None
+            elif covar_interaction:
+                c_t = interaction_covariate_t
+                if c_t.device != G_resid.device:
+                    c_t = c_t.to(G_resid.device)
+                I_t = G_resid * c_t  # (m, n)
+                c_rep = c_t.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
+                if H_resid is None:
+                    H_cov = torch.cat([G_resid.unsqueeze(-1), c_rep], dim=2)
+                else:
+                    H_cov = torch.cat([G_resid.unsqueeze(-1), H_resid, c_rep], dim=2)
+                n = int(y_t.shape[0])
+                p_pred = 1 + int(H_cov.shape[2])
+                dof = max(n - int(k_eff) - p_pred, 1)
+                if include_perm:
+                    perms = [torch.randperm(y_t.shape[0], device=device) for _ in range(nperm)]
+                    y_perm = torch.stack([y_t[idxp] for idxp in perms], dim=1) # (n x nperm)
+                    betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
+                        y=y_t, G=I_t, H=H_cov, y_perm=y_perm, k_eff=k_eff, device=device
+                    )
+                    perm_max_r2 = r2_perm.max().item()
+                else:
+                    betas, ses, tstats = run_batch_regression(
+                        y=y_t, G=I_t, H=H_cov, k_eff=k_eff, device=device
+                    )
+                    r2_perm = perm_max_r2 = None
+                slope = betas[:, 0].detach().cpu().numpy()
+                slope_se = ses[:, 0].detach().cpu().numpy()
+                tstat = tstats[:, 0].detach().cpu().numpy()
+                pvals = get_t_pval(tstat, dof)
             else:
-                betas, ses, tstats = run_batch_regression(
-                    y=y_t, G=G_resid, H=H_resid, k_eff=k_eff, device=device
-                )
-                pvals_t, _dof = nominal_pvals_tensorqtl(
-                    y_t=y_t, G_resid=G_resid, H_resid=H_resid, k_eff=k_eff, tstats=tstats
-                )
-                r2_perm = perm_max_r2 = None
+                if include_perm:
+                    perms = [torch.randperm(y_t.shape[0], device=device) for _ in range(nperm)]
+                    y_perm = torch.stack([y_t[idxp] for idxp in perms], dim=1) # (n x nperm)
+                    betas, ses, tstats, r2_perm = run_batch_regression_with_permutations(
+                        y=y_t, G=G_resid, H=H_resid, y_perm=y_perm, k_eff=k_eff, device=device
+                    )
+                    pvals_t, _dof = nominal_pvals_tensorqtl(
+                        y_t=y_t, G_resid=G_resid, H_resid=H_resid, k_eff=k_eff, tstats=tstats
+                    )
+                    perm_max_r2 = r2_perm.max().item()
+                else:
+                    betas, ses, tstats = run_batch_regression(
+                        y=y_t, G=G_resid, H=H_resid, k_eff=k_eff, device=device
+                    )
+                    pvals_t, _dof = nominal_pvals_tensorqtl(
+                        y_t=y_t, G_resid=G_resid, H_resid=H_resid, k_eff=k_eff, tstats=tstats
+                    )
+                    r2_perm = perm_max_r2 = None
 
             # Distances to phenotype start/end
             n_variants = var_ids.shape[0]
 
             # Pack and one GPU -> CPU transfer
-            floats_t = torch.stack([betas[:,0], ses[:,0], tstats[:,0],
-                                    pvals_t, af_t], dim=1).to(torch.float32)
-            ints_t   = torch.stack([ma_samples_t, ma_count_t], dim=1).to(torch.int32)
+            if interaction_mode or covar_interaction:
+                floats = np.stack([slope, slope_se, tstat, pvals,
+                                   af_t.detach().cpu().numpy()], axis=1).astype(np.float32)
+                ints = np.stack([ma_samples_t.detach().cpu().numpy(),
+                                 ma_count_t.detach().cpu().numpy()], axis=1).astype(np.int32)
+            else:
+                floats_t = torch.stack([betas[:,0], ses[:,0], tstats[:,0],
+                                        pvals_t, af_t], dim=1).to(torch.float32)
+                ints_t   = torch.stack([ma_samples_t, ma_count_t], dim=1).to(torch.int32)
 
-            floats = floats_t.detach().to("cpu", non_blocking=True).numpy()
-            ints   = ints_t.detach().to("cpu", non_blocking=True).numpy()
+                floats = floats_t.detach().to("cpu", non_blocking=True).numpy()
+                ints   = ints_t.detach().to("cpu", non_blocking=True).numpy()
 
             row_slice = slice(cursor, cursor + n_variants)
 
@@ -278,6 +393,13 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
             buffers["af"][row_slice] = af_np
             buffers["ma_samples"][row_slice] = ma_samples_np
             buffers["ma_count"][row_slice] = ma_count_np
+            if interaction_mode and interaction_columns:
+                for anc_idx in range(len(interaction_columns) // 4):
+                    base = anc_idx * 4
+                    buffers[interaction_columns[base + 0]][row_slice] = gxh_slope[:, anc_idx]
+                    buffers[interaction_columns[base + 1]][row_slice] = gxh_se[:, anc_idx]
+                    buffers[interaction_columns[base + 2]][row_slice] = gxh_t[:, anc_idx]
+                    buffers[interaction_columns[base + 3]][row_slice] = gxh_p[:, anc_idx]
 
             if include_perm:
                 fill_value = np.nan if perm_max_r2 is None else perm_max_r2
@@ -295,7 +417,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 )
 
     if sink is not None:
-        schema = _nominal_parquet_schema(include_perm)
+        schema = _nominal_parquet_schema(include_perm, ancestry_model, n_ancestries)
         table = _buffers_to_arrow(buffers, schema, cursor)
         sink.write(table)
         return None
@@ -317,6 +439,8 @@ def map_nominal(
         compression: str = "snappy", return_df: bool = False,
         logger: SimpleLogger | None = None, verbose: bool = True,
         preload_haplotypes: bool = True, tensorqtl_flavor: bool = False,
+        ancestry_model: str = "main",
+        interaction_covariate: Optional[object] = None,
     ) -> pd.DataFrame:
     """
     Nominal cis-QTL scan with optional permutations and local ancestry.
@@ -349,6 +473,10 @@ def map_nominal(
     if haplotypes is not None:
         K = int(haplotypes.shape[2])
         logger.write(f"  * including local ancestry channels (K={K})")
+    if ancestry_model == "interaction":
+        logger.write("  * ancestry model: interaction (GxH)")
+    if interaction_covariate is not None:
+        logger.write("  * covariate interaction: GxC")
     if nperm is not None:
         logger.write(f"  * computing tensorQTL-style nominal p-values and {nperm:,} permutations")
 
@@ -369,7 +497,7 @@ def map_nominal(
     # Residualize once using the filtered phenotypes from the generator
     Y = torch.tensor(ig.phenotype_df.values, dtype=torch.float32, device=device)
     with logger.time_block(" Residualizing phenotypes", sync=sync):
-        Y_resid, rez = residualize_matrix_with_covariates(Y, covariates_df,
+        Y_resid, rez = residualize_matrix_with_covariates(Y, covariates_use,
                                                           device, tensorqtl_flavor)
 
     ig.phenotype_df = pd.DataFrame(
@@ -380,10 +508,27 @@ def map_nominal(
     phenotype_counts = ig.phenotype_pos_df['chr'].value_counts().to_dict()
 
     # Per-chromosome parquet streaming
+    if ancestry_model == "interaction" and haplotypes is None:
+        raise ValueError("ancestry_model='interaction' requires haplotypes.")
+    if ancestry_model == "interaction" and interaction_covariate is not None:
+        raise ValueError("interaction_covariate cannot be combined with ancestry_model='interaction'.")
+
+    covariates_use = covariates_df
+    if isinstance(interaction_covariate, str) and covariates_df is not None:
+        if interaction_covariate in covariates_df.columns:
+            covariates_use = covariates_df.drop(columns=[interaction_covariate])
+    interaction_vec = prepare_interaction_covariate(
+        interaction_covariate, covariates_df, phenotype_df.columns
+    )
+    interaction_cov_t = None
+    if interaction_vec is not None:
+        interaction_cov_t = torch.as_tensor(interaction_vec, dtype=torch.float32, device=device)
+
     if out_dir is not None:
         os.makedirs(out_dir, exist_ok=True)
         include_perm = nperm is not None and nperm > 0
-        schema = _nominal_parquet_schema(include_perm)
+        n_anc = int(haplotypes.shape[2]) if haplotypes is not None else None
+        schema = _nominal_parquet_schema(include_perm, ancestry_model, n_anc)
         with logger.time_block("Nominal scan (per-chrom streaming)", sync=sync, sec=False):
             for chrom in ig.chrs:
                 out_path = os.path.join(out_dir, f"{out_prefix}.{chrom}.parquet")
@@ -404,6 +549,9 @@ def map_nominal(
                             maf_threshold=maf_threshold, chrom=chrom, sink=sink,
                             target_rows=target_rows, logger=logger,
                             total_phenotypes=chrom_total,
+                            ancestry_model=ancestry_model,
+                            n_ancestries=n_anc,
+                            interaction_covariate_t=interaction_cov_t,
                         )
                         # logger.write(f"{chrom}: ~{sink.rows:,} rows written")
                 if logger.verbose:
@@ -419,7 +567,10 @@ def map_nominal(
         results = _run_nominal_core(ig, variant_df, rez, nperm, device,
                                     maf_threshold=maf_threshold,
                                     chrom=None, sink=None, logger=logger,
-                                    total_phenotypes=total_phenotypes)
+                                    total_phenotypes=total_phenotypes,
+                                    ancestry_model=ancestry_model,
+                                    n_ancestries=int(haplotypes.shape[2]) if haplotypes is not None else None,
+                                    interaction_covariate_t=interaction_cov_t)
     if logger.verbose:
         elapsed = time.time() - overall_start
         logger.write(f"    Completed nominal scan in {elapsed / 60:.2f} min")
