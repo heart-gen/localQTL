@@ -68,7 +68,9 @@ class CisMapper:
     # Delegating methods
     # ----------------------------
     def map_nominal(self, nperm: Optional[int] = None,
-                    maf_threshold: Optional[float] = None) -> pd.DataFrame:
+                    maf_threshold: Optional[float] = None,
+                    ancestry_model: str = "main",
+                    interaction_covariate: Optional[object] = None) -> pd.DataFrame:
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
         return _map_nominal(
             genotype_df=self.genotype_df,
@@ -90,12 +92,16 @@ class CisMapper:
             logger=self.logger,
             tensorqtl_flavor=self.tensorqtl_flavor,
             verbose=getattr(self.logger, "verbose", True),
+            ancestry_model=ancestry_model,
+            interaction_covariate=interaction_covariate,
         )
 
     def map_permutations(
             self, nperm: int = 10_000, beta_approx: bool = True,
             perm_chunk: int = 4096, maf_threshold: Optional[float] = None,
-            seed: Optional[int] = None
+            seed: Optional[int] = None,
+            ancestry_model: str = "main",
+            interaction_covariate: Optional[object] = None
     ) -> pd.DataFrame:
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
         return _map_permutations(
@@ -117,6 +123,8 @@ class CisMapper:
             logger=self.logger,
             tensorqtl_flavor=self.tensorqtl_flavor,
             verbose=getattr(self.logger, "verbose", True),
+            ancestry_model=ancestry_model,
+            interaction_covariate=interaction_covariate,
         )
 
     def map_independent(
@@ -125,6 +133,8 @@ class CisMapper:
             random_tiebreak: bool = False, missing_val: float = -9.0,
             beta_approx: bool = True, seed: Optional[int] = None,
             maf_threshold: Optional[float] = None,
+            ancestry_model: str = "main",
+            interaction_covariate: Optional[object] = None,
     ) -> pd.DataFrame:
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
         return _map_independent(
@@ -151,6 +161,8 @@ class CisMapper:
             logger=self.logger,
             tensorqtl_flavor=self.tensorqtl_flavor,
             verbose=getattr(self.logger, "verbose", True),
+            ancestry_model=ancestry_model,
+            interaction_covariate=interaction_covariate,
         )
 
     def calculate_qvalues(
