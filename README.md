@@ -21,6 +21,9 @@ workflows, while adding ancestry-aware use cases.
 - **Parquet streaming sinks** that make it easy to materialise association statistics
   without loading the entire result set in memory.
 - **Pure-Python statistics (no R/rpy2 required)**: tensorQTL's `rfunc` calls have been refactored to scipy.stats for p-values and q-values are computed with the Python port of Storey's `qvalue` (`py-qvalue`).
+- **Fine-mapping and colocalization helpers** via `localqtl.susie`,
+  `localqtl.coloc`, and cis post-processing utilities that annotate nominal or
+  permutation outputs with credible sets and COLOC posterior support.
 
 ## Installation
 
@@ -85,6 +88,36 @@ results = map_nominal(
 
 print(results.head())
 ```
+
+### Covariate interaction scans
+
+`map_nominal`, `map_permutations`, `map_independent`, and `CisMapper` also
+support sample-level genotype-by-covariate interaction models through the
+`interaction_covariate` argument. Pass either a covariate-column name, a
+`pandas.Series` indexed by sample ID, or a 1D array aligned to the sample
+order.
+
+```python
+from localqtl.cis import map_nominal
+
+results = map_nominal(
+    genotype_df=genotype_df,
+    variant_df=variant_df,
+    phenotype_df=phenotype_df,
+    phenotype_pos_df=phenotype_pos_df,
+    covariates_df=covariates_df,
+    interaction_covariate="age",
+    device="auto",
+    out_dir=None,
+)
+
+print(results[["variant_id", "pval_nominal", "pval_g", "pval_i", "pval_gi"]].head())
+```
+
+This emits the standard nominal columns plus canonical joint-model statistics
+for `y ~ g + i + g:i`: `b_g`, `b_i`, `b_gi`, their standard errors, t-stats,
+and p-values. `interaction_covariate` cannot be combined with
+`ancestry_model="interaction"`.
 
 For analyses that combine nominal scans, permutations, and independent signal
 calling, the `CisMapper` class offers a thin object-oriented façade:
@@ -173,6 +206,48 @@ perm_df = mapper.calculate_qvalues(perm_df, fdr=0.05)
 lead_df = mapper.map_independent(cis_df=perm_df, fdr=0.05)
 
 print(lead_df.head())
+```
+
+### Fine-mapping and colocalization
+
+The branch also adds SuSiE fine-mapping and COLOC colocalization helpers for
+downstream interpretation of cis hits:
+
+```python
+from localqtl import coloc, susie
+
+susie_summary = susie.map(
+    genotype_df=genotype_df,
+    variant_df=variant_df,
+    phenotype_df=phenotype_df,
+    phenotype_pos_df=phenotype_pos_df,
+    covariates_df=covariates_df,
+    device="auto",
+)
+
+coloc_df = coloc.run_pairs(
+    genotype_df=genotype_df,
+    variant_df=variant_df,
+    phenotype1_df=phenotype_df,
+    phenotype2_df=external_trait_df,
+    phenotype_pos_df=phenotype_pos_df,
+    covariates1_df=covariates_df,
+    device="auto",
+)
+```
+
+`susie.map()` returns a summary table of credible-set membership with per-variant
+PIPs. `coloc.run_pairs()` returns one row per phenotype with posterior support
+for hypotheses `H0` through `H4`, including shared-signal support in
+`pp_h4_abf`.
+
+To annotate downstream cis outputs:
+
+```python
+from localqtl.cis.postproc import annotate_with_coloc, annotate_with_susie
+
+nominal_annotated = annotate_with_susie(results, susie_summary)
+perm_annotated = annotate_with_coloc(perm_df, coloc_df)
 ```
 
 **Input expectations**

@@ -18,10 +18,11 @@ from .utils import SimpleLogger
 __all__ = [
     "beta_approx_pval",
     "get_t_pval",
+    "test_beta_difference",
     "t_two_sided_pval_torch",
     "nominal_pvals_tensorqtl",
     "calculate_qvalues",
-    "pval_from_corr_r2"
+    "pval_from_corr_r2",
 ]
 
 def get_t_pval(t, df, two_tailed: bool = True, log10: bool = False):
@@ -39,6 +40,46 @@ def get_t_pval(t, df, two_tailed: bool = True, log10: bool = False):
     if log10:
         return -log_p / np.log(10.0)
     return np.minimum(np.exp(log_p), 1.0)
+
+
+def test_beta_difference(
+    beta1: np.ndarray,
+    se1: np.ndarray,
+    beta2: np.ndarray,
+    se2: np.ndarray,
+    correlation: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Wald test for H0: beta1 = beta2.
+
+    Parameters
+    ----------
+    beta1, beta2 : array-like
+        Effect size estimates from two conditions (e.g. ancestry-specific betas).
+    se1, se2 : array-like
+        Standard errors of the effect size estimates.
+    correlation : float
+        Estimated correlation between the two beta estimates (default 0, which
+        is conservative when the estimates come from non-overlapping samples or
+        orthogonal ancestry channels).
+
+    Returns
+    -------
+    z : np.ndarray
+        Z-statistics for the difference.
+    pval : np.ndarray
+        Two-sided p-values.
+    """
+    beta1 = np.asarray(beta1, dtype=np.float64)
+    beta2 = np.asarray(beta2, dtype=np.float64)
+    se1 = np.asarray(se1, dtype=np.float64)
+    se2 = np.asarray(se2, dtype=np.float64)
+
+    var_diff = se1 ** 2 + se2 ** 2 - 2 * correlation * se1 * se2
+    var_diff = np.maximum(var_diff, 1e-30)
+    z = (beta1 - beta2) / np.sqrt(var_diff)
+    pval = 2.0 * stats.norm.sf(np.abs(z))
+    return z, pval
 
 
 def pval_from_corr_r2(r2, dof, two_tailed: bool = True, log10: bool = False):

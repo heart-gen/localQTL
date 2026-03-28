@@ -12,6 +12,7 @@ if _IS_RTD:
     os.environ.setdefault("LOCALQTL_NO_GPU", "1")
 
 from . import cis
+from . import coloc
 from . import finemap
 from . import genotypeio
 from . import haplotypeio
@@ -21,6 +22,7 @@ from . import phenotypeio
 from . import preproc
 from . import regression_kernels
 from . import stats
+from . import susie
 from . import utils
 
 from .cis import CisMapper, map_independent, map_nominal, map_permutations
@@ -43,6 +45,7 @@ __all__ = [
     "InputGeneratorCis",
     "InputGeneratorCisWithHaps",
     "cis",
+    "coloc",
     "finemap",
     "phenotypeio",
     "genotypeio",
@@ -52,5 +55,6 @@ __all__ = [
     "preproc",
     "regression_kernels",
     "stats",
+    "susie",
     "utils",
 ]

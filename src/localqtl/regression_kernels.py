@@ -12,6 +12,7 @@ except Exception:
 __all__ = [
     "Residualizer",
     "run_batch_regression",
+    "run_batch_interaction_regression",
     "run_batch_regression_with_permutations",
     "perm_chunk_r2", "prep_ctx_for_perm",
 ]
@@ -205,24 +206,124 @@ def run_batch_regression(y, G, H=None, k_eff: int = 0, device="cuda"):
     XtX = torch.matmul(X.transpose(1, 2), X)      # (m × p × p)
     Xty = torch.matmul(X.transpose(1, 2), y_exp)  # (m × p × 1)
 
+    # Regularize near-singular batches (Tikhonov / ridge with tiny lambda)
+    diag_scale = torch.diagonal(XtX, dim1=1, dim2=2).abs().mean(dim=1, keepdim=True)  # (m, 1)
+    eps = 1e-6 * diag_scale.unsqueeze(-1)  # (m, 1, 1)
+    I_p = torch.eye(p, device=device, dtype=XtX.dtype).unsqueeze(0)
+    XtX_reg = XtX + eps * I_p
+
     # Solve for betas
-    betas = torch.linalg.solve(XtX, Xty).squeeze(-1)  # (m × p)
+    betas = torch.linalg.solve(XtX_reg, Xty).squeeze(-1)  # (m × p)
 
     # Residuals and variance estimate
     y_hat = torch.matmul(X, betas.unsqueeze(-1))      # (m × n × 1)
     resid = y_exp - y_hat                             # (m × n × 1)
-    dof = n - int(k_eff) - p
+    dof = max(n - int(k_eff) - p, 1)
     sigma2 = (resid.transpose(1,2) @ resid).squeeze() / dof  # (m,)
 
     # Standard errors: sqrt(diag(XtX^-1) * sigma2)
-    XtX_inv = torch.linalg.inv(XtX)                   # (m × p × p)
+    XtX_inv = torch.linalg.inv(XtX_reg)               # (m × p × p)
     var_betas = XtX_inv * sigma2.view(-1,1,1)         # broadcast sigma2
-    ses = torch.sqrt(torch.diagonal(var_betas, dim1=1, dim2=2))  # (m × p)
+    ses = torch.sqrt(torch.clamp(torch.diagonal(var_betas, dim1=1, dim2=2), min=1e-30))  # (m × p)
 
     # T-statistics
     tstats = betas / ses
 
     return betas, ses, tstats
+
+
+def run_batch_interaction_regression(
+    y: torch.Tensor,
+    G: torch.Tensor,
+    interaction: torch.Tensor,
+    k_eff: int = 0,
+    device: str = "cuda",
+) -> dict[str, torch.Tensor]:
+    """
+    Batched OLS for y ~ g + i + g:i (interaction model).
+
+    All inputs are assumed to be pre-residualized against covariates and centered.
+
+    Parameters
+    ----------
+    y : torch.Tensor
+        (n,) phenotype vector (samples).
+    G : torch.Tensor
+        (m, n) genotype matrix (variants x samples).
+    interaction : torch.Tensor
+        (n,) or (n, ni) interaction term(s), e.g. ancestry dosage or
+        sample-level covariate.
+    k_eff : int
+        Number of covariate columns already projected out (dof reduction).
+    device : str
+        ``"cuda"`` or ``"cpu"``.
+
+    Returns
+    -------
+    dict
+        Keys ``b_g``, ``se_g``, ``tstat_g`` — genotype main effect (m,);
+        ``b_i``, ``se_i``, ``tstat_i`` — interaction main effect (m,) or (m, ni);
+        ``b_gi``, ``se_gi``, ``tstat_gi`` — genotype x interaction (m,) or (m, ni);
+        ``dof`` — scalar degrees of freedom.
+    """
+    device = resolve_device(device)
+    y = move_to_device(y, device)
+    G = move_to_device(G, device)
+    interaction = move_to_device(interaction, device)
+
+    if interaction.dim() == 1:
+        interaction = interaction.unsqueeze(-1)  # (n, 1)
+
+    m, n = G.shape
+    ni = interaction.shape[1]
+    nb = 1 + 2 * ni  # g, i_1..i_ni, gi_1..gi_ni
+
+    # Build design matrix X: (m, n, 1+2*ni)
+    g_col = G.unsqueeze(-1)                                        # (m, n, 1)
+    i_cols = interaction.unsqueeze(0).expand(m, -1, -1)            # (m, n, ni)
+    gi_cols = G.unsqueeze(-1) * interaction.unsqueeze(0)           # (m, n, ni)
+
+    X = torch.cat([g_col, i_cols, gi_cols], dim=2)                 # (m, n, nb)
+    y_exp = y.unsqueeze(0).expand(m, -1).unsqueeze(-1)             # (m, n, 1)
+
+    # Solve normal equations: (X'X) b = X'y
+    XtX = X.transpose(1, 2) @ X                                   # (m, nb, nb)
+    Xty = X.transpose(1, 2) @ y_exp                               # (m, nb, 1)
+
+    # Gentle regularization for near-singular batches
+    I_reg = 1e-6 * torch.eye(nb, device=device, dtype=XtX.dtype).unsqueeze(0)
+    XtX = XtX + I_reg
+
+    betas = torch.linalg.solve(XtX, Xty).squeeze(-1)              # (m, nb)
+
+    # Residual variance
+    y_hat = (X @ betas.unsqueeze(-1))                              # (m, n, 1)
+    resid = y_exp - y_hat
+    dof = max(n - int(k_eff) - nb, 1)
+    rss = (resid.transpose(1, 2) @ resid).squeeze(-1).squeeze(-1) # (m,)
+    sigma2 = rss / dof
+
+    # Standard errors from diagonal of (X'X)^-1 * sigma2
+    XtX_inv = torch.linalg.inv(XtX)                               # (m, nb, nb)
+    var_diag = torch.diagonal(XtX_inv, dim1=1, dim2=2)            # (m, nb)
+    ses = torch.sqrt(torch.clamp(var_diag * sigma2.unsqueeze(-1), min=1e-30))  # (m, nb)
+
+    tstats = betas / ses                                           # (m, nb)
+
+    # Unpack columns: g=0, i=1..ni, gi=ni+1..2*ni
+    result = {
+        "b_g":      betas[:, 0],
+        "se_g":     ses[:, 0],
+        "tstat_g":  tstats[:, 0],
+        "b_i":      betas[:, 1:1+ni].squeeze(-1),
+        "se_i":     ses[:, 1:1+ni].squeeze(-1),
+        "tstat_i":  tstats[:, 1:1+ni].squeeze(-1),
+        "b_gi":     betas[:, 1+ni:].squeeze(-1),
+        "se_gi":    ses[:, 1+ni:].squeeze(-1),
+        "tstat_gi": tstats[:, 1+ni:].squeeze(-1),
+        "dof":      dof,
+    }
+    return result
 
 
 def _is_cuda(*tensors):
