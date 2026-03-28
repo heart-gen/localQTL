@@ -336,8 +336,12 @@ def susie_get_cs(res, X=None, Xcorr=None, coverage=0.95, min_abs_corr=0.5,
 
     if dedup:
         duplicated = torch.ones(status.shape[0], dtype=torch.bool, device=device)
-        _, ix = status.unique(dim=0, return_inverse=True)
-        duplicated[ix.unique()] = False
+        seen = {}
+        _, inverse_idx = status.unique(dim=0, return_inverse=True)
+        for row_idx, group_idx in enumerate(inverse_idx.tolist()):
+            if group_idx not in seen:
+                seen[group_idx] = row_idx
+                duplicated[row_idx] = False
         include_mask = include_mask & ~duplicated
 
     if not include_mask.any():

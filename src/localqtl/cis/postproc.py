@@ -247,9 +247,18 @@ def annotate_with_susie(
         df['susie_cs'] = None
         return df
 
-    # Build lookup: (phenotype_id, variant_id) -> (pip, cs_id)
-    pip_map = susie_summary.set_index(['phenotype_id', 'variant_id'])['pip']
-    cs_map = susie_summary.set_index(['phenotype_id', 'variant_id'])['cs_id']
+    # Variants can appear in multiple credible sets; collapse them deterministically.
+    summary = susie_summary.copy()
+    summary["cs_id"] = summary["cs_id"].astype(str)
+    summary = (
+        summary.groupby(["phenotype_id", "variant_id"], sort=False, as_index=False)
+        .agg(
+            pip=("pip", "max"),
+            cs_id=("cs_id", lambda values: ",".join(sorted(dict.fromkeys(values)))),
+        )
+    )
+    pip_map = summary.set_index(['phenotype_id', 'variant_id'])['pip']
+    cs_map = summary.set_index(['phenotype_id', 'variant_id'])['cs_id']
 
     key = list(zip(df['phenotype_id'], df['variant_id']))
     df['susie_pip'] = [pip_map.get(k, float('nan')) for k in key]

@@ -136,6 +136,36 @@ The helper trio also mirrors tensorQTL's "tensor-friendly" outputs through the
 ``tensorqtl_flavor`` switch. Setting the flag to ``True`` swaps Parquet streaming
 for tensorQTL-compatible TSV/Parquet naming conventions and column layouts.
 
+Covariate interaction models
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The cis-mapping entry points also support genotype-by-covariate interaction
+tests by passing ``interaction_covariate``. Accepted forms are a covariate
+column name in ``covariates_df``, a :class:`pandas.Series` indexed by sample
+IDs, or a 1D array-like already aligned to the sample order.
+
+.. code-block:: python
+
+   interaction_df = map_nominal(
+       genotype_df=genotype_df,
+       variant_df=variant_df,
+       phenotype_df=phenotype_df,
+       phenotype_pos_df=phenotype_pos_df,
+       covariates_df=covariates_df,
+       interaction_covariate="age",
+       device="auto",
+       return_df=True,
+   )
+
+   interaction_df[[
+       "variant_id", "pval_nominal", "pval_g", "pval_i", "pval_gi"
+   ]].head()
+
+In this mode the result includes the standard nominal columns plus the
+joint-model coefficients ``b_g``, ``b_i``, ``b_gi`` and their standard errors,
+t-statistics, and p-values. ``interaction_covariate`` is mutually exclusive
+with ``ancestry_model="interaction"``.
+
 CisMapper orchestration
 ~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -163,9 +193,9 @@ q-value corrections, and conditional analyses:
    # ``nperm`` defaults to ``None`` (alias ``0``) to mirror tensorQTL's
    # permutation-free nominal scans.
 
-    # Persist independent hits using the streaming Parquet sink employed under
-    # the hood by the functional APIs.
-    lead_df.to_parquet("lead_hits.parquet", compression="snappy")
+   # Persist independent hits using the streaming Parquet sink employed under
+   # the hood by the functional APIs.
+   lead_df.to_parquet("lead_hits.parquet", compression="snappy")
 
 Local ancestry workflows
 ------------------------
@@ -240,6 +270,129 @@ fine-mapping or replication analyses:
 
 For additional preprocessing helpers, explore :mod:`localqtl.preproc` (MAF
 filters) and :mod:`localqtl.utils` (CUDA detection utilities).
+
+SuSiE fine-mapping
+------------------
+
+The :mod:`localqtl.susie` module ports tensorQTL's SuSiE workflow to pure
+Python. It supports low-level model fitting through
+:func:`localqtl.susie.susie` and high-level cis-window scanning through
+:func:`localqtl.susie.map` and :func:`localqtl.susie.map_loci`.
+
+Genome-wide cis windows
+~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   from localqtl import susie
+
+   susie_summary = susie.map(
+       genotype_df=genotype_df,
+       variant_df=variant_df,
+       phenotype_df=phenotype_df,
+       phenotype_pos_df=phenotype_pos_df,
+       covariates_df=covariates_df,
+       L=10,
+       coverage=0.95,
+       min_abs_corr=0.5,
+       device="auto",
+   )
+
+   susie_summary.head()
+
+The summary output contains ``phenotype_id``, ``variant_id``, posterior
+inclusion probabilities in ``pip``, allele frequency in ``af``, and credible
+set membership in ``cs_id``.
+
+Targeted loci
+~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   locus_df = phenotype_pos_df.reset_index()[["phenotype_id", "chr"]].copy()
+   locus_df["position"] = (
+       phenotype_pos_df["start"].to_numpy() + phenotype_pos_df["end"].to_numpy()
+   ) // 2
+
+   locus_summary, locus_res = susie.map_loci(
+       locus_df=locus_df,
+       genotype_df=genotype_df,
+       variant_df=variant_df,
+       phenotype_df=phenotype_df,
+       covariates_df=covariates_df,
+       device="auto",
+   )
+
+Use ``map_loci`` when each phenotype should be fine-mapped only in specific
+windows rather than across its full cis span.
+
+COLOC colocalization
+--------------------
+
+The :mod:`localqtl.coloc` module provides Approximate Bayes Factor
+colocalization from raw data or summary statistics.
+
+Raw-data phenotype pairs
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   from localqtl import coloc
+
+   coloc_df = coloc.run_pairs(
+       genotype_df=genotype_df,
+       variant_df=variant_df,
+       phenotype1_df=phenotype_df,
+       phenotype2_df=trait2_df,
+       phenotype_pos_df=phenotype_pos_df,
+       covariates1_df=covariates_df,
+       covariates2_df=trait2_covariates_df,
+       mode="beta",
+       device="auto",
+   )
+
+   coloc_df[["pp_h3_abf", "pp_h4_abf"]].head()
+
+This returns one row per phenotype with posterior support for hypotheses
+``H0`` through ``H4``. ``pp_h4_abf`` is the shared-causal-variant posterior and
+is the typical downstream summary statistic.
+
+Summary-statistics interface
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   coloc_stats = coloc.coloc_from_summary(
+       beta1=eqtl_beta,
+       se1=eqtl_se,
+       beta2=gwas_beta,
+       se2=gwas_se,
+       maf=maf,
+       n1=eqtl_n,
+       n2=gwas_n,
+   )
+
+Use :func:`localqtl.coloc.coloc_from_summary` when only marginal effect sizes
+and standard errors are available.
+
+Post-processing helpers
+-----------------------
+
+The branch adds lightweight helpers in :mod:`localqtl.cis.postproc` for
+attaching fine-mapping and colocalization results to existing cis outputs.
+
+.. code-block:: python
+
+   from localqtl.cis.postproc import annotate_with_coloc, annotate_with_susie
+
+   nominal_annotated = annotate_with_susie(nominal_df, susie_summary)
+   perm_annotated = annotate_with_coloc(perm_df, coloc_df)
+
+``annotate_with_susie`` appends ``susie_pip`` and ``susie_cs`` columns keyed by
+``(phenotype_id, variant_id)``. When a variant belongs to multiple credible
+sets, ``susie_cs`` stores a comma-separated list of set IDs.
+``annotate_with_coloc`` appends a phenotype-level ``coloc_pp_h4`` column to
+permutation results.
 
 Device, logging, and reproducibility helpers
 --------------------------------------------

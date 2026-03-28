@@ -119,6 +119,24 @@ class TestSuSiEGetCS:
                 found = any(ci in indices for indices in cs['cs'].values())
                 assert found, f"Causal index {ci} not found in any CS"
 
+    def test_dedup_keeps_first_unique_credible_sets(self):
+        """Duplicate CS rows should not displace later unique rows."""
+        alpha = torch.tensor([
+            [0.9, 0.1, 0.0, 0.0],
+            [0.9, 0.1, 0.0, 0.0],
+            [0.0, 0.0, 0.8, 0.2],
+        ], dtype=torch.float32)
+        res = {
+            "alpha": alpha,
+            "V": torch.ones(alpha.shape[0], dtype=torch.float32),
+            "null_index": 0,
+        }
+
+        cs = susie_get_cs(res, coverage=0.95, dedup=True)
+
+        assert cs["cs"] is not None
+        assert list(cs["cs"]) == ["L1", "L3"]
+
 
 class TestSuSiEGetPIP:
     def test_pip_standalone(self, synthetic_causal):

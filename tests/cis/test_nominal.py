@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 from src.localqtl.cis.nominal import map_nominal
-from src.localqtl.cis.postproc import annotate_ancestry_difference
+from src.localqtl.cis.postproc import annotate_ancestry_difference, annotate_with_susie
 from src.localqtl.utils import SimpleLogger
 
 
@@ -141,3 +141,28 @@ def test_map_nominal_no_interaction(toy_data):
     # No interaction columns should be present
     assert "b_g" not in result.columns
     assert "slope_gxh_anc0" not in result.columns
+
+
+def test_annotate_with_susie_collapses_duplicate_cs_membership():
+    nominal_df = pd.DataFrame(
+        {
+            "phenotype_id": ["geneA", "geneA", "geneB"],
+            "variant_id": ["var1", "var2", "var3"],
+        }
+    )
+    susie_summary = pd.DataFrame(
+        {
+            "phenotype_id": ["geneA", "geneA", "geneA"],
+            "variant_id": ["var1", "var1", "var2"],
+            "pip": [0.7, 0.7, 0.2],
+            "cs_id": ["2", "1", "3"],
+        }
+    )
+
+    annotated = annotate_with_susie(nominal_df, susie_summary)
+
+    assert annotated.loc[0, "susie_pip"] == pytest.approx(0.7)
+    assert annotated.loc[0, "susie_cs"] == "1,2"
+    assert annotated.loc[1, "susie_cs"] == "3"
+    assert pd.isna(annotated.loc[2, "susie_pip"])
+    assert annotated.loc[2, "susie_cs"] is None
