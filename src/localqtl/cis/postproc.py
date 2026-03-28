@@ -10,6 +10,9 @@ from ..utils import SimpleLogger
 
 __all__ = [
     "get_significant_pairs",
+    "annotate_ancestry_difference",
+    "annotate_with_susie",
+    "annotate_with_coloc",
 ]
 
 def _chrom_sort_key(ch: str) -> tuple:
@@ -157,3 +160,131 @@ def get_significant_pairs(res_df: pd.DataFrame,
 
     lg.write(f"  * Final significant pairs: {len(signif):,}")
     return signif
+
+
+def annotate_ancestry_difference(
+    nominal_df: pd.DataFrame,
+    n_ancestries: int = 2,
+) -> pd.DataFrame:
+    """
+    Add columns testing H0: beta_anc_i = beta_anc_j for all ancestry pairs.
+
+    Expects columns ``slope_gxh_anc{k}`` and ``slope_se_gxh_anc{k}`` for
+    k in 0..n_ancestries-1 (produced by ``map_nominal`` with
+    ``ancestry_model='interaction'``).
+
+    New columns per pair (i, j):
+      - ``beta_diff_anc{i}_anc{j}``
+      - ``se_diff_anc{i}_anc{j}``
+      - ``z_diff_anc{i}_anc{j}``
+      - ``pval_diff_anc{i}_anc{j}``
+
+    Parameters
+    ----------
+    nominal_df : DataFrame
+        Output of ``map_nominal`` with ancestry interaction columns.
+    n_ancestries : int
+        Number of ancestry channels (K). Only K-1 columns are expected to be
+        non-NaN (the last ancestry is dropped for identifiability).
+
+    Returns
+    -------
+    DataFrame
+        Input with new difference-of-effects columns appended.
+    """
+    import numpy as np
+    from ..stats import test_beta_difference
+
+    df = nominal_df.copy()
+    for i in range(n_ancestries):
+        for j in range(i + 1, n_ancestries):
+            col_b_i = f"slope_gxh_anc{i}"
+            col_se_i = f"slope_se_gxh_anc{i}"
+            col_b_j = f"slope_gxh_anc{j}"
+            col_se_j = f"slope_se_gxh_anc{j}"
+
+            if not all(c in df.columns for c in (col_b_i, col_se_i, col_b_j, col_se_j)):
+                continue
+
+            z, pval = test_beta_difference(
+                df[col_b_i].values, df[col_se_i].values,
+                df[col_b_j].values, df[col_se_j].values,
+            )
+            suffix = f"anc{i}_anc{j}"
+            df[f"beta_diff_{suffix}"] = (df[col_b_i] - df[col_b_j]).astype(np.float32)
+            df[f"se_diff_{suffix}"] = np.sqrt(
+                df[col_se_i] ** 2 + df[col_se_j] ** 2
+            ).astype(np.float32)
+            df[f"z_diff_{suffix}"] = z.astype(np.float32)
+            df[f"pval_diff_{suffix}"] = pval.astype(np.float32)
+    return df
+
+
+def annotate_with_susie(
+    nominal_df: pd.DataFrame,
+    susie_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Add PIP and credible set membership columns to nominal results.
+
+    Parameters
+    ----------
+    nominal_df : DataFrame
+        Output of ``map_nominal``. Must have ``phenotype_id`` and ``variant_id``.
+    susie_summary : DataFrame
+        Output of ``susie.map()``. Must have ``phenotype_id``, ``variant_id``,
+        ``pip``, and ``cs_id``.
+
+    Returns
+    -------
+    DataFrame
+        Input with ``susie_pip`` and ``susie_cs`` columns appended.
+    """
+    df = nominal_df.copy()
+
+    if susie_summary.empty:
+        df['susie_pip'] = float('nan')
+        df['susie_cs'] = None
+        return df
+
+    # Build lookup: (phenotype_id, variant_id) -> (pip, cs_id)
+    pip_map = susie_summary.set_index(['phenotype_id', 'variant_id'])['pip']
+    cs_map = susie_summary.set_index(['phenotype_id', 'variant_id'])['cs_id']
+
+    key = list(zip(df['phenotype_id'], df['variant_id']))
+    df['susie_pip'] = [pip_map.get(k, float('nan')) for k in key]
+    df['susie_cs'] = [cs_map.get(k, None) for k in key]
+    return df
+
+
+def annotate_with_coloc(
+    perm_df: pd.DataFrame,
+    coloc_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Add COLOC H4 posterior probability to permutation-level results.
+
+    Parameters
+    ----------
+    perm_df : DataFrame
+        Output of ``map_permutations``. Must have ``phenotype_id`` as index or column.
+    coloc_df : DataFrame
+        Output of ``coloc.run_pairs()``. Must have ``pp_h4_abf`` column,
+        indexed by phenotype.
+
+    Returns
+    -------
+    DataFrame
+        Input with ``coloc_pp_h4`` column appended.
+    """
+    df = perm_df.copy()
+    if coloc_df.empty:
+        df['coloc_pp_h4'] = float('nan')
+        return df
+
+    if 'phenotype_id' in df.columns:
+        df['coloc_pp_h4'] = df['phenotype_id'].map(coloc_df['pp_h4_abf']).values
+    else:
+        # phenotype_id is the index
+        df['coloc_pp_h4'] = df.index.map(coloc_df['pp_h4_abf']).values
+    return df

@@ -4,7 +4,47 @@ import numpy as np
 __all__ = [
     "get_pairwise_ld",
     "get_ld_matrix",
+    "get_correlation_matrix",
 ]
+
+def get_correlation_matrix(pgr, variant_ids, use_torch=True, dtype=np.float32):
+    """
+    Compute an r (not r²) correlation matrix suitable for SuSiE's ``Xcorr`` parameter.
+
+    Parameters
+    ----------
+    pgr : PgenReader
+        Initialized PgenReader object.
+    variant_ids : list
+        Variant IDs to include.
+    use_torch : bool
+        If True, compute with torch on GPU if available.
+    dtype : np.float32 or np.float64
+        Precision of computation.
+
+    Returns
+    -------
+    corr : np.ndarray or torch.Tensor
+        Correlation matrix (n_variants x n_variants).  Returns a torch.Tensor
+        when ``use_torch=True``, otherwise a numpy array.
+    """
+    G = pgr.read_list(variant_ids, dosages=False, to_torch=use_torch)
+
+    if use_torch:
+        G = G.to(dtype)
+        G = G - G.mean(dim=1, keepdim=True)
+        denom = torch.sqrt((G ** 2).sum(1, keepdim=True))
+        denom = torch.clamp(denom, min=1e-30)
+        G = G / denom
+        return torch.matmul(G, G.T)
+    else:
+        G = G.astype(dtype, copy=False)
+        G = G - G.mean(1, keepdims=True)
+        denom = np.sqrt((G ** 2).sum(1))[:, None]
+        denom = np.maximum(denom, 1e-30)
+        G = G / denom
+        return np.dot(G, G.T)
+
 
 def get_pairwise_ld(pgr, id1, id2=None, r2=True, use_torch=False, dtype=np.float32):
     """
