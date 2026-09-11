@@ -166,3 +166,20 @@ def test_annotate_with_susie_collapses_duplicate_cs_membership():
     assert annotated.loc[1, "susie_cs"] == "3"
     assert pd.isna(annotated.loc[2, "susie_pip"])
     assert annotated.loc[2, "susie_cs"] is None
+
+
+def test_ancestry_interaction_with_panel(toy_panel_2anc, toy_hap_data_2anc):
+    """LocalAncestryPanel input (no loci_df) runs the interaction model end to end
+    and matches the legacy array input built from the same counts."""
+    d = toy_panel_2anc
+    common = dict(genotype_df=d["genotype_df"], variant_df=d["variant_df"],
+                  phenotype_df=d["phenotype_df"], phenotype_pos_df=d["phenotype_pos_df"],
+                  device="cpu", nperm=None, out_dir=None, logger=SimpleLogger(verbose=False),
+                  ancestry_model="interaction")
+    res_panel = map_nominal(haplotypes=d["panel"], **common)
+    assert not res_panel.empty and "pval_gxh_anc0" in res_panel.columns
+
+    H = d["admix"][:, :, [0]].astype(float)             # legacy path: first channel, loci == variants
+    res_array = map_nominal(haplotypes=H, loci_df=d["panel"].loci_df, **common)
+    num = [c for c in res_panel.columns if res_panel[c].dtype.kind == "f"]
+    np.testing.assert_allclose(res_panel[num].to_numpy(), res_array[num].to_numpy(), rtol=1e-5, equal_nan=True)

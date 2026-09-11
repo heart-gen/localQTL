@@ -14,68 +14,37 @@ from localqtl.haplotypeio import InputGeneratorCisWithHaps
 # Fixtures for RFMixReader
 ############################
 
+def _legacy_dataset(n_pops, n_samples, seed=0):
+    """A small rfmix_reader Dataset built from a legacy (loci, g_anc, admix) triple."""
+    from rfmix_reader import from_legacy
+
+    loci = pd.DataFrame({"chromosome": ["1", "1", "2"], "physical_position": [100, 200, 300]})
+    g_anc = pd.DataFrame({"sample_id": [f"s{i + 1}" for i in range(n_samples)]})
+    pops = ["EUR", "AFR", "EAS"][:n_pops]
+    for k, pop in enumerate(pops):
+        g_anc[pop] = np.linspace(0.2, 0.8, n_samples) if k == 0 else (1 - np.linspace(0.2, 0.8, n_samples)) / max(n_pops - 1, 1)
+    g_anc["chrom"] = "1"
+    rng = np.random.default_rng(seed)
+    codes = rng.integers(0, n_pops, size=(3, n_samples, 2))
+    admix = np.stack([(codes == a).sum(axis=-1) for a in range(n_pops)], axis=-1).astype(np.int8)
+    return from_legacy(loci, g_anc, admix), admix
+
+
 @pytest.fixture
 def fake_rfmix_data_2ancestries(monkeypatch):
-    """
-    Mock read_rfmix() -> (loci_df_like, g_anc, admix)
-    where admix has 2 ancestries, shape (variants, samples, 2).
-    """
-    loci = pd.DataFrame({
-        "chromosome": ["1", "1", "2"],
-        "physical_position": [100, 200, 300],
-    })
-    g_anc = pd.DataFrame({
-        "sample_id": ["s1", "s2", "s3", "s4"],
-        "chrom": ["1", "1", "2", "2"],
-    })
-    # admix[v, s, a] = simple pattern v + 10*s + 100*a
-    n_var = loci.shape[0]    # 3 loci
-    n_s   = g_anc.shape[0]   # 4 samples
-    n_pop = 2
-    admix = np.zeros((n_var, n_s, n_pop), dtype=float)
-    for v in range(n_var):
-        for s in range(n_s):
-            for a in range(n_pop):
-                admix[v, s, a] = v + 10*s + 100*a
-
-    def fake_read_rfmix(prefix_path, binary_dir, verbose):
-        return loci, g_anc, admix
-
-    monkeypatch.setattr(hio, "read_rfmix", fake_read_rfmix)
-    return loci, g_anc, admix
+    ds, admix = _legacy_dataset(2, 4)
+    monkeypatch.setattr(hio, "open_rfmix", lambda *a, **k: ds, raising=False)
+    import rfmix_reader
+    monkeypatch.setattr(rfmix_reader, "open_rfmix", lambda *a, **k: ds)
+    return ds, admix
 
 
 @pytest.fixture
 def fake_rfmix_data_3ancestries(monkeypatch):
-    """
-    Mock read_rfmix() but with 3 ancestries.
-    """
-    loci = pd.DataFrame({
-        "chromosome": ["1", "1", "2"],
-        "physical_position": [100, 200, 300],
-    })
-    g_anc = pd.DataFrame({
-        "sample_id": ["s1", "s2"],
-        "chrom": ["1", "2"],
-    })
-    n_var = loci.shape[0]   # 3
-    n_s   = g_anc.shape[0]  # 2
-    n_pop = 3
-    admix = np.zeros((n_var, n_s, n_pop), dtype=float)
-    # ancestry0 ~ v + s
-    # ancestry1 ~ v + 10*s
-    # ancestry2 ~ v + 100*s
-    for v in range(n_var):
-        for s in range(n_s):
-            admix[v, s, 0] = v + s
-            admix[v, s, 1] = v + 10*s
-            admix[v, s, 2] = v + 100*s
-
-    def fake_read_rfmix(prefix_path, binary_dir, verbose):
-        return loci, g_anc, admix
-
-    monkeypatch.setattr(hio, "read_rfmix", fake_read_rfmix)
-    return loci, g_anc, admix
+    ds, admix = _legacy_dataset(3, 2)
+    import rfmix_reader
+    monkeypatch.setattr(rfmix_reader, "open_rfmix", lambda *a, **k: ds)
+    return ds, admix
 
 
 ##################################
@@ -84,46 +53,137 @@ def fake_rfmix_data_3ancestries(monkeypatch):
 
 def test_rfmixreader_two_ancestries(fake_rfmix_data_2ancestries):
     """
-    n_pops == 2 branch:
-      - haplotypes should become admix[:, :, [0]]
-        (only first ancestry retained)
-      - loci_df should exist and be a pandas DataFrame
+    n_pops == 2: only the first ancestry channel is exposed (the second is
+    2 - first); loci_df keeps the legacy hap-indexed layout.
     """
+    ds, admix = fake_rfmix_data_2ancestries
     reader = hio.RFMixReader("dummy_prefix", verbose=False)
 
-    # n_pops detected correctly
-    assert reader.n_pops == 2
-
-    # haplotypes collapsed to first ancestry only -> shape (loci, samples, 1)
-    assert reader.haplotypes.shape[2] == 1
-    assert reader.haplotypes.shape[0] == 3  # loci
-    assert isinstance(reader.loci_df, pd.DataFrame)
-
-    # sample_ids from g_anc
+    assert reader.n_pops == 2 and reader.n_channels == 1
+    assert reader.haplotypes.shape == (3, 4, 1)
     assert reader.sample_ids == ["s1", "s2", "s3", "s4"]
-
-    # loci_df index should be hap IDs (ends with _A0)
+    assert isinstance(reader.loci_df, pd.DataFrame)
     assert all(h.endswith("_A0") for h in reader.loci_df.index.tolist())
+    assert reader.loci["chrom"].tolist() == ["1", "1", "2"] and reader.loci["pos"].tolist() == [100, 200, 300]
+
+    H = reader.load_haplotypes()
+    assert H.shape == (3, 4, 1) and H.dtype == np.int8
+    np.testing.assert_array_equal(H[:, :, 0], admix[:, :, 0])
+    np.testing.assert_array_equal(reader.chrom_counts("1"), admix[:2, :, [0]])
+    np.testing.assert_array_equal(reader.chrom_counts("chr2"), admix[2:, :, [0]])
+    np.testing.assert_array_equal(reader.locus_index("1", [100, 150, 200, 250]), [0, -1, 1, -1])
+    np.testing.assert_array_equal(reader.locus_index("1", [150, 250], method="nearest"), [0, 1])
+    np.testing.assert_array_equal(reader.locus_index("9", [1]), [-1])
 
 
 def test_rfmixreader_three_ancestries(fake_rfmix_data_3ancestries):
-    """
-    n_pops > 2 branch:
-      - haplotypes should be full admix array
-      - loci_df should stack ancestries (A0, A1, A2) and have 'ancestry' column
-    """
+    ds, admix = fake_rfmix_data_3ancestries
     reader = hio.RFMixReader("dummy_prefix", verbose=False)
 
-    assert reader.n_pops == 3
-    # unchanged shape (loci, samples, ancestries)
+    assert reader.n_pops == 3 and reader.n_channels == 3
     assert reader.haplotypes.shape == (3, 2, 3)
-    assert isinstance(reader.loci_df, pd.DataFrame)
-
-    # should have ancestry column with {0,1,2}
     assert set(reader.loci_df["ancestry"].unique()) == {0, 1, 2}
-
-    # hap IDs in index look like chr_pos_A{k}
     assert any(h.endswith("_A2") for h in reader.loci_df.index.tolist())
+    np.testing.assert_array_equal(reader.load_haplotypes(), admix)
+
+
+def test_panel_select_samples_and_exclude_chrs(fake_rfmix_data_2ancestries):
+    ds, admix = fake_rfmix_data_2ancestries
+    panel = hio.LocalAncestryPanel(ds, select_samples=["s3", "s1"], exclude_chrs=["chr2"])
+    assert panel.sample_ids == ["s3", "s1"] and panel.chromosomes == ["1"]
+    np.testing.assert_array_equal(panel.load_haplotypes()[:, :, 0], admix[:2][:, [2, 0], 0])
+    with pytest.raises(ValueError, match="not in the local ancestry"):
+        hio.LocalAncestryPanel(ds, select_samples=["s1", "nope"])
+
+
+def _panel_for_toy(toy, n_pops=2, seed=0):
+    """Valid diploid counts on the toy variant grid, as a LocalAncestryPanel."""
+    from rfmix_reader import from_legacy
+
+    var_df = toy["variant_df"]
+    samples = list(toy["genotype_df"].columns)
+    loci = pd.DataFrame({"chromosome": var_df["chrom"].astype(str).values,
+                         "physical_position": var_df["pos"].values})
+    g_anc = pd.DataFrame({"sample_id": samples})
+    for k in range(n_pops):
+        g_anc[f"P{k}"] = 1.0 / n_pops
+    g_anc["chrom"] = "1"
+    rng = np.random.default_rng(seed)
+    codes = rng.integers(0, n_pops, size=(len(loci), len(samples), 2))
+    admix = np.stack([(codes == a).sum(axis=-1) for a in range(n_pops)], axis=-1).astype(np.int8)
+    return hio.LocalAncestryPanel(from_legacy(loci, g_anc, admix)), admix
+
+
+def test_generator_panel_mode_matches_direct_indexing(toy_hap_data_2anc):
+    """Panel mode: H is the per-chromosome count array indexed by the SNP's segment."""
+    toy = toy_hap_data_2anc
+    panel, admix = _panel_for_toy(toy)
+    gen = InputGeneratorCisWithHaps(
+        toy["genotype_df"], toy["variant_df"], toy["phenotype_df"], toy["phenotype_pos_df"],
+        haplotypes=panel, window=200,
+    )
+    assert gen.n_unmapped_variants == 0
+    batches = list(gen.generate_data())
+    assert len(batches) == 3
+    for p, G, v_idx, H, pid in batches:
+        assert isinstance(H, np.ndarray) and H.dtype == np.float32
+        assert H.shape == (len(v_idx), toy["genotype_df"].shape[1], 1)
+        np.testing.assert_array_equal(H[:, :, 0], admix[v_idx, :, 0])   # loci == variant grid here
+        assert not np.isnan(H).any()
+
+
+def test_generator_panel_mode_segment_lookup_and_missing(toy_hap_data_2anc):
+    """A coarser panel (fewer loci than SNPs) maps SNPs to the covering segment;
+    SNPs outside every segment are dropped; missing calls are interpolated."""
+    from rfmix_reader import from_legacy
+
+    toy = toy_hap_data_2anc
+    var_df = toy["variant_df"]                      # chr1: 100,200,300,800,900 ; chr2: 150,250
+    samples = list(toy["genotype_df"].columns)
+    loci = pd.DataFrame({"chromosome": ["1", "1", "2"], "physical_position": [100, 800, 150]})
+    g_anc = pd.DataFrame({"sample_id": samples, "P0": 0.5, "P1": 0.5, "chrom": "1"})
+    admix = np.zeros((3, len(samples), 2), dtype=np.int8)
+    admix[..., 0] = [[2] * len(samples), [1] * len(samples), [0] * len(samples)]
+    admix[..., 1] = 2 - admix[..., 0]
+    admix[1, 0, :] = -1                              # one missing call on the second segment
+    ds = from_legacy(loci, g_anc, admix)
+    # segment ends: 100-799 and 800-.. are implied only for msp; here segment_end == pos,
+    # so stepwise matches exact positions only and nearest with tolerance is the useful mode
+    panel = hio.LocalAncestryPanel(ds)
+    gen = InputGeneratorCisWithHaps(
+        toy["genotype_df"], var_df, toy["phenotype_df"], toy["phenotype_pos_df"],
+        haplotypes=panel, window=200, locus_method="nearest", nearest_tolerance=100,
+    )
+    # SNPs farther than 100 bp from every locus on their chromosome are dropped
+    loci_by_chrom = {"1": np.array([100, 800]), "2": np.array([150])}
+    dist = np.array([np.abs(loci_by_chrom[str(c)] - p).min() for c, p in zip(var_df["chrom"], var_df["pos"])])
+    assert gen.n_unmapped_variants == int((dist > 100).sum()) > 0
+    assert (~gen._vmask).sum() == gen.n_unmapped_variants
+    for p, G, v_idx, H, pid in gen.generate_data():
+        assert H.shape[0] == len(v_idx) == G.shape[0]
+        assert not np.isnan(H).any()                 # the -1 became NaN and was interpolated
+
+
+def test_generator_panel_mode_preload_to_torch(toy_hap_data_2anc):
+    toy = toy_hap_data_2anc
+    panel, admix = _panel_for_toy(toy)
+    gen = InputGeneratorCisWithHaps(
+        toy["genotype_df"], toy["variant_df"], toy["phenotype_df"], toy["phenotype_pos_df"],
+        haplotypes=panel, window=200, preload_to_torch=True, torch_device=torch.device("cpu"),
+    )
+    for p, G, v_idx, H, pid in gen.generate_data():
+        assert isinstance(H, torch.Tensor) and H.dtype == torch.float32 and H.device.type == "cpu"
+        np.testing.assert_array_equal(H.numpy()[:, :, 0], admix[v_idx, :, 0])
+    assert isinstance(gen._empty_h_block(), torch.Tensor)
+
+
+def test_generator_panel_mode_rejects_sample_mismatch(toy_hap_data_2anc):
+    toy = toy_hap_data_2anc
+    panel, _ = _panel_for_toy(toy)
+    geno = toy["genotype_df"].iloc[:, ::-1]          # reversed sample order
+    with pytest.raises(ValueError, match="select_samples"):
+        InputGeneratorCisWithHaps(geno, toy["variant_df"], toy["phenotype_df"].loc[:, geno.columns],
+                                  toy["phenotype_pos_df"], haplotypes=panel, window=200)
 
 
 ###########################################################

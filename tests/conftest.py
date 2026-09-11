@@ -232,3 +232,23 @@ def toy_hap_data_3anc(toy_data):
         "loci_df": loci_df,    # pandas DataFrame with ancestry column 0..2
     }
 
+
+
+@pytest.fixture
+def toy_panel_2anc(toy_data):
+    """
+    The toy variant grid as a localqtl.haplotypeio.LocalAncestryPanel (two ancestries,
+    valid diploid counts), plus the (loci, samples, 2) count array it was built from.
+    """
+    from rfmix_reader import from_legacy
+    from localqtl.haplotypeio import LocalAncestryPanel
+
+    var_df = toy_data["variant_df"]
+    samples = list(toy_data["genotype_df"].columns)
+    loci = pd.DataFrame({"chromosome": var_df["chrom"].astype(str).values,
+                         "physical_position": var_df["pos"].values})
+    g_anc = pd.DataFrame({"sample_id": samples, "P0": 0.5, "P1": 0.5, "chrom": "1"})
+    rng = np.random.default_rng(7)
+    codes = rng.integers(0, 2, size=(len(loci), len(samples), 2))
+    admix = np.stack([(codes == a).sum(axis=-1) for a in range(2)], axis=-1).astype(np.int8)
+    return {**toy_data, "panel": LocalAncestryPanel(from_legacy(loci, g_anc, admix)), "admix": admix}

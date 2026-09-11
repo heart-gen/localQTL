@@ -128,9 +128,10 @@ autodoc cross-references:
 
 ``map_nominal``, ``map_permutations``, and ``map_independent`` accept a
 ``preload_haplotypes`` flag that defaults to ``True``. When ancestry dosages
-are provided, enabling the flag stages haplotypes as contiguous tensors on the
-target device (GPU or CPU). Disable it if the additional memory pressure is a
-concern.
+are provided, enabling the flag stages the current chromosome's haplotype
+counts as a contiguous int8 tensor on the target device (GPU or CPU) and
+slices per-gene windows there. Disable it if the additional memory pressure
+is a concern.
 
 The helper trio also mirrors tensorQTL's "tensor-friendly" outputs through the
 ``tensorqtl_flavor`` switch. Setting the flag to ``True`` swaps Parquet streaming
@@ -210,31 +211,34 @@ Haplotype loading
 
 .. code-block:: python
 
-   from localqtl.haplotypeio import RFMixReader
+   from localqtl.haplotypeio import RFMixReader, open_panel
 
-   rfmix = RFMixReader(
-       prefix_path="data/rfmix/prefix",
-       binary_path="data/rfmix",
-       verbose=True,
+   panel = RFMixReader(
+       "data/rfmix/",                             # RFMix .msp.tsv output (+ .rfmix.Q)
+       select_samples=list(genotype_df.columns),  # same samples, same order as the genotypes
+       cache_dir="data/rfmix/la_cache/",          # parsed once into a Zarr cache
    )
+   # existing cache: panel = open_panel("data/rfmix/la_cache/", select_samples=...)
 
-   H = rfmix.load_haplotypes()
-   loci_df = rfmix.loci_df
+   panel.chrom_counts("chr21")                   # (variants, samples, channels) int8 for one chromosome
+   panel.locus_index("chr21", positions)         # covering segment per SNP, -1 = none
+
+The panel is passed as ``haplotypes`` to ``CisMapper`` / ``map_nominal``; the
+generator keeps one chromosome in memory at a time.  With two ancestries a
+single channel is exposed (the second is ``2 - first``).
 
 Sample alignment and mapping
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. code-block:: python
 
-   keep = [sid for sid in rfmix.sample_ids if sid in genotype_df.columns]
-   genotype_df = genotype_df[keep]
+   # the panel was built with select_samples=list(genotype_df.columns), so the
+   # ancestry samples already match the genotype columns (order included);
+   # restrict the other tables to the same samples
+   keep = list(genotype_df.columns)
    phenotype_df = phenotype_df[keep]
    if covariates_df is not None:
        covariates_df = covariates_df.loc[keep]
-
-   variant_df["chrom"] = variant_df["chrom"].astype(str)
-   loci_df = loci_df.copy()
-   loci_df["chrom"] = loci_df["chrom"].astype(str)
 
    mapper = CisMapper(
        genotype_df=genotype_df,
@@ -242,8 +246,7 @@ Sample alignment and mapping
        phenotype_df=phenotype_df,
        phenotype_pos_df=phenotype_pos_df,
        covariates_df=covariates_df,
-       haplotypes=H,
-       loci_df=loci_df,
+       haplotypes=panel,
        window=1_000_000,
        device="auto",
    )
