@@ -30,26 +30,31 @@ workflows, while adding ancestry-aware use cases.
 Install the latest release from PyPI:
 
 ```bash
-pip install localqtl
+pip install localqtl            # CPU / PyTorch only
+pip install "localqtl[gpu]"     # + CuPy and cuDF (CUDA 12 wheels)
 ```
+
+The core depends on PyTorch, numpy/scipy/pandas, pgenlib and rfmix-reader.
+The `gpu` extra adds the CuPy and cuDF (RAPIDS) array and dataframe backends;
+without it every helper falls back to numpy and pandas, and PyTorch still uses
+the GPU for the regressions when one is visible.
 
 The project uses [Poetry](https://python-poetry.org/) for dependency management.
 Clone the repository and install the package into a virtual environment:
 
 ```bash
-poetry install
+poetry install                  # CPU
+poetry install --extras gpu     # with the CUDA backends
 ```
 
-If you prefer `pip`, you can install the library in editable mode after exporting
-Poetry's dependency specification:
+If you prefer `pip`, you can install the library in editable mode:
 
 ```bash
-pip install -e .
+pip install -e ".[gpu]"
 ```
 
-> **Note:** GPU acceleration relies on PyTorch, CuPy, and cuDF. Make sure you use
-> versions that match the CUDA toolkit available on your system. The versions in
-> `pyproject.toml` target CUDA 12.
+> **Note:** the `gpu` extra pins CUDA 12 wheels (`cupy-cuda12x`, `cudf-cu12`,
+> `dask-cudf-cu12`); match them to the CUDA toolkit on your system.
 
 ## Quickstart
 

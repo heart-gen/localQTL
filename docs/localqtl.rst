@@ -58,17 +58,20 @@ Poetry
 
 .. code-block:: bash
 
-   poetry install
+   poetry install                 # CPU / PyTorch only
+   poetry install --extras gpu    # + CuPy and cuDF (CUDA 12 wheels)
 
 Pip
 ~~~
 
 Install the published package directly from PyPI when you do not need the
-editable source checkout:
+editable source checkout; the ``gpu`` extra adds the CuPy / cuDF backends
+(everything falls back to numpy and pandas without them):
 
 .. code-block:: bash
 
    pip install localqtl
+   pip install "localqtl[gpu]"
 
 To work against the latest repository state, fall back to an editable install:
 
