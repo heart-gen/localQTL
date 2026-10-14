@@ -183,3 +183,96 @@ def test_ancestry_interaction_with_panel(toy_panel_2anc, toy_hap_data_2anc):
     res_array = map_nominal(haplotypes=H, loci_df=d["panel"].loci_df, **common)
     num = [c for c in res_panel.columns if res_panel[c].dtype.kind == "f"]
     np.testing.assert_allclose(res_panel[num].to_numpy(), res_array[num].to_numpy(), rtol=1e-5, equal_nan=True)
+
+
+def _dosage_common(d, **extra):
+    return dict(genotype_df=d["genotype_df"], variant_df=d["variant_df"],
+                phenotype_df=d["phenotype_df"], phenotype_pos_df=d["phenotype_pos_df"],
+                device="cpu", nperm=None, out_dir=None, logger=SimpleLogger(verbose=False), **extra)
+
+
+def test_dosage_model_columns_and_hard_call_dosages(toy_panel_2anc):
+    """ancestry_model='dosage' on a hard-call panel: per-ancestry, joint and
+    pairwise-difference columns, finite where estimable."""
+    from localqtl.cis.nominal import _dosage_columns
+
+    d = toy_panel_2anc
+    res = map_nominal(haplotypes=d["panel"], ancestry_model="dosage", **_dosage_common(d))
+    assert not res.empty
+    cols = _dosage_columns(2)
+    assert cols == ["slope_anc0", "slope_se_anc0", "tstat_anc0", "pval_anc0",
+                    "slope_anc1", "slope_se_anc1", "tstat_anc1", "pval_anc1",
+                    "fstat_joint", "pval_joint", "z_diff_anc0_anc1", "pval_diff_anc0_anc1"]
+    assert all(c in res.columns for c in cols)
+    assert "slope_gxh_anc0" not in res.columns
+    # lead columns are the ancestry with the largest |t|
+    best = np.where(res["tstat_anc0"].abs() >= res["tstat_anc1"].abs(), res["slope_anc0"], res["slope_anc1"])
+    np.testing.assert_allclose(res["slope"].to_numpy(), best, rtol=1e-6)
+    assert ((res["pval_joint"] >= 0) & (res["pval_joint"] <= 1)).all()
+    assert ((res["pval_diff_anc0_anc1"] >= 0) & (res["pval_diff_anc0_anc1"] <= 1)).all()
+
+
+def test_dosage_model_homogeneous_ancestry_matches_main_model():
+    """With every haplotype assigned to ancestry 0, D_0 == G and the ancestry-0
+    effect equals the plain genotype slope of the main model (with a covariate,
+    so both designs are centred and the constant local-ancestry column vanishes)."""
+    from rfmix_reader import from_legacy
+    from localqtl.haplotypeio import LocalAncestryPanel
+
+    rng = np.random.default_rng(3)
+    n, m = 16, 6
+    samples = [f"S{i}" for i in range(n)]
+    vids = [f"v{k}" for k in range(m)]
+    variant_df = pd.DataFrame({"chrom": "1", "pos": np.arange(1, m + 1) * 100}, index=vids)
+    genotype_df = pd.DataFrame(rng.integers(0, 3, size=(m, n)).astype(np.float32), index=vids, columns=samples)
+    phenotype_df = pd.DataFrame(rng.normal(size=(2, n)).astype(np.float32), index=["gA", "gB"], columns=samples)
+    phenotype_pos_df = pd.DataFrame({"chr": "1", "start": [250, 450], "end": [250, 450]}, index=["gA", "gB"])
+    covariates_df = pd.DataFrame({"c1": rng.normal(size=n)}, index=samples)
+
+    loci = pd.DataFrame({"chromosome": "1", "physical_position": variant_df["pos"].values})
+    g_anc = pd.DataFrame({"sample_id": samples, "P0": 1.0, "P1": 0.0, "chrom": "1"})
+    admix = np.zeros((m, n, 2), dtype=np.int8)
+    admix[:, :, 0] = 2
+    panel = LocalAncestryPanel(from_legacy(loci, g_anc, admix))
+
+    common = dict(genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+                  phenotype_pos_df=phenotype_pos_df, covariates_df=covariates_df, device="cpu",
+                  nperm=None, out_dir=None, logger=SimpleLogger(verbose=False))
+    res_d = map_nominal(haplotypes=panel, ancestry_model="dosage", **common)
+    res_m = map_nominal(**common)
+    merged = res_d.merge(res_m, on=["phenotype_id", "variant_id"], suffixes=("_d", "_m"))
+    assert len(merged) == len(res_d) == 2 * m
+    np.testing.assert_allclose(merged["slope_anc0"], merged["slope_m"], rtol=1e-3, atol=1e-5)
+    # ancestry 1 carries no alleles: its column is the (regularised) zero
+    np.testing.assert_allclose(merged["slope_anc1"], 0.0, atol=1e-3)
+
+
+def test_dosage_model_posterior_panel_runs_and_differs_from_hard_calls(toy_panel_2anc_posterior):
+    d = toy_panel_2anc_posterior
+    res_post = map_nominal(haplotypes=d["panel_post"], ancestry_model="dosage", **_dosage_common(d))
+    res_hard = map_nominal(haplotypes=d["panel_hard"], ancestry_model="dosage", **_dosage_common(d))
+    assert len(res_post) == len(res_hard) > 0
+    assert np.isfinite(res_post["slope_anc0"]).any()
+    # soft posteriors change the design, so the estimates move
+    assert not np.allclose(res_post["slope_anc0"].to_numpy(), res_hard["slope_anc0"].to_numpy())
+
+
+def test_dosage_model_argument_validation(toy_panel_2anc, covariates_df):
+    from localqtl.cis.permutations import map_permutations
+
+    d = toy_panel_2anc
+    with pytest.raises(ValueError, match="requires haplotypes"):
+        map_nominal(ancestry_model="dosage", **_dosage_common(d))
+    with pytest.raises(ValueError, match="nperm"):
+        map_nominal(haplotypes=d["panel"], ancestry_model="dosage",
+                    **{**_dosage_common(d), "nperm": 5})
+    with pytest.raises(ValueError, match="interaction_covariate"):
+        map_nominal(haplotypes=d["panel"], ancestry_model="dosage", covariates_df=covariates_df,
+                    interaction_covariate=covariates_df.columns[0], **_dosage_common(d))
+    with pytest.raises(ValueError, match="Unknown ancestry_model"):
+        map_nominal(haplotypes=d["panel"], ancestry_model="bogus", **_dosage_common(d))
+    with pytest.raises(ValueError, match="only implemented for map_nominal"):
+        map_permutations(genotype_df=d["genotype_df"], variant_df=d["variant_df"],
+                         phenotype_df=d["phenotype_df"], phenotype_pos_df=d["phenotype_pos_df"],
+                         haplotypes=d["panel"], ancestry_model="dosage", device="cpu", nperm=4,
+                         logger=SimpleLogger(verbose=False))

@@ -67,3 +67,37 @@ def test_residualize_batch_supports_grouped_and_scalar_inputs():
         assert vec.shape == (3,)
         assert torch.allclose(vec.sum(), torch.tensor(0.0), atol=1e-6)
     assert torch.equal(G_group_resid, G_resid)
+
+
+def test_residualize_batch_handles_multiple_channels_per_sample():
+    """Each (variant, channel) column of H must be residualised across samples
+    independently; a flat reshape of (m, n, p) would mix samples and channels."""
+    import torch
+    from src.localqtl.regression_kernels import Residualizer
+    from src.localqtl.cis.common import (
+        residualize_batch, residualize_batch_interaction, residualize_batch_dosage,
+    )
+
+    torch.manual_seed(0)
+    m, n, p = 3, 12, 2
+    C = torch.randn(n, 2)
+    rez = Residualizer(C)
+    y = torch.randn(n)
+    G = torch.randn(m, n)
+    H = torch.rand(m, n, p) * 2
+    _, _, H_resid = residualize_batch(y, G, H, rez, center=True)
+    for v in range(m):
+        for k in range(p):
+            (ref,) = rez.transform(H[v, :, k].unsqueeze(0), center=True)
+            torch.testing.assert_close(H_resid[v, :, k], ref.squeeze(0), rtol=1e-5, atol=1e-5)
+
+    _, _, H_res2, I_resid = residualize_batch_interaction(y, G, H, rez, center=True)
+    torch.testing.assert_close(H_res2, H_resid, rtol=1e-5, atol=1e-5)
+    (ref_i,) = rez.transform((G[1] * H[1, :, 1]).unsqueeze(0), center=True)
+    torch.testing.assert_close(I_resid[1, :, 1], ref_i.squeeze(0), rtol=1e-5, atol=1e-5)
+
+    L = H / H.sum(dim=2, keepdim=True) * 2          # expected counts summing to 2
+    _, D_resid, L_resid = residualize_batch_dosage(y, G, L, rez, center=True)
+    assert D_resid.shape == (m, n, p) and L_resid.shape == (m, n, p - 1)
+    (ref_d,) = rez.transform((G[2] * L[2, :, 0] / 2).unsqueeze(0), center=True)
+    torch.testing.assert_close(D_resid[2, :, 0], ref_d.squeeze(0), rtol=1e-5, atol=1e-5)

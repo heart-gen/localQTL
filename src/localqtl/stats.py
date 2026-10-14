@@ -18,6 +18,7 @@ from .utils import SimpleLogger
 __all__ = [
     "beta_approx_pval",
     "get_t_pval",
+    "get_f_pval",
     "test_beta_difference",
     "t_two_sided_pval_torch",
     "nominal_pvals_tensorqtl",
@@ -37,6 +38,15 @@ def get_t_pval(t, df, two_tailed: bool = True, log10: bool = False):
     # Use log-survival to avoid underflow at large |t|
     log_sf = stats.t.logsf(np.abs(t), df)
     log_p  = log_sf + (0.0 if not two_tailed else np.log(2.0))
+    if log10:
+        return -log_p / np.log(10.0)
+    return np.minimum(np.exp(log_p), 1.0)
+
+
+def get_f_pval(f, dfn, dfd, log10: bool = False):
+    """Upper-tail p-value of an F statistic with ``(dfn, dfd)`` degrees of freedom."""
+    f = np.asarray(f, dtype=np.float64)
+    log_p = stats.f.logsf(f, dfn, dfd)
     if log10:
         return -log_p / np.log(10.0)
     return np.minimum(np.exp(log_p), 1.0)

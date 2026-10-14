@@ -19,6 +19,9 @@ Notes
   are numpy / torch slices of it.
 - A plain ``(loci, samples, ancestries)`` array plus ``loci_df`` is still
   accepted (legacy path, nearest-position join).
+- With ``use_posterior`` the panel serves posterior-expected ancestry counts
+  (``sum_h P(Z_h = k)``, float) instead of hard calls, for the
+  ``ancestry_model="dosage"`` scan (see ``localqtl.cis.nominal``).
 """
 import warnings
 import numpy as np
@@ -68,6 +71,13 @@ class LocalAncestryPanel:
     collapse_two_ancestries : bool, default True
         With exactly two ancestries keep only the first channel (the second
         is ``2 - first``, so both would be collinear with the intercept).
+    use_posterior : bool or "auto", default False
+        Serve posterior-expected ancestry counts
+        ``E[count_k] = sum_h P(Z_h = k)`` (float32, NaN = no call) instead of
+        hard diploid counts (int8, ``-1`` = no call).  Requires
+        ``ds.la.posterior`` (RFMix ``.fb.tsv`` opened with
+        ``keep_posteriors=True``, or a cache converted from it); ``"auto"``
+        uses posteriors when present and hard calls otherwise.
 
     Attributes
     ----------
@@ -78,6 +88,10 @@ class LocalAncestryPanel:
     channels : list[int]
         Ancestry indices exposed as haplotype channels.
     n_samples, n_pops, n_channels : int
+    has_posterior : bool
+        Whether the Dataset carries per-haplotype posteriors.
+    use_posterior : bool
+        Whether :meth:`chrom_counts` returns expected (float) counts.
     g_anc : pd.DataFrame
         Global ancestry per sample (and chromosome).
     shape : tuple
@@ -86,7 +100,8 @@ class LocalAncestryPanel:
 
     def __init__(self, ds, select_samples: Optional[Sequence[str]] = None,
                  exclude_chrs: Optional[Sequence[str]] = None,
-                 collapse_two_ancestries: bool = True):
+                 collapse_two_ancestries: bool = True,
+                 use_posterior: Union[bool, str] = False):
         import rfmix_reader.core  # noqa: F401  (registers ds.la)
         from rfmix_reader.formats.common import normalize_chrom_label
 
@@ -112,8 +127,21 @@ class LocalAncestryPanel:
         self.n_channels = len(self.channels)
         self.chromosomes: List[str] = ds.la.chromosomes
         self.g_anc = ds.la.global_ancestry
+        self.has_posterior: bool = ds.la.posterior is not None
+        if isinstance(use_posterior, str):
+            if use_posterior != "auto":
+                raise ValueError("use_posterior must be True, False or 'auto'.")
+            use_posterior = self.has_posterior
+        elif use_posterior and not self.has_posterior:
+            raise ValueError(
+                "use_posterior=True but the local ancestry Dataset has no posteriors; "
+                "open RFMix .fb output with keep_posteriors=True (and a cache_dir), or "
+                "use use_posterior='auto'.")
+        self.use_posterior: bool = bool(use_posterior)
         self._cache_chrom: Optional[str] = None
         self._cache: Optional[np.ndarray] = None
+        self._post_cache_chrom: Optional[str] = None
+        self._post_cache: Optional[np.ndarray] = None
         self._loci: Optional[pd.DataFrame] = None
         self._loci_df: Optional[pd.DataFrame] = None
 
@@ -160,20 +188,48 @@ class LocalAncestryPanel:
         return self._loci_df
 
     # -- per-chromosome access ---------------------------------------------
+    def _materialise_counts(self, ds) -> np.ndarray:
+        """Counts of ``ds`` restricted to :attr:`channels` (hard or expected)."""
+        if self.use_posterior:
+            post = np.asarray(ds.la.posterior.values, dtype=np.float32)   # (v, s, 2, A)
+            counts = post.sum(axis=2)                                      # (v, s, A)
+            nocall = (post.sum(axis=3) <= 0).any(axis=2)                   # a haplotype without mass
+            if nocall.any():
+                counts[nocall] = np.nan
+        else:
+            counts = np.asarray(ds.la.counts.values)
+        if self.channels != list(range(self.n_pops)):
+            counts = np.ascontiguousarray(counts[:, :, self.channels])
+        return counts
+
     def chrom_counts(self, chrom: str) -> np.ndarray:
         """
-        ``(variants_on_chrom, samples, channels)`` int8 diploid ancestry counts
-        (``-1`` = no call), materialised once and cached until another
-        chromosome is requested.
+        ``(variants_on_chrom, samples, channels)`` diploid ancestry counts,
+        materialised once and cached until another chromosome is requested:
+        int8 hard calls (``-1`` = no call) or, with ``use_posterior``,
+        float32 posterior-expected counts (NaN = no call).
         """
         key = str(chrom)
         if self._cache_chrom != key:
-            sub = self.ds.la.sel_chrom(key)
-            counts = np.asarray(sub.la.counts.values)
-            if self.channels != list(range(self.n_pops)):
-                counts = np.ascontiguousarray(counts[:, :, self.channels])
+            counts = self._materialise_counts(self.ds.la.sel_chrom(key))
             self._cache_chrom, self._cache = key, counts
         return self._cache
+
+    def chrom_posterior(self, chrom: str) -> np.ndarray:
+        """
+        ``(variants_on_chrom, samples, 2, n_pops)`` float32 per-haplotype
+        ancestry posteriors for one chromosome (all ancestries, regardless of
+        :attr:`channels`), cached like :meth:`chrom_counts`.  Raises
+        ``ValueError`` when the Dataset has no posteriors.
+        """
+        if not self.has_posterior:
+            raise ValueError("The local ancestry Dataset has no posteriors.")
+        key = str(chrom)
+        if self._post_cache_chrom != key:
+            sub = self.ds.la.sel_chrom(key)
+            self._post_cache_chrom = key
+            self._post_cache = np.asarray(sub.la.posterior.values, dtype=np.float32)
+        return self._post_cache
 
     def locus_index(self, chrom: str, positions, method: str = "stepwise",
                     tolerance: Optional[int] = None) -> np.ndarray:
@@ -186,14 +242,12 @@ class LocalAncestryPanel:
 
     def load_haplotypes(self) -> np.ndarray:
         """
-        Whole-genome ``(variants, samples, channels)`` int8 array (``-1`` = no
-        call).  Convenient for small data; per-chromosome access through the
-        generator is the intended path for large cohorts.
+        Whole-genome ``(variants, samples, channels)`` array: int8 hard counts
+        (``-1`` = no call) or float32 expected counts (NaN) with
+        ``use_posterior``.  Convenient for small data; per-chromosome access
+        through the generator is the intended path for large cohorts.
         """
-        counts = np.asarray(self.ds.la.counts.values)
-        if self.channels != list(range(self.n_pops)):
-            counts = np.ascontiguousarray(counts[:, :, self.channels])
-        return counts
+        return self._materialise_counts(self.ds)
 
 
 class RFMixReader(LocalAncestryPanel):
@@ -207,28 +261,39 @@ class RFMixReader(LocalAncestryPanel):
     select_samples, exclude_chrs, collapse_two_ancestries
         See :class:`LocalAncestryPanel`.
     source : {"msp", "fb"}
-        ``msp`` (segment hard calls, recommended for QTL mapping) or ``fb``.
+        ``msp`` (segment hard calls, recommended for QTL mapping) or ``fb``
+        (per-haplotype posteriors; hard calls are the per-haplotype argmax).
     cache_dir : str, optional
         rfmix_reader Zarr cache (parsed once, reopened instantly afterwards).
     chrom : str, optional
         Restrict to one chromosome.
+    keep_posteriors : bool, default False
+        With ``source="fb"`` keep the forward-backward posteriors in the cache
+        (``cache_dir`` is then required by rfmix-reader) so the panel can
+        serve posterior-expected counts.
+    use_posterior : bool or "auto", default False
+        See :class:`LocalAncestryPanel`.
     verbose : bool
     """
 
     def __init__(self, prefix_path: str, select_samples: Optional[Sequence[str]] = None,
                  exclude_chrs: Optional[Sequence[str]] = None, *, source: str = "msp",
                  cache_dir: Optional[str] = None, chrom: Optional[str] = None,
-                 collapse_two_ancestries: bool = True, verbose: bool = True,
+                 collapse_two_ancestries: bool = True, keep_posteriors: bool = False,
+                 use_posterior: Union[bool, str] = False, verbose: bool = True,
                  binary_path: Optional[str] = None, **open_kwargs):
         from rfmix_reader import open_rfmix
 
         if binary_path is not None:
-            warnings.warn("binary_path is ignored: rfmix-reader >= 0.6 uses a Zarr cache "
+            warnings.warn("binary_path is ignored: rfmix-reader >= 0.7 uses a Zarr cache "
                           "(cache_dir=...) instead of .bin files.", DeprecationWarning, stacklevel=2)
+        if keep_posteriors and source != "fb":
+            raise ValueError("keep_posteriors=True requires source='fb' (RFMix .fb.tsv output).")
         ds = open_rfmix(prefix_path, source=source, chrom=chrom, cache_dir=cache_dir,
-                        verbose=verbose, **open_kwargs)
+                        keep_posteriors=keep_posteriors, verbose=verbose, **open_kwargs)
         super().__init__(ds, select_samples=select_samples, exclude_chrs=exclude_chrs,
-                         collapse_two_ancestries=collapse_two_ancestries)
+                         collapse_two_ancestries=collapse_two_ancestries,
+                         use_posterior=use_posterior)
 
 
 class FlareReader(LocalAncestryPanel):
@@ -237,24 +302,32 @@ class FlareReader(LocalAncestryPanel):
     def __init__(self, prefix_path: str, select_samples: Optional[Sequence[str]] = None,
                  exclude_chrs: Optional[Sequence[str]] = None, *,
                  cache_dir: Optional[str] = None, chrom: Optional[str] = None,
-                 collapse_two_ancestries: bool = True, verbose: bool = True, **open_kwargs):
+                 collapse_two_ancestries: bool = True, use_posterior: Union[bool, str] = False,
+                 verbose: bool = True, **open_kwargs):
         from rfmix_reader import open_flare
 
         open_kwargs.pop("chunk_size", None)      # legacy argument
         ds = open_flare(prefix_path, chrom=chrom, cache_dir=cache_dir, verbose=verbose, **open_kwargs)
         super().__init__(ds, select_samples=select_samples, exclude_chrs=exclude_chrs,
-                         collapse_two_ancestries=collapse_two_ancestries)
+                         collapse_two_ancestries=collapse_two_ancestries,
+                         use_posterior=use_posterior)
 
 
 def open_panel(cache_dir: str, select_samples: Optional[Sequence[str]] = None,
                exclude_chrs: Optional[Sequence[str]] = None, *, chrom: Optional[str] = None,
-               collapse_two_ancestries: bool = True) -> LocalAncestryPanel:
-    """Panel from an existing rfmix_reader Zarr cache (``rfmix-reader convert ...``)."""
+               collapse_two_ancestries: bool = True,
+               use_posterior: Union[bool, str] = False) -> LocalAncestryPanel:
+    """
+    Panel from an existing rfmix_reader Zarr cache (``rfmix-reader convert ...``).
+    A cache converted from ``.fb.tsv`` with ``keep_posteriors`` reopens with its
+    posteriors, so ``use_posterior=True`` / ``"auto"`` works here too.
+    """
     from rfmix_reader import open_local_ancestry
 
     ds = open_local_ancestry(cache_dir, chrom=chrom)
     return LocalAncestryPanel(ds, select_samples=select_samples, exclude_chrs=exclude_chrs,
-                              collapse_two_ancestries=collapse_two_ancestries)
+                              collapse_two_ancestries=collapse_two_ancestries,
+                              use_posterior=use_posterior)
 
 
 def _is_panel(obj) -> bool:
@@ -264,13 +337,15 @@ def _is_panel(obj) -> bool:
 
 def _fill_missing_along_loci(counts: np.ndarray) -> np.ndarray:
     """
-    Chromosome-wide imputation of missing calls (``-1``) by rounded linear
-    interpolation along the loci axis, per (sample, channel) column; columns
-    without any call stay ``-1``.  Same rule as ``_interpolate_block`` but
-    applied once per chromosome, so windows never see a NaN that has a
-    neighbour anywhere on the chromosome.
+    Chromosome-wide imputation of missing calls by linear interpolation along
+    the loci axis, per (sample, channel) column; columns without any call stay
+    missing.  Integer counts (``-1`` = missing) are rounded back to integers;
+    float expected counts (NaN = missing) are kept fractional.  Same rule as
+    ``_interpolate_block`` but applied once per chromosome, so windows never
+    see a missing value that has a neighbour anywhere on the chromosome.
     """
-    missing = counts < 0
+    is_float = counts.dtype.kind == "f"
+    missing = np.isnan(counts) if is_float else counts < 0
     if not missing.any():
         return counts
     out = counts.copy()
@@ -282,7 +357,8 @@ def _fill_missing_along_loci(counts: np.ndarray) -> np.ndarray:
         m = miss[:, j]
         valid = ~m
         if valid.any():
-            flat[m, j] = np.rint(np.interp(idx[m], idx[valid], flat[valid, j].astype(float))).astype(counts.dtype)
+            vals = np.interp(idx[m], idx[valid], flat[valid, j].astype(float))
+            flat[m, j] = (vals if is_float else np.rint(vals)).astype(counts.dtype)
     return out
 
 
@@ -334,6 +410,9 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
             self._hap_torch_device = torch.device(torch_device)
 
         self._panel: Optional[LocalAncestryPanel] = haplotypes if _is_panel(haplotypes) else None
+        # Expected (posterior) counts are fractional: never round imputed values.
+        self._round_imputed: bool = not (self._panel is not None
+                                         and getattr(self._panel, "use_posterior", False))
         if self._panel is not None:
             self._init_panel_mode(locus_method)
         else:
@@ -395,7 +474,7 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
             H_block = torch.index_select(self._hap_torch_cache, 0, index).to(dtype=torch.float32)
             H_block = torch.where(H_block < 0, torch.nan, H_block)
             if self.on_the_fly_impute and torch.isnan(H_block).any():
-                H_np = self._interpolate_block(H_block.detach().cpu().numpy())
+                H_np = self._interpolate_block(H_block.detach().cpu().numpy(), self._round_imputed)
                 H_block = torch.as_tensor(H_np, dtype=torch.float32, device=self._hap_torch_cache.device).contiguous()
             if self.on_the_fly_impute and torch.isnan(H_block).any():
                 raise ValueError("Detected NaNs in haplotype block after filtering.")
@@ -403,7 +482,7 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
         H_block = self._chrom_np[hap_idx].astype(np.float32)
         H_block[H_block < 0] = np.nan
         if self.on_the_fly_impute and np.isnan(H_block).any():
-            H_block = self._interpolate_block(H_block)
+            H_block = self._interpolate_block(H_block, self._round_imputed)
         if self.on_the_fly_impute and np.isnan(H_block).any():
             raise ValueError("Detected NaNs in haplotype block after filtering.")
         return H_block
@@ -528,12 +607,14 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
         return geno2hap, vmask, dropped_n
 
     @staticmethod
-    def _interpolate_block(block):
+    def _interpolate_block(block, round_values: bool = True):
         """
         Interpolate missing values in a 3D haplotype block: (loci, samples, ancestries).
 
         Performs linear interpolation along the loci axis (axis=0) for each (sample, ancestry)
-        pair independently. Supports NumPy or CuPy arrays via arr_mod.
+        pair independently. Supports NumPy or CuPy arrays via arr_mod.  Imputed
+        values are rounded to integer counts unless ``round_values=False``
+        (posterior-expected counts).
         """
         # Determine array module
         mod = _get_array_module(block)
@@ -552,7 +633,8 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
                 if mod.any(valid):
                     # Linear interpolation and rounding
                     interpolated = mod.interp(idx[mask], idx[valid], col[valid])
-                    block_imputed[mask, s] = mod.round(interpolated).astype(int)
+                    block_imputed[mask, s] = (mod.round(interpolated).astype(int)
+                                              if round_values else interpolated)
 
         return block_imputed.reshape(loci_dim, sample_dim, ancestry_dim).astype(np.float32, copy=False)
 
@@ -571,7 +653,7 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
             if H_block.dtype != torch.float32:
                 H_block = H_block.to(dtype=torch.float32)
             if self.on_the_fly_impute and torch.isnan(H_block).any():
-                H_np = self._interpolate_block(H_block.detach().cpu().numpy())
+                H_np = self._interpolate_block(H_block.detach().cpu().numpy(), self._round_imputed)
                 H_block = torch.as_tensor(H_np, dtype=torch.float32, device=self._hap_torch_cache.device).contiguous()
             if self.on_the_fly_impute and torch.isnan(H_block).any():
                 raise ValueError("Detected NaNs in haplotype block after filtering.")
@@ -583,7 +665,7 @@ class InputGeneratorCisWithHaps(InputGeneratorCis):
             H_block = H_block.get()
         H_block = np.asarray(H_block, dtype=np.float32)
         if self.on_the_fly_impute and np.isnan(H_block).any():
-            H_block = self._interpolate_block(H_block)
+            H_block = self._interpolate_block(H_block, self._round_imputed)
         if self.on_the_fly_impute and np.isnan(H_block).any():
             raise ValueError("Detected NaNs in haplotype block after filtering.")
         return H_block

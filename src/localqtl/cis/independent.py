@@ -1658,6 +1658,8 @@ def map_independent(
               else (device if device in ("cuda", "cpu") else "cpu"))
     torch_device = torch.device(device)
     logger = logger or SimpleLogger(verbose=verbose, timestamps=True)
+    if ancestry_model == "dosage":
+        raise ValueError("ancestry_model='dosage' is currently only implemented for map_nominal.")
     sync = (torch.cuda.synchronize if device == "cuda" else None)
 
     if not phenotype_df.index.equals(phenotype_pos_df.index):

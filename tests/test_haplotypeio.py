@@ -317,3 +317,94 @@ def test_preload_to_torch_returns_tensor_blocks(toy_hap_data_2anc):
     empty = gen._empty_h_block()
     assert isinstance(empty, torch.Tensor)
     assert empty.device.type == "cpu"
+
+
+##################################
+# Posterior-expected counts
+##################################
+
+def _posterior_dataset(n_samples=4, seed=0):
+    """Two-ancestry Dataset on chr1/chr2 with per-haplotype posteriors (one no-call)."""
+    from rfmix_reader import build_dataset
+
+    rng = np.random.default_rng(seed)
+    codes = rng.integers(0, 2, size=(3, n_samples, 2)).astype(np.int8)
+    conf = rng.uniform(0.55, 0.95, size=codes.shape).astype(np.float32)
+    post = np.zeros(codes.shape + (2,), dtype=np.float32)
+    for a in range(2):
+        post[..., a] = np.where(codes == a, conf, 1.0 - conf)
+    post[1, 0, 1, :] = 0.0          # locus 2, sample 1, haplotype 2: no mass
+    codes[1, 0, 1] = -1
+    ds = build_dataset(["1", "1", "2"], [100, 200, 300], None, codes,
+                       sample_id=[f"s{i + 1}" for i in range(n_samples)], ancestry=["EUR", "AFR"],
+                       posterior=post)
+    return ds, codes, post
+
+
+def test_panel_posterior_expected_counts():
+    ds, codes, post = _posterior_dataset()
+    panel = hio.LocalAncestryPanel(ds, use_posterior=True, collapse_two_ancestries=False)
+    assert panel.has_posterior and panel.use_posterior and panel.n_channels == 2
+
+    exp = post.sum(axis=2)                                    # (v, s, A)
+    c1 = panel.chrom_counts("1")
+    assert c1.dtype == np.float32 and c1.shape == (2, 4, 2)
+    np.testing.assert_allclose(c1[0], exp[0], rtol=1e-6)
+    assert np.isnan(c1[1, 0]).all()                           # no-call haplotype -> NaN row
+    np.testing.assert_allclose(c1[1, 1:], exp[1, 1:], rtol=1e-6)
+    np.testing.assert_allclose(panel.chrom_counts("chr2")[0], exp[2], rtol=1e-6)
+    # expected counts sum to 2 per sample where called, and the collapsed channel is the first
+    np.testing.assert_allclose(np.nansum(c1[0], axis=-1), 2.0, rtol=1e-6)
+    collapsed = hio.LocalAncestryPanel(ds, use_posterior=True)
+    np.testing.assert_allclose(collapsed.chrom_counts("1")[0, :, 0], exp[0, :, 0], rtol=1e-6)
+    assert collapsed.load_haplotypes().shape == (3, 4, 1)
+    # per-haplotype posteriors are served unchanged
+    np.testing.assert_array_equal(panel.chrom_posterior("1"), post[:2])
+
+    # hard-call mode on the same Dataset is unchanged (int8, argmax codes)
+    hard = hio.LocalAncestryPanel(ds, collapse_two_ancestries=False)
+    h1 = hard.chrom_counts("1")
+    assert h1.dtype == np.int8 and (h1[1, 0] == -1).all()
+    assert (h1[0, :, 0] == (codes[0] == 0).sum(axis=-1)).all()
+
+
+def test_panel_use_posterior_modes():
+    ds, _, _ = _posterior_dataset()
+    assert hio.LocalAncestryPanel(ds, use_posterior="auto").use_posterior
+    ds_hard = ds.drop_vars("posterior")
+    auto = hio.LocalAncestryPanel(ds_hard, use_posterior="auto")
+    assert not auto.use_posterior and not auto.has_posterior
+    with pytest.raises(ValueError, match="no posteriors"):
+        hio.LocalAncestryPanel(ds_hard, use_posterior=True)
+    with pytest.raises(ValueError):
+        auto.chrom_posterior("1")
+    with pytest.raises(ValueError, match="use_posterior"):
+        hio.LocalAncestryPanel(ds, use_posterior="sometimes")
+
+
+def test_fill_missing_along_loci_float_and_int():
+    ints = np.array([[[0], [2]], [[-1], [-1]], [[2], [2]]], dtype=np.int8)
+    out = hio._fill_missing_along_loci(ints)
+    assert out.dtype == np.int8 and out[1, 0, 0] == 1 and out[1, 1, 0] == 2
+    floats = np.array([[[0.2], [1.5]], [[np.nan], [np.nan]], [[1.0], [1.5]]], dtype=np.float32)
+    outf = hio._fill_missing_along_loci(floats)
+    assert outf.dtype == np.float32
+    np.testing.assert_allclose(outf[1, :, 0], [0.6, 1.5], rtol=1e-6)   # fractional, not rounded
+    # a column with no call anywhere stays missing
+    allnan = np.full((3, 1, 1), np.nan, dtype=np.float32)
+    assert np.isnan(hio._fill_missing_along_loci(allnan)).all()
+
+
+def test_generator_posterior_panel_serves_fractional_blocks(toy_panel_2anc_posterior):
+    d = toy_panel_2anc_posterior
+    gen = InputGeneratorCisWithHaps(
+        genotype_df=d["genotype_df"], variant_df=d["variant_df"],
+        phenotype_df=d["phenotype_df"], phenotype_pos_df=d["phenotype_pos_df"],
+        window=1_000_000, haplotypes=d["panel_post"],
+    )
+    assert gen._round_imputed is False
+    exp = d["posterior"].sum(axis=2)[:, :, 0]                   # expected count, channel 0
+    for p, G, v_idx, H, pid in gen.generate_data():
+        assert H.dtype == np.float32 and H.shape == (len(v_idx), 4, 1)
+        np.testing.assert_allclose(H[:, :, 0], exp[v_idx], rtol=1e-6)
+        assert not np.allclose(H, np.rint(H))                    # genuinely fractional

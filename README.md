@@ -94,6 +94,42 @@ results = map_nominal(
 print(results.head())
 ```
 
+### Ancestry-specific dosage model (posterior-aware)
+
+Hard local-ancestry calls discard the uncertainty of the assignment (a
+haplotype with P(AFR) = 0.65, P(EUR) = 0.35 is simply "AFR"). With
+`ancestry_model="dosage"`, `map_nominal` instead estimates one regulatory
+effect per ancestry from the expected ancestry-specific alternate-allele
+dosage. For sample *i* with alternate-allele dosage `G_i` and expected
+ancestry counts `L_ik = sum_h P(Z_ih = k)` (hard calls give 0/1/2):
+
+```
+D_ik = G_i * L_ik / 2                      (sum_k D_ik = G_i; phase unknown)
+y_i  = sum_k beta_k D_ik + sum_{k<K} gamma_k L_ik + covariates + e_i
+```
+
+The `L` columns adjust for local-ancestry main effects. Output columns per
+ancestry are `slope_anc{k}`, `slope_se_anc{k}`, `tstat_anc{k}`,
+`pval_anc{k}`; `fstat_joint` / `pval_joint` test all `beta_k = 0` jointly;
+`z_diff_anc{i}_anc{j}` / `pval_diff_anc{i}_anc{j}` test `beta_i = beta_j`
+using the full covariance of the ancestry betas. The standard `slope`,
+`slope_se`, `tstat`, `pval_nominal` columns carry the ancestry with the
+strongest effect.
+
+```python
+panel = RFMixReader("data/rfmix/", source="fb", keep_posteriors=True,
+                    cache_dir="data/rfmix/la_cache_fb/", use_posterior=True,
+                    select_samples=list(genotype_df.columns))
+dosage_df = mapper.map_nominal(ancestry_model="dosage")   # mapper built with haplotypes=panel
+```
+
+With a hard-call panel (`.msp.tsv`) the same model reduces to the classic
+ancestry-specific genotype regression. Note that substituting posterior
+expectations for the unknown haplotype ancestries does not propagate that
+uncertainty into the standard errors; joint-likelihood or multiple-imputation
+estimation is future work. `ancestry_model="dosage"` is currently available
+for `map_nominal` only (no permutations, no `interaction_covariate`).
+
 ### Covariate interaction scans
 
 `map_nominal`, `map_permutations`, `map_independent`, and `CisMapper` also
@@ -183,6 +219,12 @@ panel = RFMixReader(
 
 # For two ancestries the panel exposes one channel (the other is 2 - first);
 # panel.ancestries, panel.chromosomes, panel.g_anc (global ancestry) are available.
+
+# Keep RFMix's forward-backward posteriors (.fb.tsv) to serve posterior-expected
+# ancestry counts  E[count_k] = sum_h P(Z_h = k)  instead of hard calls:
+# panel = RFMixReader("data/rfmix/", source="fb", keep_posteriors=True,
+#                     cache_dir="data/rfmix/la_cache_fb/", use_posterior=True,
+#                     select_samples=list(genotype_df.columns))
 
 # Ancestry-aware mapping
 mapper = CisMapper(

@@ -165,13 +165,18 @@ def get_significant_pairs(res_df: pd.DataFrame,
 def annotate_ancestry_difference(
     nominal_df: pd.DataFrame,
     n_ancestries: int = 2,
+    prefix: str = "gxh",
 ) -> pd.DataFrame:
     """
     Add columns testing H0: beta_anc_i = beta_anc_j for all ancestry pairs.
 
-    Expects columns ``slope_gxh_anc{k}`` and ``slope_se_gxh_anc{k}`` for
-    k in 0..n_ancestries-1 (produced by ``map_nominal`` with
-    ``ancestry_model='interaction'``).
+    Expects columns ``slope_{prefix}_anc{k}`` and ``slope_se_{prefix}_anc{k}``
+    for k in 0..n_ancestries-1 (``prefix="gxh"``: ``map_nominal`` with
+    ``ancestry_model='interaction'``).  The ``ancestry_model='dosage'`` scan
+    writes ``slope_anc{k}`` (use ``prefix=""``) but already reports
+    ``z_diff_anc{i}_anc{j}`` / ``pval_diff_anc{i}_anc{j}`` computed from the
+    full covariance of the ancestry betas, which should be preferred: this
+    helper assumes the two estimates are uncorrelated.
 
     New columns per pair (i, j):
       - ``beta_diff_anc{i}_anc{j}``
@@ -186,6 +191,8 @@ def annotate_ancestry_difference(
     n_ancestries : int
         Number of ancestry channels (K). Only K-1 columns are expected to be
         non-NaN (the last ancestry is dropped for identifiability).
+    prefix : str
+        Column infix between ``slope_`` and ``_anc{k}`` (``""`` for none).
 
     Returns
     -------
@@ -198,10 +205,11 @@ def annotate_ancestry_difference(
     df = nominal_df.copy()
     for i in range(n_ancestries):
         for j in range(i + 1, n_ancestries):
-            col_b_i = f"slope_gxh_anc{i}"
-            col_se_i = f"slope_se_gxh_anc{i}"
-            col_b_j = f"slope_gxh_anc{j}"
-            col_se_j = f"slope_se_gxh_anc{j}"
+            infix = f"_{prefix}" if prefix else ""
+            col_b_i = f"slope{infix}_anc{i}"
+            col_se_i = f"slope_se{infix}_anc{i}"
+            col_b_j = f"slope{infix}_anc{j}"
+            col_se_j = f"slope_se{infix}_anc{j}"
 
             if not all(c in df.columns for c in (col_b_i, col_se_i, col_b_j, col_se_j)):
                 continue

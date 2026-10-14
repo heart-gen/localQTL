@@ -120,14 +120,14 @@ def residualize_batch(
     if H is not None:
         m, n, pH = H.shape
         H_shape = (m, n, pH)
-        mats.append(H.reshape(m * pH, n))
+        mats.append(_stack_channels(H))
 
     mats_resid = rez.transform(*mats, Y, center=center)
 
     G_resid = mats_resid[0]
     idx, H_resid = 1, None
     if H is not None:
-        H_resid = mats_resid[idx].reshape(H_shape)
+        H_resid = _unstack_channels(mats_resid[idx], *H_shape)
         idx += 1
     Y_resid = mats_resid[idx]
 
@@ -135,6 +135,100 @@ def residualize_batch(
         return [Y_resid[i, :] for i in range(Y_resid.shape[0])], G_resid, H_resid
     else:
         return Y_resid.squeeze(0), G_resid, H_resid
+
+
+def _stack_channels(M: torch.Tensor) -> torch.Tensor:
+    """``(m, n, p)`` -> ``(m * p, n)`` with one (variant, channel) row per line."""
+    m, n, p = M.shape
+    return M.permute(0, 2, 1).reshape(m * p, n)
+
+
+def _unstack_channels(M2: torch.Tensor, m: int, n: int, p: int) -> torch.Tensor:
+    """Inverse of :func:`_stack_channels`: ``(m * p, n)`` -> ``(m, n, p)``."""
+    return M2.reshape(m, p, n).permute(0, 2, 1).contiguous()
+
+
+def ancestry_dosage_design(G: torch.Tensor, H: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build the ancestry-specific dosage design from a genotype block and the
+    generator's (expected) ancestry counts.
+
+    ``H`` is ``(m, n, 1)`` for the collapsed two-ancestry panel (the second
+    channel is ``2 - first``) or ``(m, n, K)`` with every ancestry.  With the
+    phase unknown, the expected alternate-allele dosage carried on ancestry-k
+    haplotypes is ``D_k = G * L_k / 2`` (so ``sum_k D_k = G``).
+
+    Returns ``(D, L_adj)``: ``D`` is ``(m, n, K)`` and ``L_adj`` holds the
+    first ``K - 1`` expected-count columns (local-ancestry main effects; the
+    K-th is collinear with the centred intercept).
+    """
+    if H.dim() != 3:
+        raise ValueError("H must be (variants, samples, channels).")
+    L = torch.cat([H, 2.0 - H], dim=2) if H.shape[2] == 1 else H
+    D = G.unsqueeze(-1) * L * 0.5
+    return D, L[:, :, :-1]
+
+
+def residualize_batch_dosage(
+        y, G: torch.Tensor, H: torch.Tensor,
+        rez: Optional[Residualizer], center: bool = True, group: bool = False,
+) -> Tuple[object, torch.Tensor, torch.Tensor]:
+    """
+    Residualize y and the ancestry-specific dosage design (``D``, ``L_adj``
+    from :func:`ancestry_dosage_design`) with the same Residualizer.
+    Returns ``(y_resid, D_resid, L_resid)``; ``y_resid`` is a list in group mode.
+    """
+    if H is None:
+        raise ValueError("H (local ancestry counts) is required for the dosage model.")
+
+    if rez is not None and hasattr(rez, "Q_t") and getattr(rez.Q_t, "numel", lambda: 0)() > 0:
+        dev = resolve_device(rez.Q_t.device)
+    else:
+        dev = resolve_device(G.device)
+    G = move_to_device(G, dev)
+    H = move_to_device(H, dev)
+    D, L = ancestry_dosage_design(G, H)
+
+    if rez is None:
+        if group:
+            if isinstance(y, (list, tuple)):
+                y_list = [torch.as_tensor(yi) if not torch.is_tensor(yi) else yi for yi in y]
+            else:
+                Y = y if torch.is_tensor(y) else torch.as_tensor(y)
+                y_list = [Y] if Y.ndim == 1 else [Y[i, :] for i in range(Y.shape[0])]
+            return y_list, D, L
+        return (y if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32)), D, L
+
+    if group:
+        if isinstance(y, (list, tuple)):
+            Y = torch.stack([_coerce_tensor(yi, dev) for yi in y], dim=0)
+        else:
+            Y = _coerce_tensor(y, dev)
+            if Y.ndim == 1:
+                Y = Y.unsqueeze(0)
+    else:
+        Y = _coerce_tensor(y, dev)
+        if Y.ndim == 1:
+            Y = Y.unsqueeze(0)
+
+    m, n, K = D.shape
+    q = int(L.shape[2])
+    mats: List[torch.Tensor] = [_stack_channels(D)]
+    if q:
+        mats.append(_stack_channels(L))
+    mats_resid = rez.transform(*mats, Y, center=center)
+    D_resid = _unstack_channels(mats_resid[0], m, n, K)
+    idx = 1
+    if q:
+        L_resid = _unstack_channels(mats_resid[idx], m, n, q)
+        idx += 1
+    else:
+        L_resid = L
+    Y_resid = mats_resid[idx]
+
+    if group:
+        return [Y_resid[i, :] for i in range(Y_resid.shape[0])], D_resid, L_resid
+    return Y_resid.squeeze(0), D_resid, L_resid
 
 
 def residualize_batch_interaction(
@@ -185,17 +279,15 @@ def residualize_batch_interaction(
     I = G.unsqueeze(-1) * H  # (m, n, pH)
 
     mats: List[torch.Tensor] = [G]
-    H_shape = (m, n, pH)
-    I_shape = (m, n, pH)
-    mats.append(H.reshape(m * pH, n))
-    mats.append(I.reshape(m * pH, n))
+    mats.append(_stack_channels(H))
+    mats.append(_stack_channels(I))
 
     mats_resid = rez.transform(*mats, Y, center=center)
     G_resid = mats_resid[0]
     idx = 1
-    H_resid = mats_resid[idx].reshape(H_shape)
+    H_resid = _unstack_channels(mats_resid[idx], m, n, pH)
     idx += 1
-    I_resid = mats_resid[idx].reshape(I_shape)
+    I_resid = _unstack_channels(mats_resid[idx], m, n, pH)
     idx += 1
     Y_resid = mats_resid[idx]
 

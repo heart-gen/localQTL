@@ -252,3 +252,28 @@ def toy_panel_2anc(toy_data):
     codes = rng.integers(0, 2, size=(len(loci), len(samples), 2))
     admix = np.stack([(codes == a).sum(axis=-1) for a in range(2)], axis=-1).astype(np.int8)
     return {**toy_data, "panel": LocalAncestryPanel(from_legacy(loci, g_anc, admix)), "admix": admix}
+
+
+@pytest.fixture
+def toy_panel_2anc_posterior(toy_panel_2anc):
+    """
+    ``toy_panel_2anc`` with soft per-haplotype posteriors: the called ancestry
+    gets mass 0.6-0.95, the other the remainder, so the hard calls (argmax)
+    are unchanged but the expected counts are fractional.
+    """
+    from rfmix_reader import build_dataset
+    from localqtl.haplotypeio import LocalAncestryPanel
+
+    ds = toy_panel_2anc["panel"].ds
+    codes = np.asarray(ds.la.haplotypes.values)                     # (v, s, 2)
+    rng = np.random.default_rng(11)
+    conf = rng.uniform(0.6, 0.95, size=codes.shape).astype(np.float32)
+    post = np.zeros(codes.shape + (2,), dtype=np.float32)          # (v, s, 2, A)
+    for a in range(2):
+        post[..., a] = np.where(codes == a, conf, 1.0 - conf)
+    ds_post = build_dataset(
+        ds.chromosome.values, ds.variant_position.values, ds.segment_end.values, codes,
+        sample_id=ds.la.samples, ancestry=ds.la.ancestries, posterior=post,
+    )
+    return {**toy_panel_2anc, "panel_post": LocalAncestryPanel(ds_post, use_posterior=True),
+            "panel_hard": LocalAncestryPanel(ds_post), "posterior": post}

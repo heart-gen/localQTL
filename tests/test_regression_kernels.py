@@ -127,3 +127,59 @@ class TestRunBatchRegression:
         betas, ses, tstats = run_batch_regression(y, G, H, device="cpu")
         assert betas.shape == (m, 1 + pH)
         assert tstats.shape == (m, 1 + pH)
+
+
+from src.localqtl.regression_kernels import run_batch_dosage_regression
+
+
+def _ols_dosage_numpy(y, D, L):
+    """Reference OLS for y ~ D_1..D_K + L_1..L_q (no intercept, matching the kernel)."""
+    X = np.column_stack([D, L]) if L is not None and L.shape[1] else D
+    K = D.shape[1]
+    XtX_inv = np.linalg.inv(X.T @ X)
+    betas = XtX_inv @ X.T @ y
+    resid = y - X @ betas
+    dof = len(y) - X.shape[1]
+    sigma2 = resid @ resid / dof
+    cov = XtX_inv * sigma2
+    ses = np.sqrt(np.diag(cov))
+    b = betas[:K]
+    f = b @ np.linalg.solve(cov[:K, :K], b) / K
+    return b, ses[:K], b / ses[:K], cov[:K, :K], f, dof
+
+
+class TestRunBatchDosageRegression:
+    @pytest.mark.parametrize("K", [2, 3])
+    def test_matches_numpy_ols(self, K):
+        torch.manual_seed(0)
+        m, n = 4, 40
+        G = torch.randint(0, 3, (m, n)).float()
+        L = torch.distributions.Dirichlet(torch.ones(K)).sample((m, n)) * 2.0   # expected counts, sum 2
+        D = G.unsqueeze(-1) * L / 2.0
+        L_adj = L[:, :, :-1]
+        beta = torch.linspace(0.2, 1.0, K)
+        y = (D[1] @ beta) + 0.3 * torch.randn(n)
+        res = run_batch_dosage_regression(y, D, L_adj, k_eff=0, device="cpu")
+        assert res["betas"].shape == (m, K) and res["cov"].shape == (m, K, K)
+        assert res["fstat"].shape == (m,) and res["dof"] == n - (2 * K - 1)
+        for v in range(m):
+            b, se, t, cov, f, dof = _ols_dosage_numpy(
+                y.numpy().astype(np.float64), D[v].numpy().astype(np.float64),
+                L_adj[v].numpy().astype(np.float64))
+            np.testing.assert_allclose(res["betas"][v].numpy(), b, rtol=1e-3, atol=1e-4)
+            np.testing.assert_allclose(res["ses"][v].numpy(), se, rtol=1e-3, atol=1e-4)
+            np.testing.assert_allclose(res["cov"][v].numpy(), cov, rtol=2e-3, atol=1e-5)
+            np.testing.assert_allclose(res["fstat"][v].item(), f, rtol=2e-3)
+        # the simulated variant recovers its ancestry-specific effects
+        np.testing.assert_allclose(res["betas"][1].numpy(), beta.numpy(), atol=0.25)
+
+    def test_without_local_ancestry_columns_and_k_eff(self):
+        torch.manual_seed(1)
+        m, n, K = 3, 25, 2
+        D = torch.rand(m, n, K)
+        y = torch.randn(n)
+        res = run_batch_dosage_regression(y, D, None, k_eff=3, device="cpu")
+        assert res["dof"] == n - 3 - K
+        b, se, *_ = _ols_dosage_numpy(y.numpy().astype(np.float64), D[0].numpy().astype(np.float64), None)
+        np.testing.assert_allclose(res["betas"][0].numpy(), b, rtol=1e-3, atol=1e-4)
+        assert (res["ses"] > 0).all()

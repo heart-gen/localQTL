@@ -230,6 +230,65 @@ The panel is passed as ``haplotypes`` to ``CisMapper`` / ``map_nominal``; the
 generator keeps one chromosome in memory at a time.  With two ancestries a
 single channel is exposed (the second is ``2 - first``).
 
+Posterior-expected ancestry counts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+RFMix's forward-backward posteriors (``.fb.tsv``) can be kept in the cache and
+served as expected ancestry counts ``E[count_k] = sum_h P(Z_h = k)`` (float32,
+NaN = no call) instead of hard calls:
+
+.. code-block:: python
+
+   panel = RFMixReader(
+       "data/rfmix/", source="fb", keep_posteriors=True,   # cache_dir is required
+       cache_dir="data/rfmix/la_cache_fb/", use_posterior=True,
+       select_samples=list(genotype_df.columns),
+   )
+   panel.chrom_counts("chr21")      # float32 expected counts
+   panel.chrom_posterior("chr21")   # (variants, samples, 2, ancestries) per-haplotype posteriors
+
+``use_posterior="auto"`` uses posteriors when the Dataset has them and hard
+calls otherwise; ``open_panel`` and ``FlareReader`` accept the same argument.
+
+Ancestry-specific dosage model
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``ancestry_model="dosage"`` estimates one regulatory effect per ancestry from
+the expected ancestry-specific alternate-allele dosage.  For sample *i* with
+alternate-allele dosage :math:`G_i` and expected ancestry counts
+:math:`L_{ik} = \sum_h P(Z_{ih} = k)`:
+
+.. math::
+
+   D_{ik} = G_i \, L_{ik} / 2, \qquad
+   y_i = \sum_k \beta_k D_{ik} + \sum_{k<K} \gamma_k L_{ik}
+         + \boldsymbol{\gamma}^{T}\mathbf{C}_i + \epsilon_i
+
+so that :math:`\sum_k D_{ik} = G_i` (the phase of the alternate allele is
+unknown) and the :math:`L` columns adjust for local-ancestry main effects.
+
+.. code-block:: python
+
+   dosage_df = map_nominal(
+       genotype_df=genotype_df, variant_df=variant_df,
+       phenotype_df=phenotype_df, phenotype_pos_df=phenotype_pos_df,
+       covariates_df=covariates_df, haplotypes=panel,
+       ancestry_model="dosage", out_dir=None,
+   )
+   dosage_df[["slope_anc0", "pval_anc0", "slope_anc1", "pval_anc1",
+              "pval_joint", "pval_diff_anc0_anc1"]]
+
+Per ancestry: ``slope_anc{k}``, ``slope_se_anc{k}``, ``tstat_anc{k}``,
+``pval_anc{k}``.  ``fstat_joint`` / ``pval_joint`` test all
+:math:`\beta_k = 0`; ``z_diff_anc{i}_anc{j}`` / ``pval_diff_anc{i}_anc{j}``
+test :math:`\beta_i = \beta_j` using the covariance of the ancestry betas.
+The standard ``slope`` / ``pval_nominal`` columns carry the ancestry with the
+strongest effect.  With a hard-call panel the model reduces to the classic
+ancestry-specific genotype regression.  Substituting posterior expectations
+does not propagate the assignment uncertainty into the standard errors
+(joint-likelihood / multiple-imputation estimation is future work), and the
+model is currently available for ``map_nominal`` only.
+
 Sample alignment and mapping
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
