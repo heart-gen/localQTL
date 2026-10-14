@@ -30,26 +30,31 @@ workflows, while adding ancestry-aware use cases.
 Install the latest release from PyPI:
 
 ```bash
-pip install localqtl
+pip install localqtl            # CPU / PyTorch only
+pip install "localqtl[gpu]"     # + CuPy and cuDF (CUDA 12 wheels)
 ```
+
+The core depends on PyTorch, numpy/scipy/pandas, pgenlib and rfmix-reader.
+The `gpu` extra adds the CuPy and cuDF (RAPIDS) array and dataframe backends;
+without it every helper falls back to numpy and pandas, and PyTorch still uses
+the GPU for the regressions when one is visible.
 
 The project uses [Poetry](https://python-poetry.org/) for dependency management.
 Clone the repository and install the package into a virtual environment:
 
 ```bash
-poetry install
+poetry install                  # CPU
+poetry install --extras gpu     # with the CUDA backends
 ```
 
-If you prefer `pip`, you can install the library in editable mode after exporting
-Poetry's dependency specification:
+If you prefer `pip`, you can install the library in editable mode:
 
 ```bash
-pip install -e .
+pip install -e ".[gpu]"
 ```
 
-> **Note:** GPU acceleration relies on PyTorch, CuPy, and cuDF. Make sure you use
-> versions that match the CUDA toolkit available on your system. The versions in
-> `pyproject.toml` target CUDA 12.
+> **Note:** the `gpu` extra pins CUDA 12 wheels (`cupy-cuda12x`, `cudf-cu12`,
+> `dask-cudf-cu12`); match them to the CUDA toolkit on your system.
 
 ## Quickstart
 
@@ -88,6 +93,42 @@ results = map_nominal(
 
 print(results.head())
 ```
+
+### Ancestry-specific dosage model (posterior-aware)
+
+Hard local-ancestry calls discard the uncertainty of the assignment (a
+haplotype with P(AFR) = 0.65, P(EUR) = 0.35 is simply "AFR"). With
+`ancestry_model="dosage"`, `map_nominal` instead estimates one regulatory
+effect per ancestry from the expected ancestry-specific alternate-allele
+dosage. For sample *i* with alternate-allele dosage `G_i` and expected
+ancestry counts `L_ik = sum_h P(Z_ih = k)` (hard calls give 0/1/2):
+
+```
+D_ik = G_i * L_ik / 2                      (sum_k D_ik = G_i; phase unknown)
+y_i  = sum_k beta_k D_ik + sum_{k<K} gamma_k L_ik + covariates + e_i
+```
+
+The `L` columns adjust for local-ancestry main effects. Output columns per
+ancestry are `slope_anc{k}`, `slope_se_anc{k}`, `tstat_anc{k}`,
+`pval_anc{k}`; `fstat_joint` / `pval_joint` test all `beta_k = 0` jointly;
+`z_diff_anc{i}_anc{j}` / `pval_diff_anc{i}_anc{j}` test `beta_i = beta_j`
+using the full covariance of the ancestry betas. The standard `slope`,
+`slope_se`, `tstat`, `pval_nominal` columns carry the ancestry with the
+strongest effect.
+
+```python
+panel = RFMixReader("data/rfmix/", source="fb", keep_posteriors=True,
+                    cache_dir="data/rfmix/la_cache_fb/", use_posterior=True,
+                    select_samples=list(genotype_df.columns))
+dosage_df = mapper.map_nominal(ancestry_model="dosage")   # mapper built with haplotypes=panel
+```
+
+With a hard-call panel (`.msp.tsv`) the same model reduces to the classic
+ancestry-specific genotype regression. Note that substituting posterior
+expectations for the unknown haplotype ancestries does not propagate that
+uncertainty into the standard errors; joint-likelihood or multiple-imputation
+estimation is future work. `ancestry_model="dosage"` is currently available
+for `map_nominal` only (no permutations, no `interaction_covariate`).
 
 ### Covariate interaction scans
 
@@ -145,11 +186,18 @@ lead_df = mapper.map_independent(cis_df=perm_df, fdr=0.05)
 
 ### Local ancestry-aware mapping
 
-localQTL can incorporate local ancestry (e.g., from RFMix) so that cis-xQTL tests are performed with ancestry-aware genotype inputs. To enable this, pass **`haplotypes`** (per-variant × per-sample × per-ancestry dosages) and **`loci_df`** (variant positions corresponding to the haplotype tensor) to `CisMapper`. When these are provided, `CisMapper` switches to the ancestry-aware input generator under the hood.
+localQTL can incorporate local ancestry (RFMix, FLARE or haptools output read
+by [rfmix-reader](https://github.com/heart-gen/rfmix_reader)) so that cis-xQTL
+tests are performed with ancestry-aware genotype inputs. Pass a
+**`LocalAncestryPanel`** as `haplotypes` to `CisMapper`; the ancestry-aware
+input generator then holds one chromosome of ancestry counts in memory at a
+time and maps every SNP to the RFMix segment that covers it, so memory does
+not grow with the genome. (A plain `(loci, samples, ancestries)` array with a
+`loci_df` is still accepted.)
 
 ```python
 from localqtl import PlinkReader, read_phenotype_bed
-from localqtl.haplotypeio import RFMixReader
+from localqtl.haplotypeio import RFMixReader, open_panel
 from localqtl.cis import CisMapper
 
 plink = PlinkReader("data/genotypes")
@@ -159,25 +207,24 @@ variant_df = plink.bim.set_index("snp")[["chrom", "pos"]]
 phenotype_df, phenotype_pos_df = read_phenotype_bed("data/phenotypes.bed")
 covariates_df = None  # optional
 
-# Local ancestry from RFMix (and align to genotype samples)
-select_samples = genotype_df.columns.values
-rfmix = RFMixReader(
-    prefix_path="data/rfmix/prefix",   # directory with per-chrom outputs + fb.tsv
-    binary_path="data/rfmix",          # where prebuilt binaries live (if used)
-    select_samples=select_samples,     # optional for automatic sample alignment (recommended)
-    verbose=True
+# Local ancestry from RFMix (.msp.tsv segments), aligned to the genotype samples.
+# cache_dir: parsed once into a Zarr cache, reopened instantly afterwards.
+panel = RFMixReader(
+    "data/rfmix/",                              # directory / file / path prefix of the RFMix output
+    select_samples=list(genotype_df.columns),   # same samples, same order as the genotypes
+    cache_dir="data/rfmix/la_cache/",
 )
+# or, for an existing cache:  panel = open_panel("data/rfmix/la_cache/", select_samples=...)
+# or FLARE output:            panel = FlareReader("data/flare/", select_samples=...)
 
-# Materialize ancestry haplotypes into memory (NumPy array)
-# Shape: (variants, samples, ancestries) for >2 ancestries.
-# For 2 ancestries, the reader exposes the ancestry channel selected internally.
-H = rfmix.load_haplotypes()
-loci_df = rfmix.loci_df  # DataFrame with ['chrom','pos', 'ancestry', 'hap', 'index'] (indexed by 'hap')
+# For two ancestries the panel exposes one channel (the other is 2 - first);
+# panel.ancestries, panel.chromosomes, panel.g_anc (global ancestry) are available.
 
-# (Optional) Ensure chromosome dtype matches between variant_df and loci_df
-variant_df["chrom"] = variant_df["chrom"].astype(str)
-loci_df = loci_df.copy()
-loci_df["chrom"] = loci_df["chrom"].astype(str)
+# Keep RFMix's forward-backward posteriors (.fb.tsv) to serve posterior-expected
+# ancestry counts  E[count_k] = sum_h P(Z_h = k)  instead of hard calls:
+# panel = RFMixReader("data/rfmix/", source="fb", keep_posteriors=True,
+#                     cache_dir="data/rfmix/la_cache_fb/", use_posterior=True,
+#                     select_samples=list(genotype_df.columns))
 
 # Ancestry-aware mapping
 mapper = CisMapper(
@@ -186,8 +233,7 @@ mapper = CisMapper(
     phenotype_df=phenotype_df,
     phenotype_pos_df=phenotype_pos_df,
     covariates_df=covariates_df,
-    haplotypes=H,          # <-- enable local ancestry-aware mode
-    loci_df=loci_df,       # <-- positions that align to H
+    haplotypes=panel,      # <-- enable local ancestry-aware mode
     window=1_000_000,
     maf_threshold=0.01,
     device="auto",
@@ -252,10 +298,10 @@ perm_annotated = annotate_with_coloc(perm_df, coloc_df)
 
 **Input expectations**
 
-* `H` (from `RFMixReader.load_haplotypes()`) is ancestry dosages with shape `(variants, samples, ancestries)` for ≥3 ancestries; for 2 ancestries the reader exposes the configured channel.
-* `loci_df` rows correspond 1:1 to `H`'s and be joinable (by `chrom`/`pos`) to `variant_df` used for genotypes.
+* The panel exposes `(variants, samples, channels)` int8 ancestry counts, one chromosome at a time (`panel.chrom_counts(chrom)`); with ≥3 ancestries every ancestry is a channel, with 2 ancestries a single channel is used (the other is `2 - first`).
+* Each genotype SNP is matched to the RFMix segment that covers it (`panel.locus_index(chrom, positions)`; `locus_method="nearest"` with `nearest_tolerance` for locus-level sources); SNPs no segment covers are dropped from the ancestry-aware model.
 * Sample order in `genotype_df`, `phenotype_df`, and `covariates_df` should match `H` (reindex as shown).
-* The cis-mapping helpers default to ``preload_haplotypes=True`` so ancestry blocks are staged as contiguous tensors on the requested device (GPU or CPU). Override this flag when working under strict memory constraints.
+* The cis-mapping helpers default to ``preload_haplotypes=True`` so the current chromosome's counts are staged as an int8 tensor on the requested device (GPU or CPU) and windows are sliced there. Override this flag when working under strict memory constraints.
 
 ## Testing
 

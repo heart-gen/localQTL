@@ -865,6 +865,8 @@ def map_permutations(
         raise ValueError("nperm must be a positive integer for map_permutations.")
     if ancestry_model == "interaction" and haplotypes is None:
         raise ValueError("ancestry_model='interaction' requires haplotypes.")
+    if ancestry_model == "dosage":
+        raise ValueError("ancestry_model='dosage' is currently only implemented for map_nominal.")
     if ancestry_model == "interaction" and interaction_covariate is not None:
         raise ValueError("interaction_covariate cannot be combined with ancestry_model='interaction'.")
 

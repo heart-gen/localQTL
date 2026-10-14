@@ -58,17 +58,20 @@ Poetry
 
 .. code-block:: bash
 
-   poetry install
+   poetry install                 # CPU / PyTorch only
+   poetry install --extras gpu    # + CuPy and cuDF (CUDA 12 wheels)
 
 Pip
 ~~~
 
 Install the published package directly from PyPI when you do not need the
-editable source checkout:
+editable source checkout; the ``gpu`` extra adds the CuPy / cuDF backends
+(everything falls back to numpy and pandas without them):
 
 .. code-block:: bash
 
    pip install localqtl
+   pip install "localqtl[gpu]"
 
 To work against the latest repository state, fall back to an editable install:
 
@@ -128,9 +131,10 @@ autodoc cross-references:
 
 ``map_nominal``, ``map_permutations``, and ``map_independent`` accept a
 ``preload_haplotypes`` flag that defaults to ``True``. When ancestry dosages
-are provided, enabling the flag stages haplotypes as contiguous tensors on the
-target device (GPU or CPU). Disable it if the additional memory pressure is a
-concern.
+are provided, enabling the flag stages the current chromosome's haplotype
+counts as a contiguous int8 tensor on the target device (GPU or CPU) and
+slices per-gene windows there. Disable it if the additional memory pressure
+is a concern.
 
 The helper trio also mirrors tensorQTL's "tensor-friendly" outputs through the
 ``tensorqtl_flavor`` switch. Setting the flag to ``True`` swaps Parquet streaming
@@ -210,31 +214,93 @@ Haplotype loading
 
 .. code-block:: python
 
-   from localqtl.haplotypeio import RFMixReader
+   from localqtl.haplotypeio import RFMixReader, open_panel
 
-   rfmix = RFMixReader(
-       prefix_path="data/rfmix/prefix",
-       binary_path="data/rfmix",
-       verbose=True,
+   panel = RFMixReader(
+       "data/rfmix/",                             # RFMix .msp.tsv output (+ .rfmix.Q)
+       select_samples=list(genotype_df.columns),  # same samples, same order as the genotypes
+       cache_dir="data/rfmix/la_cache/",          # parsed once into a Zarr cache
    )
+   # existing cache: panel = open_panel("data/rfmix/la_cache/", select_samples=...)
 
-   H = rfmix.load_haplotypes()
-   loci_df = rfmix.loci_df
+   panel.chrom_counts("chr21")                   # (variants, samples, channels) int8 for one chromosome
+   panel.locus_index("chr21", positions)         # covering segment per SNP, -1 = none
+
+The panel is passed as ``haplotypes`` to ``CisMapper`` / ``map_nominal``; the
+generator keeps one chromosome in memory at a time.  With two ancestries a
+single channel is exposed (the second is ``2 - first``).
+
+Posterior-expected ancestry counts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+RFMix's forward-backward posteriors (``.fb.tsv``) can be kept in the cache and
+served as expected ancestry counts ``E[count_k] = sum_h P(Z_h = k)`` (float32,
+NaN = no call) instead of hard calls:
+
+.. code-block:: python
+
+   panel = RFMixReader(
+       "data/rfmix/", source="fb", keep_posteriors=True,   # cache_dir is required
+       cache_dir="data/rfmix/la_cache_fb/", use_posterior=True,
+       select_samples=list(genotype_df.columns),
+   )
+   panel.chrom_counts("chr21")      # float32 expected counts
+   panel.chrom_posterior("chr21")   # (variants, samples, 2, ancestries) per-haplotype posteriors
+
+``use_posterior="auto"`` uses posteriors when the Dataset has them and hard
+calls otherwise; ``open_panel`` and ``FlareReader`` accept the same argument.
+
+Ancestry-specific dosage model
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``ancestry_model="dosage"`` estimates one regulatory effect per ancestry from
+the expected ancestry-specific alternate-allele dosage.  For sample *i* with
+alternate-allele dosage :math:`G_i` and expected ancestry counts
+:math:`L_{ik} = \sum_h P(Z_{ih} = k)`:
+
+.. math::
+
+   D_{ik} = G_i \, L_{ik} / 2, \qquad
+   y_i = \sum_k \beta_k D_{ik} + \sum_{k<K} \gamma_k L_{ik}
+         + \boldsymbol{\gamma}^{T}\mathbf{C}_i + \epsilon_i
+
+so that :math:`\sum_k D_{ik} = G_i` (the phase of the alternate allele is
+unknown) and the :math:`L` columns adjust for local-ancestry main effects.
+
+.. code-block:: python
+
+   dosage_df = map_nominal(
+       genotype_df=genotype_df, variant_df=variant_df,
+       phenotype_df=phenotype_df, phenotype_pos_df=phenotype_pos_df,
+       covariates_df=covariates_df, haplotypes=panel,
+       ancestry_model="dosage", out_dir=None,
+   )
+   dosage_df[["slope_anc0", "pval_anc0", "slope_anc1", "pval_anc1",
+              "pval_joint", "pval_diff_anc0_anc1"]]
+
+Per ancestry: ``slope_anc{k}``, ``slope_se_anc{k}``, ``tstat_anc{k}``,
+``pval_anc{k}``.  ``fstat_joint`` / ``pval_joint`` test all
+:math:`\beta_k = 0`; ``z_diff_anc{i}_anc{j}`` / ``pval_diff_anc{i}_anc{j}``
+test :math:`\beta_i = \beta_j` using the covariance of the ancestry betas.
+The standard ``slope`` / ``pval_nominal`` columns carry the ancestry with the
+strongest effect.  With a hard-call panel the model reduces to the classic
+ancestry-specific genotype regression.  Substituting posterior expectations
+does not propagate the assignment uncertainty into the standard errors
+(joint-likelihood / multiple-imputation estimation is future work), and the
+model is currently available for ``map_nominal`` only.
 
 Sample alignment and mapping
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. code-block:: python
 
-   keep = [sid for sid in rfmix.sample_ids if sid in genotype_df.columns]
-   genotype_df = genotype_df[keep]
+   # the panel was built with select_samples=list(genotype_df.columns), so the
+   # ancestry samples already match the genotype columns (order included);
+   # restrict the other tables to the same samples
+   keep = list(genotype_df.columns)
    phenotype_df = phenotype_df[keep]
    if covariates_df is not None:
        covariates_df = covariates_df.loc[keep]
-
-   variant_df["chrom"] = variant_df["chrom"].astype(str)
-   loci_df = loci_df.copy()
-   loci_df["chrom"] = loci_df["chrom"].astype(str)
 
    mapper = CisMapper(
        genotype_df=genotype_df,
@@ -242,8 +308,7 @@ Sample alignment and mapping
        phenotype_df=phenotype_df,
        phenotype_pos_df=phenotype_pos_df,
        covariates_df=covariates_df,
-       haplotypes=H,
-       loci_df=loci_df,
+       haplotypes=panel,
        window=1_000_000,
        device="auto",
    )

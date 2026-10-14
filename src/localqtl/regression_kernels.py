@@ -326,6 +326,93 @@ def run_batch_interaction_regression(
     return result
 
 
+def run_batch_dosage_regression(
+    y: torch.Tensor,
+    D: torch.Tensor,
+    L: torch.Tensor | None = None,
+    k_eff: int = 0,
+    device: str = "cuda",
+) -> dict[str, torch.Tensor]:
+    """
+    Batched OLS for the ancestry-specific dosage model
+    ``y ~ D_1 + ... + D_K (+ L_1 + ... + L_{K-1})``.
+
+    ``D[:, :, k]`` is the (expected) alternate-allele dosage carried on
+    ancestry-``k`` haplotypes, ``sum_k D_k = G``; ``L`` holds optional
+    local-ancestry main-effect columns.  All inputs are assumed to be
+    pre-residualized against covariates and centered.
+
+    Parameters
+    ----------
+    y : torch.Tensor
+        (n,) phenotype vector (samples).
+    D : torch.Tensor
+        (m, n, K) ancestry-specific dosages (variants x samples x ancestries).
+    L : torch.Tensor, optional
+        (m, n, q) local-ancestry covariate columns (typically ``q = K - 1``).
+    k_eff : int
+        Number of covariate columns already projected out (dof reduction).
+    device : str
+        ``"cuda"`` or ``"cpu"``.
+
+    Returns
+    -------
+    dict
+        ``betas``, ``ses``, ``tstats`` — (m, K) ancestry-specific effects;
+        ``cov`` — (m, K, K) covariance of the ancestry betas;
+        ``fstat`` — (m,) joint Wald statistic for H0: beta_1 = ... = beta_K = 0
+        (F with ``(K, dof)`` degrees of freedom); ``dof`` — scalar.
+    """
+    device = resolve_device(device)
+    y = move_to_device(y, device)
+    D = move_to_device(D, device)
+    m, n, K = D.shape
+    if L is not None:
+        L = move_to_device(L, device)
+        X = torch.cat([D, L], dim=2)                               # (m, n, p)
+    else:
+        X = D
+    p = X.shape[2]
+    y_exp = y.unsqueeze(0).expand(m, -1).unsqueeze(-1)             # (m, n, 1)
+
+    XtX = X.transpose(1, 2) @ X                                    # (m, p, p)
+    Xty = X.transpose(1, 2) @ y_exp                                # (m, p, 1)
+
+    diag_scale = torch.diagonal(XtX, dim1=1, dim2=2).abs().mean(dim=1, keepdim=True)
+    eps = 1e-6 * diag_scale.unsqueeze(-1)
+    I_p = torch.eye(p, device=device, dtype=XtX.dtype).unsqueeze(0)
+    XtX_reg = XtX + eps * I_p
+
+    betas = torch.linalg.solve(XtX_reg, Xty).squeeze(-1)           # (m, p)
+    y_hat = X @ betas.unsqueeze(-1)
+    resid = y_exp - y_hat
+    dof = max(n - int(k_eff) - p, 1)
+    rss = (resid.transpose(1, 2) @ resid).squeeze(-1).squeeze(-1)  # (m,)
+    sigma2 = rss / dof
+
+    XtX_inv = torch.linalg.inv(XtX_reg)                            # (m, p, p)
+    cov_all = XtX_inv * sigma2.view(-1, 1, 1)
+    ses = torch.sqrt(torch.clamp(torch.diagonal(cov_all, dim1=1, dim2=2), min=1e-30))
+    tstats = betas / ses
+
+    b_anc = betas[:, :K]                                           # (m, K)
+    cov_anc = cov_all[:, :K, :K]                                   # (m, K, K)
+    # Joint Wald test on the ancestry betas: b' cov^-1 b / K ~ F(K, dof)
+    I_k = torch.eye(K, device=device, dtype=cov_anc.dtype).unsqueeze(0)
+    cov_reg = cov_anc + 1e-12 * torch.diagonal(cov_anc, dim1=1, dim2=2).mean(dim=1).view(-1, 1, 1) * I_k
+    sol = torch.linalg.solve(cov_reg, b_anc.unsqueeze(-1))         # (m, K, 1)
+    fstat = (b_anc.unsqueeze(1) @ sol).squeeze(-1).squeeze(-1) / K # (m,)
+
+    return {
+        "betas": b_anc,
+        "ses": ses[:, :K],
+        "tstats": tstats[:, :K],
+        "cov": cov_anc,
+        "fstat": fstat,
+        "dof": dof,
+    }
+
+
 def _is_cuda(*tensors):
     return all(getattr(t, "is_cuda", False) for t in tensors if t is not None)
 

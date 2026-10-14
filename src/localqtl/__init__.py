@@ -27,7 +27,7 @@ from . import utils
 
 from .cis import CisMapper, map_independent, map_nominal, map_permutations
 from .genotypeio import InputGeneratorCis, PlinkReader
-from .haplotypeio import InputGeneratorCisWithHaps, RFMixReader
+from .haplotypeio import FlareReader, InputGeneratorCisWithHaps, LocalAncestryPanel, RFMixReader, open_panel
 from .phenotypeio import read_phenotype_bed
 from .pgen import PgenReader
 from .utils import gpu_available
@@ -41,6 +41,9 @@ __all__ = [
     "gpu_available",
     "PlinkReader",
     "RFMixReader",
+    "FlareReader",
+    "LocalAncestryPanel",
+    "open_panel",
     "PgenReader",
     "InputGeneratorCis",
     "InputGeneratorCisWithHaps",

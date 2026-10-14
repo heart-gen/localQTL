@@ -6,22 +6,6 @@ import numpy as np
 import pandas as pd
 
 import sys
-import types
-
-try:  # pragma: no cover - optional dependency stub for tests
-    import rfmix_reader  # type: ignore
-except ImportError:  # pragma: no cover - exercised when dependency missing
-    rfmix_reader = types.ModuleType("rfmix_reader")  # type: ignore[assignment]
-    sys.modules.setdefault("rfmix_reader", rfmix_reader)
-
-
-def _missing(*_args, **_kwargs):  # pragma: no cover - helper for optional dep
-    raise ImportError("rfmix_reader optional dependency is not installed for tests")
-
-
-for _name in ("read_rfmix", "read_flare"):
-    if not hasattr(rfmix_reader, _name):  # type: ignore[attr-defined]
-        setattr(rfmix_reader, _name, _missing)
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:

@@ -6,19 +6,21 @@ import pyarrow as pa
 from typing import Optional
 
 from ..utils import SimpleLogger
-from ..stats import nominal_pvals_tensorqtl, get_t_pval
+from ..stats import nominal_pvals_tensorqtl, get_t_pval, get_f_pval
 from ..iosinks import AsyncParquetSink
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from ..preproc import impute_mean_and_filter, allele_stats, filter_by_maf
 from ..regression_kernels import (
     run_batch_regression,
     run_batch_interaction_regression,
+    run_batch_dosage_regression,
     run_batch_regression_with_permutations,
 )
 from .common import (
     residualize_matrix_with_covariates,
     residualize_batch,
     residualize_batch_interaction,
+    residualize_batch_dosage,
     prepare_interaction_covariate,
 )
 
@@ -38,6 +40,18 @@ def _interaction_columns(n_ancestries: int) -> list[str]:
             f"tstat_gxh_{suffix}",
             f"pval_gxh_{suffix}",
         ])
+    return cols
+
+
+def _dosage_columns(n_ancestries: int) -> list[str]:
+    """Columns of the ancestry-specific dosage model (``ancestry_model='dosage'``)."""
+    cols: list[str] = []
+    for anc in range(n_ancestries):
+        cols.extend([f"slope_anc{anc}", f"slope_se_anc{anc}", f"tstat_anc{anc}", f"pval_anc{anc}"])
+    cols.extend(["fstat_joint", "pval_joint"])
+    for i in range(n_ancestries):
+        for j in range(i + 1, n_ancestries):
+            cols.extend([f"z_diff_anc{i}_anc{j}", f"pval_diff_anc{i}_anc{j}"])
     return cols
 
 
@@ -71,6 +85,9 @@ def _nominal_parquet_schema(
     ]
     if ancestry_model == "interaction" and n_ancestries is not None and n_ancestries > 0:
         for col in _interaction_columns(int(n_ancestries)):
+            fields.append(pa.field(col, pa.float32()))
+    if ancestry_model == "dosage" and n_ancestries is not None and n_ancestries > 0:
+        for col in _dosage_columns(int(n_ancestries)):
             fields.append(pa.field(col, pa.float32()))
     if covariate_interaction:
         for col in _covariate_interaction_columns():
@@ -172,6 +189,10 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
     if ancestry_model == "interaction" and n_ancestries is not None and n_ancestries > 0:
         interaction_columns = _interaction_columns(int(n_ancestries))
         expected_columns.extend(interaction_columns)
+    dosage_columns: list[str] = []
+    if ancestry_model == "dosage" and n_ancestries is not None and n_ancestries > 0:
+        dosage_columns = _dosage_columns(int(n_ancestries))
+        expected_columns.extend(dosage_columns)
     covar_int_columns: list[str] = []
     if covar_interaction:
         covar_int_columns = _covariate_interaction_columns()
@@ -185,7 +206,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
         else:
             target_rows = _count_cis_pairs(ig, chrom)
 
-    all_extra_cols = interaction_columns + covar_int_columns
+    all_extra_cols = interaction_columns + dosage_columns + covar_int_columns
     buffers = _allocate_buffers(expected_columns, include_perm, target_rows, all_extra_cols)
     cursor = processed = 0
     variant_cache: dict[bytes, tuple[np.ndarray, np.ndarray]] = {}
@@ -250,7 +271,9 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
         v_idx = v_idx[keep_mono.detach().cpu().numpy()]
         if H_t is not None:
             H_t = H_t[keep_mono]
-            if H_t.shape[2] > 1:
+            # The dosage model needs every ancestry channel (sum_k D_k = G);
+            # the other models drop the last one for identifiability.
+            if H_t.shape[2] > 1 and ancestry_model != "dosage":
                 H_t = H_t[:, :, :-1]
 
         # Optional MAF filter on the *current* (already-imputed/trimmed) G_t
@@ -274,12 +297,19 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
  
         # Residualize in one call; returns y as list in group mode
         interaction_mode = ancestry_model == "interaction" and H_t is not None
+        dosage_mode = ancestry_model == "dosage" and H_t is not None
         covar_interaction = interaction_covariate_t is not None
         if interaction_mode:
             y_resid, G_resid, H_resid, I_resid = residualize_batch_interaction(
                 P_list if group_mode else P_list[0], G_t, H_t, rez, center=True,
                 group=group_mode
             )
+        elif dosage_mode:
+            y_resid, D_resid, L_resid = residualize_batch_dosage(
+                P_list if group_mode else P_list[0], G_t, H_t, rez, center=True,
+                group=group_mode
+            )
+            G_resid, H_resid = G_t, None
         else:
             y_resid, G_resid, H_resid = residualize_batch(
                 P_list if group_mode else P_list[0], G_t, H_t, rez, center=True,
@@ -301,7 +331,41 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
         for y_t, pid in y_iter:
             gxh_slope = gxh_se = gxh_t = gxh_p = None
             cov_int_result = None
-            if interaction_mode:
+            dosage_vals: dict[str, np.ndarray] | None = None
+            if dosage_mode:
+                K = int(D_resid.shape[2])
+                res = run_batch_dosage_regression(
+                    y=y_t, D=D_resid, L=L_resid, k_eff=k_eff, device=device
+                )
+                dof = int(res["dof"])
+                b_np = res["betas"].detach().cpu().numpy()                     # (m, K)
+                se_np = res["ses"].detach().cpu().numpy()
+                t_np = res["tstats"].detach().cpu().numpy()
+                cov_np = res["cov"].detach().cpu().numpy().astype(np.float64)   # (m, K, K)
+                dosage_vals = {}
+                for k in range(K):
+                    dosage_vals[f"slope_anc{k}"] = b_np[:, k]
+                    dosage_vals[f"slope_se_anc{k}"] = se_np[:, k]
+                    dosage_vals[f"tstat_anc{k}"] = t_np[:, k]
+                    dosage_vals[f"pval_anc{k}"] = get_t_pval(t_np[:, k], dof)
+                f_np = res["fstat"].detach().cpu().numpy()
+                dosage_vals["fstat_joint"] = f_np
+                dosage_vals["pval_joint"] = get_f_pval(f_np, K, dof)
+                for i in range(K):
+                    for j in range(i + 1, K):
+                        var = cov_np[:, i, i] + cov_np[:, j, j] - 2.0 * cov_np[:, i, j]
+                        z = (b_np[:, i] - b_np[:, j]) / np.sqrt(np.maximum(var, 1e-30))
+                        dosage_vals[f"z_diff_anc{i}_anc{j}"] = z
+                        dosage_vals[f"pval_diff_anc{i}_anc{j}"] = get_t_pval(z, dof)
+                # Lead signal = ancestry with the strongest effect
+                best_k = np.nanargmax(np.abs(t_np), axis=1)
+                row_ix = np.arange(t_np.shape[0])
+                slope = b_np[row_ix, best_k]
+                slope_se = se_np[row_ix, best_k]
+                tstat = t_np[row_ix, best_k]
+                pvals = get_t_pval(tstat, dof)
+                perm_max_r2 = np.nan if include_perm else None
+            elif interaction_mode:
                 pH = int(H_resid.shape[2])
                 n_anc = int(n_ancestries) if n_ancestries is not None else pH
 
@@ -384,7 +448,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
             n_variants = var_ids.shape[0]
 
             # Pack and one GPU -> CPU transfer
-            if interaction_mode or covar_interaction:
+            if interaction_mode or dosage_mode or covar_interaction:
                 floats = np.stack([slope, slope_se, tstat, pvals,
                                    af_t.detach().cpu().numpy()], axis=1).astype(np.float32)
                 ints = np.stack([ma_samples_t.detach().cpu().numpy(),
@@ -423,6 +487,9 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                     buffers[interaction_columns[base + 1]][row_slice] = gxh_se[:, anc_idx]
                     buffers[interaction_columns[base + 2]][row_slice] = gxh_t[:, anc_idx]
                     buffers[interaction_columns[base + 3]][row_slice] = gxh_p[:, anc_idx]
+            if dosage_mode and dosage_vals is not None:
+                for col in dosage_columns:
+                    buffers[col][row_slice] = dosage_vals[col]
             if covar_interaction and cov_int_result is not None:
                 int_dof = cov_int_result["dof"]
                 for prefix in ("g", "i", "gi"):
@@ -462,6 +529,23 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
 
     data = {col: buffers[col][:cursor] for col in expected_columns}
     return pd.DataFrame(data, columns=expected_columns)
+
+
+def _n_ancestries(haplotypes, ancestry_model: str) -> int | None:
+    """
+    Ancestry count reported in the output.  The interaction model reports one
+    block per channel; the dosage model needs every ancestry (``n_pops`` of a
+    panel; a single legacy channel means the collapsed two-ancestry case).
+    """
+    if haplotypes is None:
+        return None
+    k = int(haplotypes.shape[2])
+    if ancestry_model != "dosage":
+        return k
+    n_pops = getattr(haplotypes, "n_pops", None)
+    if n_pops is not None:
+        return int(n_pops)
+    return 2 if k == 1 else k
 
 
 def map_nominal(
@@ -510,6 +594,9 @@ def map_nominal(
         logger.write(f"  * including local ancestry channels (K={K})")
     if ancestry_model == "interaction":
         logger.write("  * ancestry model: interaction (GxH)")
+    elif ancestry_model == "dosage":
+        logger.write("  * ancestry model: ancestry-specific dosage "
+                     f"({'posterior-expected' if getattr(haplotypes, 'use_posterior', False) else 'hard-call'} ancestry counts)")
     if interaction_covariate is not None:
         logger.write("  * covariate interaction: GxC")
     if nperm is not None:
@@ -529,11 +616,15 @@ def map_nominal(
             phenotype_pos_df=phenotype_pos_df, window=window, group_s=group_s)
     )
 
-    # Validate interaction arguments
-    if ancestry_model == "interaction" and haplotypes is None:
-        raise ValueError("ancestry_model='interaction' requires haplotypes.")
-    if ancestry_model == "interaction" and interaction_covariate is not None:
-        raise ValueError("interaction_covariate cannot be combined with ancestry_model='interaction'.")
+    # Validate interaction / dosage arguments
+    if ancestry_model not in ("main", "interaction", "dosage"):
+        raise ValueError(f"Unknown ancestry_model {ancestry_model!r}; use 'main', 'interaction' or 'dosage'.")
+    if ancestry_model in ("interaction", "dosage") and haplotypes is None:
+        raise ValueError(f"ancestry_model='{ancestry_model}' requires haplotypes.")
+    if ancestry_model in ("interaction", "dosage") and interaction_covariate is not None:
+        raise ValueError(f"interaction_covariate cannot be combined with ancestry_model='{ancestry_model}'.")
+    if ancestry_model == "dosage" and nperm is not None and nperm > 0:
+        raise ValueError("ancestry_model='dosage' does not support nperm (permutations) yet.")
 
     # Prepare covariates: drop interaction column from covariates if it was named there
     covariates_use = covariates_df
@@ -563,7 +654,7 @@ def map_nominal(
     if out_dir is not None:
         os.makedirs(out_dir, exist_ok=True)
         include_perm = nperm is not None and nperm > 0
-        n_anc = int(haplotypes.shape[2]) if haplotypes is not None else None
+        n_anc = _n_ancestries(haplotypes, ancestry_model)
         schema = _nominal_parquet_schema(include_perm, ancestry_model, n_anc,
                                          covariate_interaction=interaction_cov_t is not None)
         with logger.time_block("Nominal scan (per-chrom streaming)", sync=sync, sec=False):
@@ -606,7 +697,7 @@ def map_nominal(
                                     chrom=None, sink=None, logger=logger,
                                     total_phenotypes=total_phenotypes,
                                     ancestry_model=ancestry_model,
-                                    n_ancestries=int(haplotypes.shape[2]) if haplotypes is not None else None,
+                                    n_ancestries=_n_ancestries(haplotypes, ancestry_model),
                                     interaction_covariate_t=interaction_cov_t)
     if logger.verbose:
         elapsed = time.time() - overall_start
