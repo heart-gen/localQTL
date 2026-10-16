@@ -20,7 +20,7 @@ pandas = "^2.2"
 pgenlib = "^0.93"
 rfmix-reader = ">=0.7.3"
 py-qvalue = "^0.1"
-pyarrow = "^22.0"
+pyarrow = ">=22,<24"
 pandas-plink-ng = "^2.3.2.post1"
 # GPU backends are optional: the array / dataframe helpers fall back to numpy
 # and pandas when CuPy / cuDF are absent or fail to initialise.
