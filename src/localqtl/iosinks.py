@@ -160,11 +160,12 @@ class ParquetSink:
 
 class AsyncParquetSink:
     """
-    Background-thread writer that wraps ParquetSink.
-    Benefits:
-      - Overlaps Arrow compression + filesystem writes with your GPU/CPU compute
-      - Bounded queue applies backpressure (keeps memory in check)
-      - Error in writer thread is re-raised on close()
+    Background-thread writer that wraps :class:`ParquetSink`.
+
+    It overlaps Arrow compression and filesystem writes with the GPU/CPU
+    computation, applies backpressure through a bounded queue (which keeps
+    memory in check), and re-raises an error from the writer thread on
+    :meth:`close`.
     """
     def __init__(
             self,

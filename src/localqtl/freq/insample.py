@@ -69,10 +69,12 @@ def ancestry_allele_frequencies(
 
     Returns
     -------
-    DataFrame indexed by variant ID with ``chrom, pos, [ref, alt, rsid],
-    n_called, af`` and, for each panel ancestry label ``L``,
-    ``an_anc_L, ac_anc_L, af_anc_L, ma_count_anc_L``.  Variants with no
-    covering local-ancestry locus have NaN per-ancestry columns.
+    pandas.DataFrame
+        Indexed by variant ID, with ``chrom``, ``pos``, optionally ``ref``,
+        ``alt`` and ``rsid``, ``n_called``, ``af`` and, for each panel
+        ancestry label ``L``, ``an_anc_L``, ``ac_anc_L``, ``af_anc_L`` and
+        ``ma_count_anc_L``.  Variants with no covering local-ancestry locus
+        have NaN per-ancestry columns.
     """
     if not variant_df.index.equals(genotype_df.index):
         raise ValueError("variant_df and genotype_df must share the same index (variant IDs).")

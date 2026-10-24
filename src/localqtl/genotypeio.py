@@ -498,17 +498,31 @@ def get_cis_ranges(phenotype_pos_df, chr_variant_dfs, window, verbose=True):
 class InputGeneratorCis(object):
     """
     Base input generator for cis-mapping.
-    Subclasses can extend by overriding `_postprocess_batch` to add haplotypes.
 
-    Inputs:
-      genotype_df:      genotype DataFrame (genotypes x samples)
-      variant_df:       DataFrame mapping variant_id (index) to chrom, pos
-      phenotype_df:     phenotype DataFrame (phenotypes x samples)
-      phenotype_pos_df: DataFrame defining position of each phenotype, with columns ['chr', 'pos'] or ['chr', 'start', 'end']
-      window:           cis-window; selects variants within +- cis-window from 'pos' (e.g., TSS for gene-based features)
-                        or within [start-window, end+window] if 'start' and 'end' are present in phenotype_pos_df
+    Subclasses extend it by overriding ``_postprocess_batch`` to add
+    haplotypes.
 
-    Generates: phenotype array, genotype array (2D), cis-window indices, phenotype ID
+    Parameters
+    ----------
+    genotype_df : pandas.DataFrame
+        Genotypes (variants x samples).
+    variant_df : pandas.DataFrame
+        Variant metadata indexed by variant ID with ``chrom`` and ``pos``.
+    phenotype_df : pandas.DataFrame
+        Phenotypes (phenotypes x samples).
+    phenotype_pos_df : pandas.DataFrame
+        Phenotype positions, with ``chr`` and ``pos``, or ``chr``, ``start``
+        and ``end``.
+    window : int
+        cis-window: variants within ``pos`` +- ``window`` (e.g. the TSS), or
+        within ``[start - window, end + window]`` when ``start`` and ``end``
+        are given.
+
+    Yields
+    ------
+    tuple
+        Phenotype array, genotype array (2D), cis-window indices and the
+        phenotype ID (plus the group ID in grouped mode).
     """
     def __init__(self, genotype_df, variant_df, phenotype_df, phenotype_pos_df,
                  group_s=None, window=1_000_000, **kwargs):

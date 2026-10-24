@@ -1,8 +1,10 @@
 """
-Statistical helpers (kept separate to avoid pulling SciPy into low-level kernels).
-Adapted from tensorqtl:
-  - https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/core.py
-  - https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/post.py
+Statistical helpers, kept separate so that SciPy is not pulled into the
+low-level kernels.
+
+Adapted from tensorQTL
+(`core.py <https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/core.py>`_,
+`post.py <https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/post.py>`_).
 """
 from __future__ import annotations
 import torch
@@ -251,12 +253,12 @@ def beta_approx_pval_old(r2_perm, r2_true, dof_init):
     
 def t_two_sided_pval_torch(t_abs: torch.Tensor, dof: int | torch.Tensor) -> torch.Tensor:
     """
-    Two-sided p-value for |t| with df degrees of freedom, returned on the same
-    device/dtype as t_abs.
+    Two-sided p-value for ``|t|`` with ``df`` degrees of freedom, on the same
+    device and dtype as ``t_abs``.
 
-    Strategy:
-      - For large dof (>120): Normal approx on GPU: p = 2 * Φ(-|t|)
-      - Otherwise: CPU fallback via SciPy get_t_pval, then move back to device.
+    For large ``dof`` (> 120) the normal approximation ``p = 2 * Phi(-|t|)`` is
+    computed on the GPU; otherwise the values fall back to SciPy
+    (:func:`get_t_pval`) on the CPU and are moved back to the device.
     """
     if not torch.is_tensor(t_abs):
         t_abs = torch.as_tensor(t_abs)
@@ -303,10 +305,12 @@ def nominal_pvals_tensorqtl(
 
     ``k_eff`` counts the degrees of freedom already consumed by centring (the
     intercept) and the projected-out covariates (``Residualizer.k_eff``).
-    - If H is None: correlation route with dof = n - k_eff - 1 (tensorQTL's
-      ``n - 2 - k`` with k covariates).
-    - Else: genotype-column t-stat (column 0) with dof = n - k_eff - p.
-    Returns (pvals, dof)
+
+    Without ``H`` the correlation route is used, with ``dof = n - k_eff - 1``
+    (tensorQTL's ``n - 2 - k`` for ``k`` covariates); otherwise the
+    genotype-column t-statistic (column 0) with ``dof = n - k_eff - p``.
+
+    Returns ``(pvals, dof)``.
     """
     n = int(y_t.shape[0])
     if H_resid is None:

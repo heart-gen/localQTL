@@ -71,12 +71,14 @@ def compare_allele_frequencies(
 
     Returns
     -------
-    DataFrame indexed like ``in_sample_df`` with, per label ``a`` mapped to
-    group ``g``: ``af_in_<a>, an_in_<a>, af_ref_<g>, an_ref_<g>, af_diff_<a>,
-    logodds_diff_<a>, z_<a>, discordant_<a>``; pooled ``af``,
-    ``af_ref_expected`` (admixture-weighted reference), ``af_diff_pooled``;
-    lookup flags ``match_type, allele_flipped, strand_ambiguous,
-    missing_in_reference``; and ``discordant`` (any ancestry).
+    pandas.DataFrame
+        Indexed like ``in_sample_df``, with per label ``a`` mapped to group
+        ``g``: ``af_in_<a>``, ``an_in_<a>``, ``af_ref_<g>``, ``an_ref_<g>``,
+        ``af_diff_<a>``, ``logodds_diff_<a>``, ``z_<a>`` and
+        ``discordant_<a>``; the pooled ``af``, ``af_ref_expected``
+        (admixture-weighted reference) and ``af_diff_pooled``; the lookup
+        flags ``match_type``, ``allele_flipped``, ``strand_ambiguous`` and
+        ``missing_in_reference``; and ``discordant`` (any ancestry).
     """
     labels = _labels_from_columns(in_sample_df)
     if not labels:

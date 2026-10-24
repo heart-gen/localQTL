@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, sys, pathlib, types
+import os, sys, pathlib
 from datetime import datetime
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parents[1]
@@ -60,16 +60,10 @@ def _read_version() -> str:
 release = _read_version()
 version = release
 
-# Mock heavy deps not available on RTD
-STUB_MODULES = [
-    "torch", "cupy", "cudf", "rfmix_reader",
-    "pyarrow", "pyarrow.parquet",
-    "dask", "dask_cuda", "rapids_dask_dependency",
-    "numba", "pandas_plink", "pgen",
-]
-for name in STUB_MODULES:
-    if name not in sys.modules:
-        sys.modules[name] = types.ModuleType(name)
+# Heavy / GPU-only dependencies are mocked by autodoc (see autodoc_mock_imports
+# below) when they are not installed.  Empty sys.modules stubs are *not* used:
+# autodoc's mock answers attribute access, a bare ModuleType does not, so
+# modules such as localqtl.cis.nominal (``pa.field``) would fail to import.
 
 
 extensions = [
@@ -106,10 +100,8 @@ numpydoc_show_class_members = False
 
 # Mock heavy/optional deps when autodoc imports modules
 autodoc_mock_imports = [
-    "torch", "cupy", "cudf", "rfmix_reader",
-    "pyarrow", "pyarrow.parquet",
-    "dask", "dask_cuda", "rapids_dask_dependency",
-    "numba", "pandas_plink", "pgen",
+    "cupy", "cudf", "dask_cudf", "dask_cuda", "rapids_dask_dependency", "numba",
+    "pysam", "requests", "alphagenome",
 ]
 
 # Intersphinx cross-links
@@ -138,4 +130,20 @@ nitpick_ignore = [
     ("py:class", "numpy.ndarray"),
     ("py:class", "pandas.DataFrame"),
     ("py:class", "pandas.Series"),
+]
+# numpydoc renders free-text parameter types ("optional", "array-like",
+# "DataFrame", "default 0") as cross-references; so do the annotations of the
+# mocked / untyped third-party objects.  None of them have an inventory.
+nitpick_ignore_regex = [
+    # third-party objects without (or outside) an intersphinx inventory
+    ("py:class", r"^(pandas|pd|np|numpy|torch|pyarrow|pa|scipy|anndata|xarray|rfmix_reader)\..*"),
+    # numpydoc renders the free-text type of a parameter ("samples x terms",
+    # "default 0", '"auto"') as a cross-reference; anything that is not a
+    # dotted identifier is prose, not a target.
+    ("py:class", r"^(?![A-Za-z_]\w*(\.[A-Za-z_]\w*)*$).*"),
+    ("py:class", r"^(DataFrame|Series|Index|Tensor|ndarray|dtype|AnnData|AtlasClient|"
+                 r"Residualizer|optional|sequence|Sequence|iterable|scalar|callable)$"),
+    ("py:data", r"^(pandas|numpy|torch)\..*"),
+    # attribute references to the documented object's own attributes
+    ("py:attr", r"^[A-Za-z_]\w*$"),
 ]
