@@ -513,14 +513,6 @@ comparison, optional exclusion of discordant / flipped / ambiguous variants,
 the dosage scan and the calibration tables, and repeats the scan on
 sample-permuted phenotypes as a null.
 
-Planned annotation modules
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-:mod:`localqtl.annotate.alphagenome` (AlphaGenome Atlas molecular-effect scores
-for lead variants; non-commercial API) and :mod:`localqtl.annotate.igvf` (IGVF
-Catalog variant->gene and element->gene regulatory links) define their public
-signatures and constants now; the implementations follow in a later release.
-
 Advanced topics
 ---------------
 

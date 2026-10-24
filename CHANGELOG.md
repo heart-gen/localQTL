@@ -6,7 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Versions follow the git tags (`vX.Y.Z`); the package version is derived from the tag.
 
-## [Unreleased]
+To release: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`, update the
+compare links at the bottom, merge, and only then tag `vX.Y.Z`. The release workflow builds
+the GitHub release body from that section and stops if the tag has none.
+
+## [0.3.0] - 2026-10-24
+
+External validation of lead variants against the AlphaGenome Atlas and the IGVF
+Catalog, and a complete autodoc API reference.
 
 ### Added
 
@@ -177,7 +184,8 @@ output; see *Upgrading from 0.1* in the README.
   (`InputGeneratorCisWithHaps`), PLINK 1/2 readers, streaming Parquet sinks and pure-Python
   q-values.
 
-[Unreleased]: https://github.com/heart-gen/localQTL/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/heart-gen/localQTL/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/heart-gen/localQTL/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/heart-gen/localQTL/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/heart-gen/localQTL/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/heart-gen/localQTL/compare/v0.1.2...v0.1.3
