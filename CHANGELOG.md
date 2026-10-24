@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Versions follow the git tags (`vX.Y.Z`); the package version is derived from the tag.
 
+To release: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`, update the
+compare links at the bottom, merge, and only then tag `vX.Y.Z`. The release workflow builds
+the GitHub release body from that section and stops if the tag has none.
+
 ## [0.3.0] - 2026-10-24
 
 External validation of lead variants against the AlphaGenome Atlas and the IGVF
