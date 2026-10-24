@@ -4,7 +4,7 @@ https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/genotypeio.py
 """
 import numpy as np
 import pandas as pd
-import os, gzip, sys
+import os, gzip, sys, re
 import threading, queue, bisect
 from pandas_plink import read_plink
 
@@ -22,6 +22,8 @@ __all__ = [
     "print_progress",
     "PlinkReader",
     "load_genotypes",
+    "variant_df_from_bim",
+    "alleles_from_variant_ids",
     "get_cis_ranges",
     "InputGeneratorCis",
 ]
@@ -191,14 +193,72 @@ class PlinkReader(object):
         """Load all genotypes into memory, as pd.DataFrame"""
         return pd.DataFrame(self.bed.compute(), index=self.bim['snp'], columns=self.fam['iid'])
 
+    @property
+    def variant_df(self):
+        """
+        Variant metadata indexed by variant ID with ``chrom``, ``pos``, ``ref``, ``alt``.
+
+        ``alt`` is the counted (dosage) allele. pandas_plink decodes the bed as
+        counts of ``a1`` (.bim column 6); the ``2 - bed`` flip applied in
+        :meth:`__init__` therefore makes the dosage count ``a0`` (.bim column 5,
+        PLINK A1), which is ALT for files written by ``plink2 --make-bed`` or
+        ``plink --keep-allele-order``.
+        """
+        return variant_df_from_bim(self.bim)
+
+
+def variant_df_from_bim(bim: pd.DataFrame) -> pd.DataFrame:
+    """``chrom, pos, ref, alt`` (plus ``rsid`` when IDs look like rsIDs) from a pandas_plink bim."""
+    df = bim.set_index('snp')[['chrom', 'pos']].copy()
+    df['ref'] = bim['a1'].to_numpy()
+    df['alt'] = bim['a0'].to_numpy()
+    ids = pd.Index(df.index.astype(str))
+    if ids.str.match(r"^rs\d+$").any():
+        df['rsid'] = np.where(ids.str.match(r"^rs\d+$"), ids, None)
+    return df
+
+
+_VARIANT_ID_PATTERN = re.compile(
+    r"^(?:chr)?(?P<chrom>[0-9XYMT]+|MT|M)[_:](?P<pos>\d+)[_:](?P<ref>[ACGTN]+)[_:](?P<alt>[ACGTN]+)(?:[_:].*)?$",
+    re.IGNORECASE,
+)
+
+
+def alleles_from_variant_ids(variant_df: pd.DataFrame, pattern=_VARIANT_ID_PATTERN,
+                             overwrite: bool = False) -> pd.DataFrame:
+    """
+    Fill ``ref``/``alt`` columns of ``variant_df`` from IDs shaped like
+    ``chr1_123_A_G_b38`` or ``1:123:A:G`` (GTEx / tensorQTL convention).
+
+    Opt-in helper: it is never called implicitly. IDs that do not match leave
+    NaN in ``ref``/``alt``. ``chrom``/``pos`` are kept when present and filled
+    from the ID otherwise.
+    """
+    out = variant_df.copy()
+    parts = pd.Index(out.index.astype(str)).str.extract(pattern)
+    parts.index = out.index
+    for col in ("ref", "alt"):
+        if col not in out.columns or overwrite:
+            out[col] = parts[col].str.upper().to_numpy()
+    if "chrom" not in out.columns:
+        out["chrom"] = parts["chrom"].to_numpy()
+    if "pos" not in out.columns:
+        out["pos"] = pd.to_numeric(parts["pos"], errors="coerce").to_numpy()
+    return out
+
 
 def load_genotypes(genotype_path, select_samples=None, dosages=False):
-    """Load all genotypes into a dataframe"""
+    """
+    Load all genotypes into a dataframe.
+
+    Returns ``(genotype_df, variant_df)``; for pgen and bed inputs ``variant_df``
+    carries ``chrom, pos, ref, alt`` with ``alt`` the counted (dosage) allele.
+    """
     if all([os.path.exists(f"{genotype_path}.{ext}") for ext in ['pgen', 'psam', 'pvar']]):
         if pgen is None:
             raise ImportError('Pgenlib must be installed to use PLINK 2 pgen/psam/pvar files.')
         pgr = pgen.PgenReader(genotype_path, select_samples=select_samples)
-        variant_df = pgr.pvar_df.set_index('id')[['chrom', 'pos']]
+        variant_df = pgr.pvar_df.set_index('id')[['chrom', 'pos', 'ref', 'alt']]
         if dosages:
             genotype_df = pgr.load_dosages()
         else:
@@ -206,7 +266,7 @@ def load_genotypes(genotype_path, select_samples=None, dosages=False):
     elif all([os.path.exists(f"{genotype_path}.{ext}") for ext in ['bed', 'bim', 'fam']]):
         pr = PlinkReader(genotype_path, select_samples=select_samples, dtype=np.int8)
         genotype_df = pr.load_genotypes()
-        variant_df = pr.bim.set_index('snp')[['chrom', 'pos']]
+        variant_df = pr.variant_df
     elif genotype_path.endswith(('.bed.parquet', '.bed.gz', '.bed')):
         genotype_df, variant_df = read_phenotype_bed(genotype_path)
         assert variant_df.columns[1] == 'pos', "The BED file must define a single position for each variant, with start + 1 == end."

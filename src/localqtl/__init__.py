@@ -11,8 +11,10 @@ _IS_RTD = os.environ.get("READTHEDOCS") == "True"
 if _IS_RTD:
     os.environ.setdefault("LOCALQTL_NO_GPU", "1")
 
+from . import annotate
 from . import cis
 from . import coloc
+from . import freq
 from . import finemap
 from . import genotypeio
 from . import haplotypeio
@@ -25,15 +27,17 @@ from . import stats
 from . import susie
 from . import utils
 
-from .cis import CisMapper, map_independent, map_nominal, map_permutations
+from .cis import CisMapper, map_independent, map_nominal, map_nominal_loci, map_permutations
 from .genotypeio import InputGeneratorCis, PlinkReader
 from .haplotypeio import FlareReader, InputGeneratorCisWithHaps, LocalAncestryPanel, RFMixReader, open_panel
+from .freq import FrequencyTable, ancestry_allele_frequencies, annotate_with_frequency
 from .phenotypeio import read_phenotype_bed
 from .pgen import PgenReader
 from .utils import gpu_available
 
 __all__ = [
     "map_nominal",
+    "map_nominal_loci",
     "map_permutations",
     "map_independent",
     "CisMapper",
@@ -47,9 +51,14 @@ __all__ = [
     "PgenReader",
     "InputGeneratorCis",
     "InputGeneratorCisWithHaps",
+    "FrequencyTable",
+    "ancestry_allele_frequencies",
+    "annotate_with_frequency",
+    "annotate",
     "cis",
     "coloc",
     "finemap",
+    "freq",
     "phenotypeio",
     "genotypeio",
     "haplotypeio",

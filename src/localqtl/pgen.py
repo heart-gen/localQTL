@@ -88,7 +88,8 @@ class PgenReader(object):
         if select_samples is not None:
             self.set_samples(select_samples)
 
-        variant_df = self.pvar_df.set_index('id')[['chrom', 'pos']].copy()
+        # ``alt`` is the counted (dosage) allele: pgenlib reports ALT-allele counts.
+        variant_df = self.pvar_df.set_index('id')[['chrom', 'pos', 'ref', 'alt']].copy()
         variant_df['index'] = np.arange(len(variant_df))
         self.variant_df = variant_df
         self.variant_dfs = {c:g[['pos', 'index']]

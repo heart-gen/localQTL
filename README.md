@@ -30,8 +30,9 @@ workflows, while adding ancestry-aware use cases.
 Install the latest release from PyPI:
 
 ```bash
-pip install localqtl            # CPU / PyTorch only
-pip install "localqtl[gpu]"     # + CuPy and cuDF (CUDA 12 wheels)
+pip install localqtl              # CPU / PyTorch only
+pip install "localqtl[gpu]"       # + CuPy and cuDF (CUDA 12 wheels)
+pip install "localqtl[annotate]"  # + pysam, for tabix access to gnomAD / ALFA frequency VCFs
 ```
 
 The core depends on PyTorch, numpy/scipy/pandas, pgenlib and rfmix-reader.
@@ -114,7 +115,13 @@ ancestry are `slope_anc{k}`, `slope_se_anc{k}`, `tstat_anc{k}`,
 `z_diff_anc{i}_anc{j}` / `pval_diff_anc{i}_anc{j}` test `beta_i = beta_j`
 using the full covariance of the ancestry betas. The standard `slope`,
 `slope_se`, `tstat`, `pval_nominal` columns carry the ancestry with the
-strongest effect.
+strongest effect. Each row also reports the in-sample per-ancestry allele
+statistics `an_anc{k}` (allele number), `ac_anc{k}` (count of the alt allele
+on ancestry-*k* haplotypes), `af_anc{k}` and `ma_count_anc{k}` (minor-allele
+count within the ancestry; fractional for posterior-expected counts). Pass
+`min_ancestry_ac=<count>` to mask (`NaN`) the effect estimates and pairwise
+differences of ancestries with fewer minor alleles than that in-sample; the
+variant row, pooled columns and `fstat_joint` are kept.
 
 ```python
 panel = RFMixReader("data/rfmix/", source="fb", keep_posteriors=True,
@@ -254,6 +261,61 @@ lead_df = mapper.map_independent(cis_df=perm_df, fdr=0.05)
 print(lead_df.head())
 ```
 
+### Allele metadata
+
+`PgenReader.variant_df` and `PlinkReader.variant_df` (and `load_genotypes`)
+now carry `chrom, pos, ref, alt`, where **`alt` is the counted (dosage)
+allele**: pgenlib reports ALT counts, and for PLINK 1 files the `2 - bed` flip
+makes the dosage count `.bim` column 5 (A1, which is ALT for
+`plink2 --make-bed` / `plink --keep-allele-order`). The `af` column in every
+result is the in-sample frequency of that counted allele. Variant tables that
+only have `chrom`/`pos` keep working; `genotypeio.alleles_from_variant_ids`
+parses GTEx-style `chr1_123_A_G_b38` IDs when needed.
+
+### Ancestry-aware allele-frequency QC (gnomAD / ALFA)
+
+`localqtl.freq` compares in-sample (per-ancestry) allele frequencies with
+external references and summarises p-value calibration by frequency bin and
+ancestry. References are held in a `FrequencyTable` keyed by
+`(chrom, pos, ref, alt)` on GRCh38 with `af_<group>`, `ac_<group>`,
+`an_<group>` columns, and are joined allele-aware (swapped ref/alt rows are
+re-oriented; A/T and C/G sites are flagged as strand-ambiguous).
+
+```python
+from localqtl import freq
+
+# gnomAD v4.1 sites VCFs (tabix; reads only the regions around your variants;
+# the gnomAD local-ancestry tract AF fields are detected from the header)
+gnomad = freq.from_gnomad_vcf("gnomad.genomes.v4.1.sites.chr*.vcf.bgz",
+                              variant_df=variant_df, groups=("afr", "nfe"))
+# NCBI ALFA (one GRCh38 VCF; populations are BioSample columns)
+alfa = freq.from_alfa_vcf("freq.vcf.gz", variant_df=variant_df, populations=("AFR", "AFA", "EUR"))
+# or, without pysam, read `bcftools query -H` output (recipes in localqtl.freq.bcftools)
+table = freq.from_bcftools_query_tsv("gnomad.chr22.freq.tsv")
+table.write("gnomad_chr22.freq.parquet")
+
+# panel labels -> reference groups: always explicit, no defaults
+ancestry_map = {"AFR": "afr", "EUR": "nfe"}
+
+insample = freq.ancestry_allele_frequencies(genotype_df, variant_df, panel)
+cmp_df = freq.compare_allele_frequencies(insample, gnomad, ancestry_map)
+summary = freq.summarize_af_concordance(cmp_df)          # r, |diff|, % discordant per MAF bin
+
+dosage_df = freq.annotate_with_frequency(dosage_df, variant_df, gnomad,
+                                         ancestry_map=ancestry_map, ancestry_labels=list(panel.ancestries))
+calib = freq.calibration_by_frequency_dosage(dosage_df, ancestry_labels=list(panel.ancestries),
+                                             by="af_ref_anc")  # lambda_GC, frac p<0.05, KS per bin
+
+# everything at once, with a permutation null for comparison
+bench = freq.run_frequency_benchmark(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
+                                     panel, gnomad, ancestry_map, drop_discordant=True, n_null=1)
+bench.write("qc/")
+```
+
+Only GRCh38 tables are accepted; strand flips are flagged, never corrected. The
+gnomAD local-ancestry-informed release covers bi-allelic SNPs with MAF > 0.1 %
+in the African/African American and Admixed American groups.
+
 ### Fine-mapping and colocalization
 
 The branch also adds SuSiE fine-mapping and COLOC colocalization helpers for
@@ -301,6 +363,7 @@ perm_annotated = annotate_with_coloc(perm_df, coloc_df)
 * The panel exposes `(variants, samples, channels)` int8 ancestry counts, one chromosome at a time (`panel.chrom_counts(chrom)`); with ≥3 ancestries every ancestry is a channel, with 2 ancestries a single channel is used (the other is `2 - first`).
 * Each genotype SNP is matched to the RFMix segment that covers it (`panel.locus_index(chrom, positions)`; `locus_method="nearest"` with `nearest_tolerance` for locus-level sources); SNPs no segment covers are dropped from the ancestry-aware model.
 * Sample order in `genotype_df`, `phenotype_df`, and `covariates_df` should match `H` (reindex as shown).
+* ``af`` in every output is the in-sample frequency of the counted (``alt``) allele, pooled over samples; ``af_anc{k}`` (dosage model) is the same quantity within ancestry *k*.
 * The cis-mapping helpers default to ``preload_haplotypes=True`` so the current chromosome's counts are staged as an int8 tensor on the requested device (GPU or CPU) and windows are sliced there. Override this flag when working under strict memory constraints.
 
 ## Testing

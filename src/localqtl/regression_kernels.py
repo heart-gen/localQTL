@@ -67,12 +67,13 @@ class Residualizer(object):
             self.Q_t = C_t.new_zeros((n_samples, 0))
             self.rank = 0
 
+        # k_eff = degrees of freedom consumed by centring (intercept) plus the
+        # projected-out covariates; the kernels compute dof = n - k_eff - p.
         if tensorqtl_flavor:
-            self.dof = n_samples - 2 - C_t.shape[1]
-            self.k_eff = C_t.shape[1]
+            self.k_eff = C_t.shape[1] + 1
         else:
-            self.dof = n_samples - 2 - self.rank
-            self.k_eff = self.rank
+            self.k_eff = self.rank + 1
+        self.dof = n_samples - self.k_eff - 1   # == tensorQTL's n - 2 - k
 
         if tensorqtl_flavor and self.rank < C_t.shape[1]:
             print(f"[warning] Covariate matrix has {C_t.shape[1] - self.rank} "
@@ -206,9 +207,10 @@ def run_batch_regression(y, G, H=None, k_eff: int = 0, device="cuda"):
     XtX = torch.matmul(X.transpose(1, 2), X)      # (m × p × p)
     Xty = torch.matmul(X.transpose(1, 2), y_exp)  # (m × p × 1)
 
-    # Regularize near-singular batches (Tikhonov / ridge with tiny lambda)
+    # Regularize near-singular batches (Tikhonov / ridge with tiny lambda);
+    # the absolute floor keeps an all-zero column from making the solve fail.
     diag_scale = torch.diagonal(XtX, dim1=1, dim2=2).abs().mean(dim=1, keepdim=True)  # (m, 1)
-    eps = 1e-6 * diag_scale.unsqueeze(-1)  # (m, 1, 1)
+    eps = (1e-6 * diag_scale + 1e-8).unsqueeze(-1)  # (m, 1, 1)
     I_p = torch.eye(p, device=device, dtype=XtX.dtype).unsqueeze(0)
     XtX_reg = XtX + eps * I_p
 
@@ -238,11 +240,17 @@ def run_batch_interaction_regression(
     interaction: torch.Tensor,
     k_eff: int = 0,
     device: str = "cuda",
+    H: torch.Tensor | None = None,
+    gi: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """
     Batched OLS for y ~ g + i + g:i (interaction model).
 
     All inputs are assumed to be pre-residualized against covariates and centered.
+    The product column(s) ``g:i`` should be residualized the same way (pass them
+    as ``gi``, shape ``(m, n, ni)``, e.g. from
+    :func:`localqtl.cis.common.project_interaction`); when ``gi`` is omitted
+    they are built as the raw ``G * interaction`` and the model has no intercept.
 
     Parameters
     ----------
@@ -254,9 +262,14 @@ def run_batch_interaction_regression(
         (n,) or (n, ni) interaction term(s), e.g. ancestry dosage or
         sample-level covariate.
     k_eff : int
-        Number of covariate columns already projected out (dof reduction).
+        Degrees of freedom already consumed by centring (intercept) and the
+        projected-out covariates (``Residualizer.k_eff``); dof = n - k_eff - p.
     device : str
         ``"cuda"`` or ``"cpu"``.
+    H : torch.Tensor, optional
+        (m, n, pH) per-variant nuisance columns (e.g. local-ancestry counts)
+        appended to the design as main effects; they reduce ``dof`` by ``pH``
+        and their coefficients are not reported.
 
     Returns
     -------
@@ -276,14 +289,23 @@ def run_batch_interaction_regression(
 
     m, n = G.shape
     ni = interaction.shape[1]
-    nb = 1 + 2 * ni  # g, i_1..i_ni, gi_1..gi_ni
+    pH = 0 if H is None else int(H.shape[2])
+    nb = 1 + 2 * ni + pH  # g, i_1..i_ni, gi_1..gi_ni, h_1..h_pH
 
-    # Build design matrix X: (m, n, 1+2*ni)
+    # Build design matrix X: (m, n, 1+2*ni+pH)
     g_col = G.unsqueeze(-1)                                        # (m, n, 1)
     i_cols = interaction.unsqueeze(0).expand(m, -1, -1)            # (m, n, ni)
-    gi_cols = G.unsqueeze(-1) * interaction.unsqueeze(0)           # (m, n, ni)
+    if gi is None:
+        gi_cols = G.unsqueeze(-1) * interaction.unsqueeze(0)       # (m, n, ni)
+    else:
+        gi_cols = move_to_device(gi, device)
+        if gi_cols.dim() == 2:
+            gi_cols = gi_cols.unsqueeze(-1)
 
-    X = torch.cat([g_col, i_cols, gi_cols], dim=2)                 # (m, n, nb)
+    cols = [g_col, i_cols, gi_cols]
+    if pH:
+        cols.append(move_to_device(H, device))
+    X = torch.cat(cols, dim=2)                                     # (m, n, nb)
     y_exp = y.unsqueeze(0).expand(m, -1).unsqueeze(-1)             # (m, n, 1)
 
     # Solve normal equations: (X'X) b = X'y
@@ -310,7 +332,8 @@ def run_batch_interaction_regression(
 
     tstats = betas / ses                                           # (m, nb)
 
-    # Unpack columns: g=0, i=1..ni, gi=ni+1..2*ni
+    # Unpack columns: g=0, i=1..ni, gi=ni+1..2*ni (H columns, if any, follow)
+    gi_end = 1 + 2 * ni
     result = {
         "b_g":      betas[:, 0],
         "se_g":     ses[:, 0],
@@ -318,9 +341,9 @@ def run_batch_interaction_regression(
         "b_i":      betas[:, 1:1+ni].squeeze(-1),
         "se_i":     ses[:, 1:1+ni].squeeze(-1),
         "tstat_i":  tstats[:, 1:1+ni].squeeze(-1),
-        "b_gi":     betas[:, 1+ni:].squeeze(-1),
-        "se_gi":    ses[:, 1+ni:].squeeze(-1),
-        "tstat_gi": tstats[:, 1+ni:].squeeze(-1),
+        "b_gi":     betas[:, 1+ni:gi_end].squeeze(-1),
+        "se_gi":    ses[:, 1+ni:gi_end].squeeze(-1),
+        "tstat_gi": tstats[:, 1+ni:gi_end].squeeze(-1),
         "dof":      dof,
     }
     return result
@@ -351,7 +374,8 @@ def run_batch_dosage_regression(
     L : torch.Tensor, optional
         (m, n, q) local-ancestry covariate columns (typically ``q = K - 1``).
     k_eff : int
-        Number of covariate columns already projected out (dof reduction).
+        Degrees of freedom already consumed by centring (intercept) and the
+        projected-out covariates (``Residualizer.k_eff``); dof = n - k_eff - p.
     device : str
         ``"cuda"`` or ``"cpu"``.
 

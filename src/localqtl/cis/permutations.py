@@ -25,6 +25,8 @@ from ._buffer import (
 )
 from .common import (
     residualize_matrix_with_covariates,
+    validate_ancestry_model,
+    project_interaction,
     residualize_batch,
     residualize_batch_interaction,
     prepare_interaction_covariate,
@@ -193,7 +195,7 @@ def _run_permutation_core(
             y_resid_t, G_resid, H_resid = residualize_batch(y_t, G_t, H_t, rez, center=True)
 
         # Compute effective covariate rank for DoF
-        k_eff = rez.Q_t.shape[1] if rez is not None else 0
+        k_eff = rez.k_eff if rez is not None else 1
 
         if interaction_mode:
             if H_resid is None:
@@ -281,7 +283,7 @@ def _run_permutation_core(
             c_t = interaction_covariate_t
             if c_t.device != G_resid.device:
                 c_t = c_t.to(G_resid.device)
-            I_t = G_resid * c_t
+            I_t = project_interaction(G_resid * c_t, rez)
             c_rep = c_t.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
             if H_resid is None:
                 H_cov = torch.cat([G_resid.unsqueeze(-1), c_rep], dim=2)
@@ -339,7 +341,7 @@ def _run_permutation_core(
             # Partial R^2 for genotype predictor
             n = int(y_resid_t.shape[0])
             p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-            dof = max(n - p_pred, 1)
+            dof = max(n - int(k_eff) - p_pred, 1)
             t_g = tstats[:, 0]
             t_sq = t_g.double().pow(2)
             r2_nominal_vec = (t_sq / (t_sq + dof)).to(torch.float32)
@@ -594,7 +596,7 @@ def _run_permutation_core_group(
                 pH = int(H_resid.shape[2])
                 n_anc = int(n_ancestries) if n_ancestries is not None else pH
                 H_cov = torch.cat([G_resid.unsqueeze(-1), H_resid], dim=2)
-                k_eff = rez.Q_t.shape[1] if rez is not None else 0
+                k_eff = rez.k_eff if rez is not None else 1
                 p_pred = 1 + int(H_cov.shape[2])
                 dof = max(int(y_resid.shape[0]) - int(k_eff) - int(p_pred), 1)
 
@@ -662,13 +664,13 @@ def _run_permutation_core_group(
                 c_t = interaction_covariate_t
                 if c_t.device != G_resid.device:
                     c_t = c_t.to(G_resid.device)
-                I_t = G_resid * c_t
+                I_t = project_interaction(G_resid * c_t, rez)
                 c_rep = c_t.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
                 if H_resid is None:
                     H_cov = torch.cat([G_resid.unsqueeze(-1), c_rep], dim=2)
                 else:
                     H_cov = torch.cat([G_resid.unsqueeze(-1), H_resid, c_rep], dim=2)
-                k_eff = rez.Q_t.shape[1] if rez is not None else 0
+                k_eff = rez.k_eff if rez is not None else 1
                 p_pred = 1 + int(H_cov.shape[2])
                 dof = max(int(y_resid.shape[0]) - int(k_eff) - int(p_pred), 1)
 
@@ -718,14 +720,14 @@ def _run_permutation_core_group(
                     y_resid=y_resid,
                     G_resid=G_resid,
                     H_resid=H_resid,
-                    k_eff=rez.Q_t.shape[1] if rez is not None else 0,
+                    k_eff=rez.k_eff if rez is not None else 1,
                     perm_stream=stream,
                     max_permutations=nperm,
                     return_nominal=True,
                     mixed_precision=mixed_precision,
                 )
                 p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-                dof = max(int(y_resid.shape[0]) - int(p_pred) - (rez.Q_t.shape[1] if rez is not None else 0), 1)
+                dof = max(int(y_resid.shape[0]) - int(p_pred) - (rez.k_eff if rez is not None else 1), 1)
                 r2_nominal_vec = torch.nan_to_num(r2_nominal_vec, nan=-1.0)
                 r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
                 ix = int(ix_t.item())
@@ -863,12 +865,10 @@ def map_permutations(
 
     if nperm is None or nperm <= 0:
         raise ValueError("nperm must be a positive integer for map_permutations.")
-    if ancestry_model == "interaction" and haplotypes is None:
-        raise ValueError("ancestry_model='interaction' requires haplotypes.")
-    if ancestry_model == "dosage":
-        raise ValueError("ancestry_model='dosage' is currently only implemented for map_nominal.")
-    if ancestry_model == "interaction" and interaction_covariate is not None:
-        raise ValueError("interaction_covariate cannot be combined with ancestry_model='interaction'.")
+    validate_ancestry_model(
+        ancestry_model, haplotypes=haplotypes, interaction_covariate=interaction_covariate,
+        allow_dosage=False, caller="map_permutations",
+    )
 
     covariates_use = covariates_df
     if isinstance(interaction_covariate, str) and covariates_df is not None:

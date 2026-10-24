@@ -9,7 +9,7 @@ from ..utils import SimpleLogger
 from ..stats import nominal_pvals_tensorqtl, get_t_pval, get_f_pval
 from ..iosinks import AsyncParquetSink
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
-from ..preproc import impute_mean_and_filter, allele_stats, filter_by_maf
+from ..preproc import impute_mean_and_filter, allele_stats, filter_by_maf, ancestry_allele_stats
 from ..regression_kernels import (
     run_batch_regression,
     run_batch_interaction_regression,
@@ -22,10 +22,13 @@ from .common import (
     residualize_batch_interaction,
     residualize_batch_dosage,
     prepare_interaction_covariate,
+    validate_ancestry_model,
+    project_interaction,
 )
 
 __all__ = [
     "map_nominal",
+    "map_nominal_loci",
 ]
 
 DEFAULT_ROW_GROUP_SIZE = 10_000_000
@@ -44,7 +47,13 @@ def _interaction_columns(n_ancestries: int) -> list[str]:
 
 
 def _dosage_columns(n_ancestries: int) -> list[str]:
-    """Columns of the ancestry-specific dosage model (``ancestry_model='dosage'``)."""
+    """
+    Columns of the ancestry-specific dosage model (``ancestry_model='dosage'``):
+    per-ancestry effects, the joint test, pairwise differences, then the
+    per-ancestry in-sample allele statistics (``an``: allele number, ``ac``:
+    counted-allele count, ``af``: ``ac/an``, ``ma_count``: minor-allele count
+    within the ancestry; fractional for posterior-expected ancestry counts).
+    """
     cols: list[str] = []
     for anc in range(n_ancestries):
         cols.extend([f"slope_anc{anc}", f"slope_se_anc{anc}", f"tstat_anc{anc}", f"pval_anc{anc}"])
@@ -52,6 +61,8 @@ def _dosage_columns(n_ancestries: int) -> list[str]:
     for i in range(n_ancestries):
         for j in range(i + 1, n_ancestries):
             cols.extend([f"z_diff_anc{i}_anc{j}", f"pval_diff_anc{i}_anc{j}"])
+    for anc in range(n_ancestries):
+        cols.extend([f"an_anc{anc}", f"ac_anc{anc}", f"af_anc{anc}", f"ma_count_anc{anc}"])
     return cols
 
 
@@ -163,12 +174,13 @@ def _buffers_to_arrow(buffers: dict[str, np.ndarray], schema: pa.Schema, n_rows:
 
 
 def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float = 0.0,
-                      chrom: str | None = None, sink: "ParquetSink | None" = None,
+                      chrom: str | None = None, sink: "AsyncParquetSink | None" = None,
                       target_rows: int | None = None, logger: SimpleLogger | None = None,
                       total_phenotypes: int | None = None,
                       ancestry_model: str | None = None,
                       n_ancestries: int | None = None,
-                      interaction_covariate_t: torch.Tensor | None = None):
+                      interaction_covariate_t: torch.Tensor | None = None,
+                      min_ancestry_ac: float = 0.0):
     """
     Shared inner loop for nominal (and optional permutation) mapping.
     Handles both InputGeneratorCis (no haps) and InputGeneratorCisWithHaps (haps).
@@ -299,6 +311,11 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
         interaction_mode = ancestry_model == "interaction" and H_t is not None
         dosage_mode = ancestry_model == "dosage" and H_t is not None
         covar_interaction = interaction_covariate_t is not None
+        # Per-ancestry allele statistics from the raw (imputed, un-residualized) block
+        anc_stats_np: dict[str, np.ndarray] | None = None
+        if dosage_mode:
+            anc_stats_np = {k: v.detach().cpu().numpy().astype(np.float32)
+                            for k, v in ancestry_allele_stats(G_t, H_t).items()}
         if interaction_mode:
             y_resid, G_resid, H_resid, I_resid = residualize_batch_interaction(
                 P_list if group_mode else P_list[0], G_t, H_t, rez, center=True,
@@ -325,7 +342,7 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
             var_ids = idx_to_id[v_idx]
             var_pos = pos_arr[v_idx].astype(np.int32, copy=False)
             variant_cache[cache_key] = (var_ids, var_pos)
-        k_eff = rez.Q_t.shape[1] if rez is not None else 0
+        k_eff = rez.k_eff if rez is not None else 1
 
         # Per-phenotype regressions in this window
         for y_t, pid in y_iter:
@@ -342,6 +359,14 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 se_np = res["ses"].detach().cpu().numpy()
                 t_np = res["tstats"].detach().cpu().numpy()
                 cov_np = res["cov"].detach().cpu().numpy().astype(np.float64)   # (m, K, K)
+                # Mask ancestries with too few minor alleles in-sample (report-level
+                # mask: the design and fstat_joint are unchanged).
+                masked = None
+                if min_ancestry_ac and min_ancestry_ac > 0 and anc_stats_np is not None:
+                    masked = anc_stats_np["ma_count"] < float(min_ancestry_ac)   # (m, K)
+                    b_np = np.where(masked, np.nan, b_np)
+                    se_np = np.where(masked, np.nan, se_np)
+                    t_np = np.where(masked, np.nan, t_np)
                 dosage_vals = {}
                 for k in range(K):
                     dosage_vals[f"slope_anc{k}"] = b_np[:, k]
@@ -355,10 +380,20 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                     for j in range(i + 1, K):
                         var = cov_np[:, i, i] + cov_np[:, j, j] - 2.0 * cov_np[:, i, j]
                         z = (b_np[:, i] - b_np[:, j]) / np.sqrt(np.maximum(var, 1e-30))
+                        if masked is not None:
+                            z = np.where(masked[:, i] | masked[:, j], np.nan, z)
                         dosage_vals[f"z_diff_anc{i}_anc{j}"] = z
                         dosage_vals[f"pval_diff_anc{i}_anc{j}"] = get_t_pval(z, dof)
-                # Lead signal = ancestry with the strongest effect
-                best_k = np.nanargmax(np.abs(t_np), axis=1)
+                if anc_stats_np is not None:
+                    for k in range(K):
+                        dosage_vals[f"an_anc{k}"] = anc_stats_np["an"][:, k]
+                        dosage_vals[f"ac_anc{k}"] = anc_stats_np["ac"][:, k]
+                        dosage_vals[f"af_anc{k}"] = anc_stats_np["af"][:, k]
+                        dosage_vals[f"ma_count_anc{k}"] = anc_stats_np["ma_count"][:, k]
+                # Lead signal = ancestry with the strongest (unmasked) effect
+                abs_t = np.abs(t_np)
+                all_nan = np.all(np.isnan(abs_t), axis=1)
+                best_k = np.nanargmax(np.where(all_nan[:, None], 0.0, abs_t), axis=1)
                 row_ix = np.arange(t_np.shape[0])
                 slope = b_np[row_ix, best_k]
                 slope_se = se_np[row_ix, best_k]
@@ -412,9 +447,12 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 if c_t.device != G_resid.device:
                     c_t = c_t.to(G_resid.device)
 
-                # Joint model: y ~ g + c + g*c via interaction kernel
+                # Joint model: y ~ g + c + g*c (+ local-ancestry main effects H);
+                # the g*c column is residualized like g (Frisch–Waugh).
+                gi_t = project_interaction(G_resid * c_t, rez)
                 cov_int_result = run_batch_interaction_regression(
-                    y=y_t, G=G_resid, interaction=c_t, k_eff=k_eff, device=device
+                    y=y_t, G=G_resid, interaction=c_t, k_eff=k_eff, device=device,
+                    H=H_resid, gi=gi_t,
                 )
                 int_dof = cov_int_result["dof"]
 
@@ -560,18 +598,30 @@ def map_nominal(
         preload_haplotypes: bool = True, tensorqtl_flavor: bool = False,
         ancestry_model: str = "main",
         interaction_covariate: Optional[object] = None,
+        min_ancestry_ac: float = 0.0,
     ) -> pd.DataFrame:
     """
     Nominal cis-QTL scan with optional permutations and local ancestry.
 
     Adjusts for covariates by residualizing y, G, and H across samples using the
-    same Residualizer (projection onto the orthogonal complement of C).
+    same Residualizer (projection onto the orthogonal complement of C). Without
+    covariates every matrix is centred, which is equivalent to an intercept.
 
     Parameters
     ----------
     preload_haplotypes : bool, default True
         When haplotypes are provided, pre-load them into a contiguous torch.Tensor
         on the requested device to avoid per-batch host<->device transfers.
+    ancestry_model : {"main", "interaction", "dosage"}
+        ``"main"`` adjusts for local-ancestry counts; ``"interaction"`` fits GxH
+        terms; ``"dosage"`` fits one effect per ancestry and also reports the
+        per-ancestry in-sample allele statistics ``an_anc{k}``, ``ac_anc{k}``,
+        ``af_anc{k}``, ``ma_count_anc{k}``.
+    min_ancestry_ac : float, default 0
+        Dosage model only. Ancestries whose in-sample minor-allele count
+        (``ma_count_anc{k}``) is below this value get NaN effect estimates and
+        NaN pairwise differences; the variant row is kept and ``fstat_joint``
+        is unchanged.
     """
     device = device if device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
     torch_device = torch.device(device)
@@ -598,7 +648,8 @@ def map_nominal(
         logger.write("  * ancestry model: ancestry-specific dosage "
                      f"({'posterior-expected' if getattr(haplotypes, 'use_posterior', False) else 'hard-call'} ancestry counts)")
     if interaction_covariate is not None:
-        logger.write("  * covariate interaction: GxC")
+        logger.write("  * covariate interaction: GxC"
+                     + (" (+ local ancestry main effects)" if haplotypes is not None else ""))
     if nperm is not None:
         logger.write(f"  * computing tensorQTL-style nominal p-values and {nperm:,} permutations")
 
@@ -617,14 +668,16 @@ def map_nominal(
     )
 
     # Validate interaction / dosage arguments
-    if ancestry_model not in ("main", "interaction", "dosage"):
-        raise ValueError(f"Unknown ancestry_model {ancestry_model!r}; use 'main', 'interaction' or 'dosage'.")
-    if ancestry_model in ("interaction", "dosage") and haplotypes is None:
-        raise ValueError(f"ancestry_model='{ancestry_model}' requires haplotypes.")
-    if ancestry_model in ("interaction", "dosage") and interaction_covariate is not None:
-        raise ValueError(f"interaction_covariate cannot be combined with ancestry_model='{ancestry_model}'.")
+    validate_ancestry_model(
+        ancestry_model, haplotypes=haplotypes, interaction_covariate=interaction_covariate,
+        allow_dosage=True, caller="map_nominal",
+    )
     if ancestry_model == "dosage" and nperm is not None and nperm > 0:
         raise ValueError("ancestry_model='dosage' does not support nperm (permutations) yet.")
+    if min_ancestry_ac and min_ancestry_ac > 0:
+        if ancestry_model != "dosage":
+            raise ValueError("min_ancestry_ac is only meaningful with ancestry_model='dosage'.")
+        logger.write(f"  * masking ancestry effects with in-sample minor-allele count < {min_ancestry_ac:g}")
 
     # Prepare covariates: drop interaction column from covariates if it was named there
     covariates_use = covariates_df
@@ -680,6 +733,7 @@ def map_nominal(
                             ancestry_model=ancestry_model,
                             n_ancestries=n_anc,
                             interaction_covariate_t=interaction_cov_t,
+                            min_ancestry_ac=min_ancestry_ac,
                         )
                         # logger.write(f"{chrom}: ~{sink.rows:,} rows written")
                 if logger.verbose:
@@ -698,7 +752,8 @@ def map_nominal(
                                     total_phenotypes=total_phenotypes,
                                     ancestry_model=ancestry_model,
                                     n_ancestries=_n_ancestries(haplotypes, ancestry_model),
-                                    interaction_covariate_t=interaction_cov_t)
+                                    interaction_covariate_t=interaction_cov_t,
+                                    min_ancestry_ac=min_ancestry_ac)
     if logger.verbose:
         elapsed = time.time() - overall_start
         logger.write(f"    Completed nominal scan in {elapsed / 60:.2f} min")
@@ -722,38 +777,77 @@ def map_nominal_loci(
     Parameters
     ----------
     locus_df : DataFrame
-        Must contain ``phenotype_id`` and either:
-        - ``chr``, ``start``, ``end`` (explicit window), or
-        - ``chr``, ``position`` (uses ``window`` kwarg for +/- padding).
+        Must contain ``phenotype_id`` and ``chr`` plus either
+        ``start``/``end`` (explicit window, tested as-is) or ``position``
+        (tested as ``position ± window``). Several loci per phenotype are
+        allowed; the phenotype is then reported once per locus with the
+        suffix ``__locus{i}`` appended to ``phenotype_id``.
     genotype_df, variant_df, phenotype_df, covariates_df
         As in :func:`map_nominal`.
+    window : int, default 1_000_000
+        Padding applied to ``position``; ignored when ``start``/``end`` are
+        given. The padding is applied exactly once.
     **kwargs
-        Passed through to :func:`map_nominal`.
+        Passed through to :func:`map_nominal` (``phenotype_pos_df`` and
+        ``window`` are managed here and may not be passed).
 
     Returns
     -------
     DataFrame
-        Nominal scan results for the specified loci only.
+        Nominal scan results for the specified loci only (``out_dir`` defaults
+        to ``None`` here so a DataFrame is returned).
     """
-    window = kwargs.pop('window', 1_000_000)
+    if "phenotype_pos_df" in kwargs:
+        raise ValueError("map_nominal_loci builds phenotype_pos_df from locus_df; do not pass it.")
+    window = int(kwargs.pop("window", 1_000_000))
+    kwargs.setdefault("out_dir", None)
+    logger = kwargs.get("logger") or SimpleLogger(verbose=kwargs.get("verbose", True),
+                                                   timestamps=True)
+    kwargs["logger"] = logger
+
+    required = {"phenotype_id", "chr"}
+    missing = required - set(locus_df.columns)
+    if missing:
+        raise ValueError(f"locus_df is missing required columns: {sorted(missing)}")
     locus_df = locus_df.copy()
+    if "position" in locus_df.columns:
+        pos = locus_df["position"].astype(np.int64)
+        locus_df["start"] = np.maximum(pos - window, 1)
+        locus_df["end"] = pos + window
+    elif not {"start", "end"}.issubset(locus_df.columns):
+        raise ValueError("locus_df needs either 'position' or both 'start' and 'end'.")
+    locus_df["start"] = np.maximum(locus_df["start"].astype(np.int64), 1)
+    locus_df["end"] = locus_df["end"].astype(np.int64)
 
-    if 'position' in locus_df.columns:
-        locus_df['start'] = np.maximum(locus_df['position'] - window, 1)
-        locus_df['end'] = locus_df['position'] + window
+    known = locus_df["phenotype_id"].isin(phenotype_df.index)
+    if (~known).any():
+        dropped = locus_df.loc[~known, "phenotype_id"].unique()
+        logger.write(f"  * dropping {len(dropped)} loci whose phenotype is not in phenotype_df")
+        locus_df = locus_df.loc[known]
+    if locus_df.empty:
+        raise ValueError("No loci left after matching phenotype_df.")
 
-    pids = locus_df['phenotype_id'].unique()
-    phenotype_sub = phenotype_df.loc[phenotype_df.index.intersection(pids)]
+    # One output phenotype per locus; suffix only when a phenotype has >1 locus.
+    counts = locus_df.groupby("phenotype_id")["phenotype_id"].transform("size")
+    rank = locus_df.groupby("phenotype_id").cumcount()
+    out_ids = np.where(counts > 1,
+                       locus_df["phenotype_id"].astype(str) + "__locus" + rank.astype(str),
+                       locus_df["phenotype_id"].astype(str))
+    phenotype_sub = phenotype_df.loc[locus_df["phenotype_id"].to_numpy()].copy()
+    phenotype_sub.index = pd.Index(out_ids, name=phenotype_df.index.name)
+    pos_df = pd.DataFrame({
+        "chr": locus_df["chr"].astype(str).to_numpy(),
+        "start": locus_df["start"].to_numpy(),
+        "end": locus_df["end"].to_numpy(),
+    }, index=phenotype_sub.index)
 
-    pos_df = locus_df[['phenotype_id', 'chr', 'start', 'end']].drop_duplicates(
-        'phenotype_id').set_index('phenotype_id')
-
+    # window=0: the generator uses exactly [start, end] (already padded above).
     return map_nominal(
         genotype_df=genotype_df,
         variant_df=variant_df,
         phenotype_df=phenotype_sub,
         phenotype_pos_df=pos_df,
         covariates_df=covariates_df,
-        window=window,
+        window=0,
         **kwargs,
     )

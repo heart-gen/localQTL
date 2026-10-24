@@ -5,7 +5,7 @@ from typing import Mapping, Optional, Sequence, Union
 
 from ..utils import SimpleLogger, pick_device
 from ..stats import calculate_qvalues as _calculate_qvalues
-from .nominal import map_nominal as _map_nominal
+from .nominal import map_nominal as _map_nominal, map_nominal_loci as _map_nominal_loci
 from .permutations import map_permutations as _map_permutations
 from .independent import map_independent as _map_independent
 from .postproc import get_significant_pairs as _get_significant_pairs
@@ -70,7 +70,8 @@ class CisMapper:
     def map_nominal(self, nperm: Optional[int] = None,
                     maf_threshold: Optional[float] = None,
                     ancestry_model: str = "main",
-                    interaction_covariate: Optional[object] = None) -> pd.DataFrame:
+                    interaction_covariate: Optional[object] = None,
+                    min_ancestry_ac: float = 0.0) -> pd.DataFrame:
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
         return _map_nominal(
             genotype_df=self.genotype_df,
@@ -94,6 +95,25 @@ class CisMapper:
             verbose=getattr(self.logger, "verbose", True),
             ancestry_model=ancestry_model,
             interaction_covariate=interaction_covariate,
+            min_ancestry_ac=min_ancestry_ac,
+        )
+
+    def map_nominal_loci(self, locus_df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+        """Nominal scan restricted to the loci in ``locus_df`` (see :func:`map_nominal_loci`)."""
+        kwargs.setdefault("maf_threshold", self.maf_threshold)
+        kwargs.setdefault("window", self.window)
+        kwargs.setdefault("device", self.device)
+        kwargs.setdefault("logger", self.logger)
+        kwargs.setdefault("tensorqtl_flavor", self.tensorqtl_flavor)
+        kwargs.setdefault("haplotypes", self.haplotypes)
+        kwargs.setdefault("loci_df", self.loci_df)
+        return _map_nominal_loci(
+            locus_df,
+            genotype_df=self.genotype_df,
+            variant_df=self.variant_df,
+            phenotype_df=self.phenotype_df,
+            covariates_df=self.covariates_df,
+            **kwargs,
         )
 
     def map_permutations(

@@ -22,6 +22,8 @@ from ._buffer import (
 )
 from .common import (
     align_like_casefold,
+    validate_ancestry_model,
+    project_interaction,
     residualize_batch,
     residualize_batch_interaction,
     prepare_interaction_covariate,
@@ -198,7 +200,6 @@ def _run_independent_core(
 
             interaction_mode = ancestry_model == "interaction" and H_t is not None
             covar_interaction = interaction_covariate_t is not None
-            covar_interaction = interaction_covariate_t is not None
 
             pH = 0 if H_t is None else int(H_t.shape[2])
             perm_chunk_local = _auto_perm_chunk(G_t.shape[0], nperm, pH=pH)
@@ -207,7 +208,7 @@ def _run_independent_core(
 
             rez_cov = Residualizer(covariates_base_t, tensorqtl_flavor=tensorqtl_flavor) if covariates_base_t is not None else None
             y0, G0, H0 = residualize_batch(y_t, G_t, H_t, rez_cov, center=True, group=False)
-            k_base = rez_cov.k_eff if rez_cov is not None else 0
+            k_base = rez_cov.k_eff if rez_cov is not None else 1
 
             perm_seed_base = subseed(seed, pid) if seed is not None else None
             gen = None
@@ -261,7 +262,7 @@ def _run_independent_core(
                         )
                     else:
                         y_resid, G_resid, H_resid = y0, G0, H0
-                k_eff = k_base + (rez_extra.k_eff if rez_extra is not None else 0)
+                k_eff = k_base + (rez_extra.rank if rez_extra is not None else 0)
                 cap = nperm if stage1_cap is None else min(nperm, stage1_cap)
                 if interaction_mode:
                     if H_resid is None:
@@ -382,7 +383,7 @@ def _run_independent_core(
                     c_t = interaction_covariate_t
                     if c_t.device != G_resid.device:
                         c_t = c_t.to(G_resid.device)
-                    I_t = G_resid * c_t
+                    I_t = project_interaction(project_interaction(G_resid * c_t, rez_cov), rez_extra)
                     c_rep = c_t.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
                     if H_resid is None:
                         H_cov = torch.cat([G_resid.unsqueeze(-1), c_rep], dim=2)
@@ -585,6 +586,9 @@ def _run_independent_core(
 
                 ix = eval_res["ix"]
                 var_id = idx_to_id[v_idx[ix]]
+                if var_id in dosage_proj or len(forward_records) > int(G_t.shape[0]):
+                    # already conditioned on (degenerate tie) or every variant used: stop
+                    break
                 var_pos = int(pos_arr[v_idx[ix]])
                 start_pos = ig.phenotype_start[pid]
                 end_pos = ig.phenotype_end[pid]
@@ -631,8 +635,10 @@ def _run_independent_core(
                         forward_records[-1][interaction_columns[base + 2]] = eval_res["tstat_gxh"][anc_idx]
                         forward_records[-1][interaction_columns[base + 3]] = eval_res["pval_gxh"][anc_idx]
 
-                if var_id in var_in_frame and var_id in ig.genotype_df.index and var_id not in dosage_proj:
+                if var_id in var_in_frame and var_id in ig.genotype_df.index:
                     ensure_projected(var_id)
+                else:
+                    break   # cannot condition on this variant; stop the forward pass
 
             if not forward_records:
                 continue
@@ -856,6 +862,7 @@ def _run_independent_core_group(
                     H_t = H_t[keep_maf]
 
             interaction_mode = ancestry_model == "interaction" and H_t is not None
+            covar_interaction = interaction_covariate_t is not None
 
             pH = 0 if H_t is None else int(H_t.shape[2])
             perm_chunk_local = _auto_perm_chunk(G_t.shape[0], nperm, pH=pH)
@@ -873,7 +880,7 @@ def _run_independent_core_group(
 
             rez_cov = Residualizer(covariates_base_t, tensorqtl_flavor=tensorqtl_flavor) if covariates_base_t is not None else None
             y_base_list, G0, H0 = residualize_batch(y_stack, G_t, H_t, rez_cov, center=True, group=True)
-            k_base = rez_cov.k_eff if rez_cov is not None else 0
+            k_base = rez_cov.k_eff if rez_cov is not None else 1
 
             perm_seed_base = subseed(seed, f"group:{group_id}") if seed is not None else None
             gen = None
@@ -926,7 +933,7 @@ def _run_independent_core_group(
                         )
                     else:
                         y_resid_list, G_resid, H_resid = y_base_list, G0, H0
-                k_eff = k_base + (rez_extra.k_eff if rez_extra is not None else 0)
+                k_eff = k_base + (rez_extra.rank if rez_extra is not None else 0)
                 num_var = int(G_resid.shape[0])
                 stage_cap = nperm if stage1_cap is None else min(nperm, stage1_cap)
 
@@ -1140,7 +1147,7 @@ def _run_independent_core_group(
                     c_t = interaction_covariate_t
                     if c_t.device != G_resid.device:
                         c_t = c_t.to(G_resid.device)
-                    I_t = G_resid * c_t
+                    I_t = project_interaction(project_interaction(G_resid * c_t, rez_cov), rez_extra)
                     c_rep = c_t.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
                     if H_resid is None:
                         H_cov = torch.cat([G_resid.unsqueeze(-1), c_rep], dim=2)
@@ -1491,6 +1498,8 @@ def _run_independent_core_group(
                 best_ix_pheno = eval_res["best_pheno_idx"]
                 pid_best = ids_list[best_ix_pheno]
                 var_id = idx_to_id[v_idx[best_ix_var]]
+                if var_id in dosage_proj or len(forward_records) > int(G_t.shape[0]):
+                    break
                 var_pos = int(pos_arr[v_idx[best_ix_var]])
                 start_pos = ig.phenotype_start[pid_best]
                 end_pos = ig.phenotype_end[pid_best]
@@ -1539,8 +1548,10 @@ def _run_independent_core_group(
                         forward_records[-1][interaction_columns[base + 2]] = eval_res["tstat_gxh"][anc_idx]
                         forward_records[-1][interaction_columns[base + 3]] = eval_res["pval_gxh"][anc_idx]
 
-                if var_id in var_in_frame and var_id in geno_has_variant and var_id not in dosage_proj:
+                if var_id in var_in_frame and var_id in geno_has_variant:
                     ensure_projected(var_id)
+                else:
+                    break
 
             if not forward_records:
                 continue
@@ -1658,8 +1669,10 @@ def map_independent(
               else (device if device in ("cuda", "cpu") else "cpu"))
     torch_device = torch.device(device)
     logger = logger or SimpleLogger(verbose=verbose, timestamps=True)
-    if ancestry_model == "dosage":
-        raise ValueError("ancestry_model='dosage' is currently only implemented for map_nominal.")
+    validate_ancestry_model(
+        ancestry_model, haplotypes=haplotypes, interaction_covariate=interaction_covariate,
+        allow_dosage=False, caller="map_independent",
+    )
     sync = (torch.cuda.synchronize if device == "cuda" else None)
 
     if not phenotype_df.index.equals(phenotype_pos_df.index):
@@ -1718,10 +1731,6 @@ def map_independent(
 
     if nperm is None or nperm <= 0:
         raise ValueError("nperm must be a positive integer for map_independent.")
-    if ancestry_model == "interaction" and haplotypes is None:
-        raise ValueError("ancestry_model='interaction' requires haplotypes.")
-    if ancestry_model == "interaction" and interaction_covariate is not None:
-        raise ValueError("interaction_covariate cannot be combined with ancestry_model='interaction'.")
 
     covariates_use = covariates_df
     if isinstance(interaction_covariate, str) and covariates_df is not None:
