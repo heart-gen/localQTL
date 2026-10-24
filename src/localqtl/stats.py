@@ -11,12 +11,13 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 from scipy.special import betaln
-from py_qvalue import qvalue, pi0est
+from py_qvalue import qvalue
 from typing import Optional, Sequence, Union
 
 from .utils import SimpleLogger
 __all__ = [
     "beta_approx_pval",
+    "fit_beta_parameters",
     "get_t_pval",
     "get_f_pval",
     "test_beta_difference",
@@ -159,6 +160,27 @@ def _beta_mle_on_p(p):
     if not (np.isfinite(a) and np.isfinite(b) and a > 0 and b > 0):
         return float(a0), float(b0)
     return float(a), float(b)
+
+
+def fit_beta_parameters(r2_perm, dof_init, tol: float = 1e-4, return_minp: bool = False):
+    """
+    Fit the Beta approximation to a vector of permutation maximum ``r2`` values
+    (tensorQTL ``fit_beta_parameters``): estimate the effective degrees of
+    freedom ``true_dof`` such that the moment-matched first Beta shape is 1,
+    then fit ``Beta(a, b)`` by maximum likelihood to the p-values obtained
+    with ``true_dof``.
+
+    Returns ``(beta_shape1, beta_shape2, true_dof)`` or, with
+    ``return_minp``, ``(beta_shape1, beta_shape2, true_dof, pval_true_dof)``
+    where the last element is the per-permutation minimum p-value vector.
+    """
+    r2_perm = np.asarray(r2_perm, dtype=np.float64)
+    true_dof = _solve_true_dof(r2_perm, float(dof_init), tol=tol)
+    p_perm = pval_from_corr_r2(r2_perm, true_dof)
+    a, b = _beta_mle_on_p(p_perm)
+    if return_minp:
+        return float(a), float(b), float(true_dof), p_perm
+    return float(a), float(b), float(true_dof)
 
 
 def beta_approx_pval(r2_perm, r2_true, dof_init, log10=False):

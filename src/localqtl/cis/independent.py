@@ -383,8 +383,9 @@ def _run_independent_core(
                     c_t = interaction_covariate_t
                     if c_t.device != G_resid.device:
                         c_t = c_t.to(G_resid.device)
-                    I_t = project_interaction(project_interaction(G_resid * c_t, rez_cov), rez_extra)
-                    c_rep = c_t.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
+                    I_t = project_interaction(project_interaction(G_t * c_t, rez_cov), rez_extra)
+                    c_res = project_interaction(project_interaction(c_t.unsqueeze(0), rez_cov), rez_extra)[0]
+                    c_rep = c_res.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
                     if H_resid is None:
                         H_cov = torch.cat([G_resid.unsqueeze(-1), c_rep], dim=2)
                     else:
@@ -1147,8 +1148,9 @@ def _run_independent_core_group(
                     c_t = interaction_covariate_t
                     if c_t.device != G_resid.device:
                         c_t = c_t.to(G_resid.device)
-                    I_t = project_interaction(project_interaction(G_resid * c_t, rez_cov), rez_extra)
-                    c_rep = c_t.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
+                    I_t = project_interaction(project_interaction(G_t * c_t, rez_cov), rez_extra)
+                    c_res = project_interaction(project_interaction(c_t.unsqueeze(0), rez_cov), rez_extra)[0]
+                    c_rep = c_res.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
                     if H_resid is None:
                         H_cov = torch.cat([G_resid.unsqueeze(-1), c_rep], dim=2)
                     else:

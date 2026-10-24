@@ -45,6 +45,11 @@ documentation-only call-outs for common production workflows:
   requirements and play nicely with containerised deployments. The
   :mod:`localqtl.stats` module exposes the q-value helpers used by the high-level
   APIs.
+- **tensorQTL feature parity**: :mod:`localqtl.trans` (trans-QTL mapping and
+  permutation null), :mod:`localqtl.eigenmt`, multi-term ``interaction_df``
+  scans with top-association output, ``paired_covariate_df``,
+  :mod:`localqtl.post` (aFC, replication, gene annotation), tabix VCF readers,
+  chunked pgen processing and the ``localqtl`` command line.
 
 Installation
 ------------
@@ -145,10 +150,11 @@ for tensorQTL-compatible TSV/Parquet naming conventions and column layouts.
 Covariate interaction models
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The cis-mapping entry points also support genotype-by-covariate interaction
-tests by passing ``interaction_covariate``. Accepted forms are a covariate
-column name in ``covariates_df``, a :class:`pandas.Series` indexed by sample
-IDs, or a 1D array-like already aligned to the sample order.
+The cis-mapping entry points support genotype-by-covariate interaction tests.
+``interaction_df`` (tensorQTL's argument; a DataFrame of samples x terms or a
+Series) fits ``y ~ g + i_1..i_k + g:i_1..g:i_k``; the legacy
+``interaction_covariate`` takes a single z-scored term (covariate column name,
+:class:`pandas.Series` or aligned 1D array).
 
 .. code-block:: python
 
@@ -158,19 +164,80 @@ IDs, or a 1D array-like already aligned to the sample order.
        phenotype_df=phenotype_df,
        phenotype_pos_df=phenotype_pos_df,
        covariates_df=covariates_df,
-       interaction_covariate="age",
+       interaction_df=covariates_df[["age"]],
+       maf_threshold_interaction=0.05,
+       run_eigenmt=True,
        device="auto",
-       return_df=True,
+       out_dir=None,
    )
+   top_df = interaction_df.attrs["top_assoc"]
 
    interaction_df[[
        "variant_id", "pval_nominal", "pval_g", "pval_i", "pval_gi"
    ]].head()
 
-In this mode the result includes the standard nominal columns plus the
-joint-model coefficients ``b_g``, ``b_i``, ``b_gi`` and their standard errors,
-t-statistics, and p-values. ``interaction_covariate`` is mutually exclusive
-with ``ancestry_model="interaction"``.
+With one term the result includes the standard nominal columns plus the
+joint-model coefficients ``b_g``, ``b_i``, ``b_gi`` with standard errors
+(``se_*``), t-statistics and p-values; with several terms the variable names
+are substituted (``b_age``, ``pval_g-age``, ...).  ``i`` and ``g:i`` are
+residualized against the covariates like ``g`` (Frisch–Waugh), so the fit
+equals a full OLS of ``y ~ 1 + g + i + g:i + C``.  The top association per
+phenotype (or group) is collected with optional eigenMT correction
+(``tests_emt``, ``pval_emt``, ``pval_adj_bh``) and written to
+``<out_prefix>.top_assoc.txt.gz`` (``top_assoc_path``); ``write_stats=False``
+skips the pair-level output.  ``interaction_df`` is mutually exclusive with
+``ancestry_model="interaction"``.
+
+``paired_covariate_df`` (phenotypes x samples) adds one phenotype-specific
+covariate to the shared covariates in :func:`localqtl.cis.map_nominal` and
+:func:`localqtl.cis.map_permutations`.
+
+trans-QTL mapping and tensorQTL post-processing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:mod:`localqtl.trans` mirrors tensorQTL's ``trans`` module
+(:func:`localqtl.trans.map_trans`, :func:`localqtl.trans.filter_cis`,
+:func:`localqtl.trans.map_trans_permutations`,
+:func:`localqtl.trans.apply_permutations`); a
+:class:`~localqtl.haplotypeio.LocalAncestryPanel` passed as ``haplotypes``
+(with ``variant_df``) adds per-variant local-ancestry main effects.
+:mod:`localqtl.eigenmt` estimates the effective number of tests per
+cis-window, and :mod:`localqtl.post` provides
+:func:`~localqtl.post.calculate_afc` (mixQTL total-read-count model),
+:func:`~localqtl.post.calculate_replication` and
+:func:`~localqtl.post.annotate_genes`.
+
+.. code-block:: python
+
+   from localqtl import trans, eigenmt, post
+
+   pairs_df = trans.map_trans(genotype_df, phenotype_df, covariates_df,
+                              pval_threshold=1e-5, maf_threshold=0.05, return_r2=True)
+   pairs_df = trans.filter_cis(pairs_df, phenotype_pos_df, variant_df, window=5_000_000)
+   null = trans.map_trans_permutations(genotype_df, covariates_df, nperms=10_000, seed=1)
+   pairs_df = trans.apply_permutations(null, pairs_df)
+
+   tests_emt = eigenmt.run_eigenmt(genotype_df, variant_df, phenotype_df, phenotype_pos_df)
+
+Command line
+~~~~~~~~~~~~
+
+``python -m localqtl`` / ``localqtl`` accepts tensorQTL's arguments and modes
+(``cis``, ``cis_nominal``, ``cis_independent``, ``cis_susie``, ``trans``,
+``trans_susie``) and writes tensorQTL's output file names
+(``<prefix>.cis_qtl.txt.gz``, ``<prefix>.cis_qtl_pairs.<chr>.parquet``,
+``<prefix>.cis_qtl_top_assoc.txt.gz``, ``<prefix>.cis_independent_qtl.txt.gz``,
+``<prefix>.trans_qtl_pairs.parquet`` ...).  Local ancestry is enabled with
+``--haplotypes`` (RFMix / FLARE output or an rfmix_reader cache),
+``--ancestry_model`` and ``--min_ancestry_ac``; ``--device``,
+``--perm_chunk`` and ``--localqtl_names`` are the other localQTL additions.
+
+.. code-block:: bash
+
+   localqtl geno pheno.bed.gz prefix --mode cis --covariates covariates.txt
+   localqtl geno pheno.bed.gz prefix --mode cis_nominal --covariates covariates.txt \
+           --interaction age.txt --cis_output prefix.cis_qtl.txt.gz
+   localqtl geno pheno.bed.gz prefix --mode trans --haplotypes rfmix/out
 
 CisMapper orchestration
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -676,6 +743,28 @@ Core mapping API
 * :class:`localqtl.cis.CisMapper`
 * :mod:`localqtl.cis`
 
+trans-QTL mapping, eigenMT and post-processing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* :func:`localqtl.trans.map_trans`
+* :func:`localqtl.trans.filter_cis`
+* :func:`localqtl.trans.map_trans_permutations`
+* :func:`localqtl.trans.apply_permutations`
+* :class:`localqtl.trans.GenotypeGeneratorTrans`
+* :func:`localqtl.eigenmt.run_eigenmt`
+* :func:`localqtl.eigenmt.compute_tests`
+* :func:`localqtl.eigenmt.padjust_bh`
+* :func:`localqtl.post.calculate_afc`
+* :func:`localqtl.post.calculate_replication`
+* :func:`localqtl.post.annotate_genes`
+* :func:`localqtl.compat.to_tensorqtl_columns`
+* :func:`localqtl.compat.from_tensorqtl_columns`
+* :func:`localqtl.cli.main`
+* :mod:`localqtl.trans`
+* :mod:`localqtl.eigenmt`
+* :mod:`localqtl.post`
+* :mod:`localqtl.compat`
+
 Allele frequencies and QC
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -699,11 +788,14 @@ Genotype and phenotype I/O
 
 * :class:`localqtl.genotypeio.PlinkReader`
 * :func:`localqtl.genotypeio.alleles_from_variant_ids`
+* :func:`localqtl.genotypeio.get_vcf_region`
+* :func:`localqtl.genotypeio.get_vcf_variants`
 * :class:`localqtl.genotypeio.InputGeneratorCis`
 * :class:`localqtl.haplotypeio.RFMixReader`
 * :class:`localqtl.haplotypeio.InputGeneratorCisWithHaps`
 * :func:`localqtl.phenotypeio.read_phenotype_bed`
 * :class:`localqtl.pgen.PgenReader`
+* :func:`localqtl.pgen.generate_paired_chunks`
 * :class:`localqtl.iosinks.ParquetSink`
 * :class:`localqtl.iosinks.AsyncParquetSink`
 * :class:`localqtl.iosinks.RowGroupBuffer`
@@ -728,6 +820,7 @@ Statistics and regression
 
 * :func:`localqtl.stats.calculate_qvalues`
 * :func:`localqtl.stats.beta_approx_pval`
+* :func:`localqtl.stats.fit_beta_parameters`
 * :func:`localqtl.stats.pval_from_corr_r2`
 * :func:`localqtl.stats.get_t_pval`
 * :mod:`localqtl.stats`

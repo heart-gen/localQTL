@@ -489,3 +489,175 @@ def test_min_ancestry_ac_masks_only_that_ancestry(toy_panel_2anc):
         np.testing.assert_allclose(res.loc[one_masked, "slope"], expected)
     with pytest.raises(ValueError, match="min_ancestry_ac"):
         map_nominal(haplotypes=d["panel"], ancestry_model="main", min_ancestry_ac=1.0, **_dosage_common(d))
+
+
+# ---------------------------------------------------------------------------
+# tensorQTL parity: interaction_df, maf_threshold_interaction, paired covariates,
+# top associations / eigenMT, best_only
+# ---------------------------------------------------------------------------
+def _interaction_cohort(seed=3, n=70, m=8):
+    d = _random_cohort(seed=seed, n=n, m=m)
+    rng = d["rng"]
+    C = rng.normal(size=(n, 2))
+    I = rng.normal(size=(n, 2))
+    y = 0.3 * d["G"][2] + 0.25 * d["G"][2] * I[:, 1] + rng.normal(size=n)
+    d["phenotype_df"] = pd.DataFrame([y], index=["geneA"], columns=d["samples"]).astype(np.float32)
+    d["y"] = y
+    d["covariates_df"] = pd.DataFrame(C, index=d["samples"], columns=["c1", "c2"])
+    d["interaction_df"] = pd.DataFrame(I, index=d["samples"], columns=["age", "sex"])
+    return d
+
+
+def _fit(y, X):
+    X1 = np.column_stack([np.ones(len(y)), X])
+    b = np.linalg.lstsq(X1, y, rcond=None)[0]
+    r = y - X1 @ b
+    dof = len(y) - X1.shape[1]
+    cov = (r @ r) / dof * np.linalg.inv(X1.T @ X1)
+    return b[1:], np.sqrt(np.diag(cov))[1:], dof
+
+
+def test_interaction_df_multiple_terms_matches_ols():
+    from scipy import stats as st
+    d = _interaction_cohort()
+    res = map_nominal(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+                      d["covariates_df"], interaction_df=d["interaction_df"], device="cpu", out_dir=None,
+                      logger=SimpleLogger(verbose=False))
+    for c in ["b_g", "se_g", "tstat_g", "pval_g", "b_age", "pval_age", "b_sex", "b_g-age", "se_g-age",
+              "tstat_g-age", "pval_g-age", "b_g-sex", "pval_g-sex"]:
+        assert c in res.columns
+    assert "b_i" not in res.columns
+    G, I, C = d["G"], d["interaction_df"].values, d["covariates_df"].values
+    b, se, dof = _fit(d["y"], np.column_stack([G[2], I, G[2] * I[:, 0], G[2] * I[:, 1], C]))
+    row = res[res.variant_id == d["variant_df"].index[2]].iloc[0]
+    np.testing.assert_allclose([row.b_g, row.b_age, row.b_sex, row["b_g-age"], row["b_g-sex"]], b[:5], rtol=1e-3)
+    np.testing.assert_allclose([row.se_g, row.se_age, row["se_g-sex"]], [se[0], se[1], se[4]], rtol=1e-3)
+    np.testing.assert_allclose(row["pval_g-sex"], 2 * st.t.sf(abs(b[4] / se[4]), dof), rtol=1e-3)
+    # lead columns = strongest g:i term
+    k = np.argmax(np.abs([row["tstat_g-age"], row["tstat_g-sex"]]))
+    assert row.slope == [row["b_g-age"], row["b_g-sex"]][k]
+    top = res.attrs["top_assoc"]
+    assert list(top.index) == ["geneA"] and "b_g-sex" in top.columns and "tests_emt" not in top.columns
+    with pytest.raises(ValueError, match="either"):
+        map_nominal(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+                    d["covariates_df"], interaction_df=d["interaction_df"], interaction_covariate="c1",
+                    device="cpu", out_dir=None, logger=SimpleLogger(verbose=False))
+
+
+def test_interaction_single_term_with_covariates_matches_ols():
+    """Regression test: g:i is built from the raw genotypes and i is residualized (Frisch-Waugh)."""
+    from scipy import stats as st
+    d = _interaction_cohort()
+    sex = d["interaction_df"][["sex"]]
+    res = map_nominal(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+                      d["covariates_df"], interaction_df=sex, device="cpu", out_dir=None,
+                      logger=SimpleLogger(verbose=False), run_eigenmt=True)
+    G, s, C = d["G"], sex.values[:, 0], d["covariates_df"].values
+    b, se, dof = _fit(d["y"], np.column_stack([G[2], s, G[2] * s, C]))
+    row = res[res.variant_id == d["variant_df"].index[2]].iloc[0]
+    np.testing.assert_allclose([row.b_g, row.b_i, row.b_gi], b[:3], rtol=1e-3)
+    np.testing.assert_allclose([row.se_g, row.se_i, row.se_gi], se[:3], rtol=1e-3)
+    np.testing.assert_allclose(row.pval_gi, 2 * st.t.sf(abs(b[2] / se[2]), dof), rtol=1e-3)
+    top = res.attrs["top_assoc"]
+    assert {"tests_emt", "pval_emt", "pval_adj_bh"} <= set(top.columns)
+    assert top.loc["geneA", "tests_emt"] <= len(d["variant_df"])
+    assert top.loc["geneA", "pval_emt"] == pytest.approx(min(top.loc["geneA", "tests_emt"] * top.loc["geneA", "pval_gi"], 1.0))
+    # the legacy z-scored interaction_covariate gives the same t / p and a rescaled slope
+    res2 = map_nominal(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+                       d["covariates_df"], interaction_covariate=sex["sex"], device="cpu", out_dir=None,
+                       logger=SimpleLogger(verbose=False))
+    row2 = res2[res2.variant_id == d["variant_df"].index[2]].iloc[0]
+    np.testing.assert_allclose(row2.pval_gi, row.pval_gi, rtol=1e-4)
+    np.testing.assert_allclose(row2.b_gi / s.std(), row.b_gi, rtol=1e-3)
+
+
+def test_maf_threshold_interaction_filters_both_halves():
+    d = _interaction_cohort()
+    gdf = d["genotype_df"].copy()
+    sex = d["interaction_df"]["sex"]
+    # variant polymorphic only in the upper half of `sex`
+    upper = sex.sort_values(kind="mergesort").index[len(sex) // 2:]
+    v = d["variant_df"].index[4]
+    gdf.loc[v] = 0.0
+    gdf.loc[v, upper[:10]] = 1.0
+    kw = dict(device="cpu", out_dir=None, logger=SimpleLogger(verbose=False))
+    res0 = map_nominal(gdf, d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"], d["covariates_df"],
+                       interaction_df=sex, maf_threshold_interaction=0.0, **kw)
+    res1 = map_nominal(gdf, d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"], d["covariates_df"],
+                       interaction_df=sex, maf_threshold_interaction=0.05, **kw)
+    assert v in set(res0.variant_id) and v not in set(res1.variant_id)
+    assert len(res1) == len(res0) - 1
+
+
+def test_paired_covariate_matches_ols_and_only_affects_listed_phenotypes():
+    from scipy import stats as st
+    d = _interaction_cohort()
+    pdf = pd.concat([d["phenotype_df"], d["phenotype_df"].rename(index={"geneA": "geneB"})])
+    pos = pd.concat([d["phenotype_pos_df"], d["phenotype_pos_df"].rename(index={"geneA": "geneB"})])
+    paired = pd.DataFrame(d["rng"].normal(size=(1, len(d["samples"]))), index=["geneA"], columns=d["samples"])
+    res = map_nominal(d["genotype_df"], d["variant_df"], pdf, pos, d["covariates_df"],
+                      paired_covariate_df=paired, device="cpu", out_dir=None, logger=SimpleLogger(verbose=False))
+    v = d["variant_df"].index[2]
+    b, se, dof = _fit(d["y"], np.column_stack([d["G"][2], d["covariates_df"].values, paired.values[0]]))
+    row = res[(res.variant_id == v) & (res.phenotype_id == "geneA")].iloc[0]
+    np.testing.assert_allclose(row.slope, b[0], rtol=1e-4)
+    np.testing.assert_allclose(row.slope_se, se[0], rtol=1e-4)
+    np.testing.assert_allclose(row.pval_nominal, 2 * st.t.sf(abs(b[0] / se[0]), dof), rtol=1e-4)
+    b2, se2, dof2 = _fit(d["y"], np.column_stack([d["G"][2], d["covariates_df"].values]))
+    rowB = res[(res.variant_id == v) & (res.phenotype_id == "geneB")].iloc[0]
+    np.testing.assert_allclose(rowB.slope, b2[0], rtol=1e-4)
+    np.testing.assert_allclose(rowB.pval_nominal, 2 * st.t.sf(abs(b2[0] / se2[0]), dof2), rtol=1e-4)
+    with pytest.raises(ValueError, match="sample"):
+        map_nominal(d["genotype_df"], d["variant_df"], pdf, pos, d["covariates_df"],
+                    paired_covariate_df=paired.iloc[:, ::-1], device="cpu", out_dir=None,
+                    logger=SimpleLogger(verbose=False))
+    with pytest.raises(ValueError, match="groups"):
+        map_nominal(d["genotype_df"], d["variant_df"], pdf, pos, d["covariates_df"],
+                    paired_covariate_df=paired, group_s=pd.Series({"geneA": "g", "geneB": "g"}),
+                    device="cpu", out_dir=None, logger=SimpleLogger(verbose=False))
+
+
+def test_top_assoc_file_and_best_only(tmp_path):
+    d = _interaction_cohort()
+    lg = SimpleLogger(verbose=False)
+    out = map_nominal(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+                      d["covariates_df"], interaction_df=d["interaction_df"][["sex"]], device="cpu",
+                      out_dir=str(tmp_path), out_prefix="x.cis_qtl_pairs", run_eigenmt=True, logger=lg,
+                      top_assoc_path=str(tmp_path / "x.cis_qtl_top_assoc.txt.gz"))
+    assert out is None
+    assert (tmp_path / "x.cis_qtl_pairs.chr1.parquet").exists()
+    top = pd.read_csv(tmp_path / "x.cis_qtl_top_assoc.txt.gz", sep="\t", index_col=0)
+    assert list(top.index) == ["geneA"] and {"pval_gi", "tests_emt", "pval_emt", "pval_adj_bh"} <= set(top.columns)
+    pairs = pd.read_parquet(tmp_path / "x.cis_qtl_pairs.chr1.parquet")
+    assert "b_gi" in pairs.columns and len(pairs) == len(d["variant_df"])
+    # write_top=False returns the table instead
+    top2 = map_nominal(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+                       d["covariates_df"], interaction_df=d["interaction_df"][["sex"]], device="cpu",
+                       out_dir=str(tmp_path / "b"), write_top=False, logger=lg)
+    pd.testing.assert_frame_equal(top2.drop(columns=[c for c in top2.columns if c in ("tests_emt", "pval_emt", "pval_adj_bh")]),
+                                  top.drop(columns=["tests_emt", "pval_emt", "pval_adj_bh"]), check_dtype=False, atol=1e-5)
+    # best_only: no pair-level output
+    top3 = map_nominal(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+                       d["covariates_df"], interaction_df=d["interaction_df"][["sex"]], device="cpu",
+                       out_dir=str(tmp_path / "c"), write_stats=False, logger=lg)
+    assert top3 is None and not list((tmp_path / "c").glob("*.parquet"))
+    assert (tmp_path / "c" / "cis_nominal.top_assoc.txt.gz").exists()
+    top4 = map_nominal(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+                       d["covariates_df"], interaction_df=d["interaction_df"][["sex"]], device="cpu",
+                       out_dir=None, write_stats=False, logger=lg)
+    assert isinstance(top4, pd.DataFrame) and list(top4.index) == ["geneA"]
+    with pytest.raises(ValueError, match="interaction"):
+        map_nominal(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+                    d["covariates_df"], device="cpu", out_dir=None, write_stats=False, logger=lg)
+
+
+def test_grouped_interaction_top_per_group():
+    d = _interaction_cohort()
+    pdf = pd.concat([d["phenotype_df"], d["phenotype_df"].rename(index={"geneA": "geneB"}) * 0.5])
+    pos = pd.concat([d["phenotype_pos_df"], d["phenotype_pos_df"].rename(index={"geneA": "geneB"})])
+    group_s = pd.Series({"geneA": "grp", "geneB": "grp"})
+    res = map_nominal(d["genotype_df"], d["variant_df"], pdf, pos, d["covariates_df"], group_s=group_s,
+                      interaction_df=d["interaction_df"][["sex"]], device="cpu", out_dir=None,
+                      logger=SimpleLogger(verbose=False))
+    top = res.attrs["top_assoc"]
+    assert len(top) == 1 and top["group_id"].iloc[0] == "grp" and top["num_phenotypes"].iloc[0] == 2

@@ -183,3 +183,51 @@ def test_input_generator_batches(toy_data):
     # ---- iterator should now be exhausted ----
     with pytest.raises(StopIteration):
         next(it)
+
+
+############################
+# VCF helpers (tabix)
+############################
+
+def _write_vcf(tmp_path):
+    pysam = pytest.importorskip("pysam")
+    lines = [
+        "##fileformat=VCFv4.2",
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
+        '##FORMAT=<ID=DS,Number=1,Type=Float,Description="Dosage">',
+        "##contig=<ID=chr1,length=100000>",
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3",
+        "chr1\t100\tchr1_100_A_G_b38\tA\tG\t.\tPASS\t.\tGT:DS\t0/0:0.1\t0|1:1.0\t1/1:1.9",
+        "chr1\t200\tchr1_200_C_T_b38\tC\tT\t.\tPASS\t.\tGT:DS\t0/1:0.9\t./.:.\t0/0:0.0",
+        "chr1\t300\tchr1_300_G_A_b38\tG\tA\t.\tPASS\t.\tGT:DS\t1/1:2.0\t1/1:2.0\t0/1:1.1",
+    ]
+    plain = tmp_path / "toy.vcf"
+    plain.write_text("\n".join(lines) + "\n")
+    gz = tmp_path / "toy.vcf.gz"
+    pysam.tabix_compress(str(plain), str(gz), force=True)
+    pysam.tabix_index(str(gz), preset="vcf", force=True)
+    return str(gz)
+
+
+def test_get_vcf_region_and_variants(tmp_path):
+    from src.localqtl.genotypeio import get_sample_ids, get_vcf_region, get_vcf_variants
+    vcf = _write_vcf(tmp_path)
+    assert get_sample_ids(vcf) == ["S1", "S2", "S3"]
+    df, pos_s = get_vcf_region("chr1:150-350", vcf)
+    assert list(df.index) == ["chr1_200_C_T_b38", "chr1_300_G_A_b38"]
+    assert list(pos_s) == [200, 300]
+    np.testing.assert_allclose(df.loc["chr1_200_C_T_b38"], [1.0, 0.5, 0.0])  # missing imputed to the mean
+    df2, _ = get_vcf_region("chr1", vcf, field="DS", select_samples=["S3", "S1"], impute_missing=False)
+    assert list(df2.columns) == ["S3", "S1"] and df2.shape[0] == 3
+    assert np.isnan(df2.loc["chr1_200_C_T_b38", "S1"]) is np.False_ and df2.loc["chr1_300_G_A_b38", "S3"] == pytest.approx(1.1)
+    # contig name without the chr prefix is resolved
+    df3, _ = get_vcf_region("1:100-100", vcf)
+    assert list(df3.index) == ["chr1_100_A_G_b38"]
+    g = get_vcf_variants(["chr1_300_G_A_b38", "chr1_100_A_G_b38", "chr1_200_C_T_b38"], vcf)
+    # the variant with a missing call is dropped (tensorQTL behaviour)
+    assert set(g.index) == {"chr1_100_A_G_b38", "chr1_300_G_A_b38"}
+    np.testing.assert_allclose(g.loc["chr1_100_A_G_b38"], [0, 1, 2])
+    g2 = get_vcf_variants({"chr1_200_C_T_b38": "chr1:200"}, vcf, field="DS")
+    np.testing.assert_allclose(g2.loc["chr1_200_C_T_b38"], [0.9, np.nan, 0.0])
+    with pytest.raises(ValueError, match="parse"):
+        get_vcf_variants(["rs123"], vcf)
