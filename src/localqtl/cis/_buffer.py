@@ -38,7 +38,11 @@ def write_row(buffers: dict[str, np.ndarray], idx: int, row: dict[str, object]) 
         if arr.dtype == object:
             arr[idx] = None if value is None else value
         elif np.issubdtype(arr.dtype, np.integer):
-            arr[idx] = int(value) if value is not None else 0
+            # NaN (e.g. true_dof with beta_approx=False) cannot be cast to int.
+            if value is None or (isinstance(value, (float, np.floating)) and not np.isfinite(value)):
+                arr[idx] = 0
+            else:
+                arr[idx] = int(value)
         elif np.issubdtype(arr.dtype, np.floating):
             if value is None:
                 arr[idx] = np.nan

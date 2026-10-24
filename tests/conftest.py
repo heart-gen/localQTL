@@ -277,3 +277,24 @@ def toy_panel_2anc_posterior(toy_panel_2anc):
     )
     return {**toy_panel_2anc, "panel_post": LocalAncestryPanel(ds_post, use_posterior=True),
             "panel_hard": LocalAncestryPanel(ds_post), "posterior": post}
+
+
+def make_random_cohort(seed=0, n=40, m=6, chrom="chr1", effect=0.4):
+    """Random dosages / one phenotype with a planted effect on the first variant."""
+    rng = np.random.default_rng(seed)
+    samples = [f"S{i}" for i in range(n)]
+    G = rng.integers(0, 3, size=(m, n)).astype(np.float32)
+    variant_ids = [f"v{i}_{chrom}_{100 + 10 * i}" for i in range(m)]
+    genotype_df = pd.DataFrame(G, index=variant_ids, columns=samples)
+    variant_df = pd.DataFrame({"chrom": chrom, "pos": [100 + 10 * i for i in range(m)]}, index=variant_ids)
+    y = effect * G[0] + rng.normal(size=n)
+    phenotype_df = pd.DataFrame([y], index=["geneA"], columns=samples).astype(np.float32)
+    phenotype_pos_df = pd.DataFrame({"chr": [chrom], "start": [120], "end": [120]}, index=["geneA"])
+    return dict(genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+                phenotype_pos_df=phenotype_pos_df, samples=samples, G=G, y=y, rng=rng)
+
+
+@pytest.fixture
+def random_cohort():
+    """Factory fixture: ``random_cohort(seed=..., n=..., m=...)``."""
+    return make_random_cohort

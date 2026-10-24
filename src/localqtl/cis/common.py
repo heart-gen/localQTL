@@ -7,13 +7,51 @@ from .._torch_utils import move_to_device, resolve_device
 from ..regression_kernels import Residualizer
 
 __all__ = [
+    "ANCESTRY_MODELS",
+    "validate_ancestry_model",
     "dosage_vector_for_covariate",
     "residualize_matrix_with_covariates",
     "residualize_batch",
+    "residualize_batch_dosage",
     "residualize_batch_interaction",
+    "ancestry_dosage_design",
     "prepare_interaction_covariate",
+    "project_interaction",
     "align_like_casefold",
 ]
+
+ANCESTRY_MODELS = ("main", "interaction", "dosage")
+
+
+def validate_ancestry_model(
+        ancestry_model: str,
+        *,
+        haplotypes,
+        interaction_covariate,
+        allow_dosage: bool,
+        caller: str = "map_nominal",
+) -> str:
+    """
+    Validate the ``ancestry_model`` argument shared by the cis mappers.
+
+    Raises ``ValueError`` for unknown models, for models that need a local
+    ancestry panel when none was given, for combining an ancestry model with
+    ``interaction_covariate``, and for ``'dosage'`` on callers that do not
+    implement it yet (``allow_dosage=False``).
+    """
+    if ancestry_model not in ANCESTRY_MODELS:
+        raise ValueError(
+            f"Unknown ancestry_model {ancestry_model!r}; use 'main', 'interaction' or 'dosage'."
+        )
+    if ancestry_model == "dosage" and not allow_dosage:
+        raise ValueError("ancestry_model='dosage' is currently only implemented for map_nominal.")
+    if ancestry_model in ("interaction", "dosage") and haplotypes is None:
+        raise ValueError(f"ancestry_model='{ancestry_model}' requires haplotypes.")
+    if ancestry_model in ("interaction", "dosage") and interaction_covariate is not None:
+        raise ValueError(
+            f"interaction_covariate cannot be combined with ancestry_model='{ancestry_model}'."
+        )
+    return ancestry_model
 
 
 def _coerce_tensor(value, device: torch.device) -> torch.Tensor:
@@ -58,18 +96,57 @@ def dosage_vector_for_covariate(
 def residualize_matrix_with_covariates(
         Y: torch.Tensor, C: Optional[pd.DataFrame], device: str,
         tensorqtl_flavor: bool = False
-) -> Tuple[torch.Tensor, Optional[Residualizer]]:
+) -> Tuple[torch.Tensor, Residualizer]:
     """
     Residualize (features x samples) matrix Y against covariates C across samples.
-    Returns residualized Y and a Residualizer (or None if no covariates).
+
+    Returns residualized Y and a :class:`Residualizer`. Without covariates the
+    residualizer has rank 0 and only centres each row, which is equivalent to
+    fitting an intercept in every downstream regression (``k_eff == 0``).
     """
-    if C is None:
-        return Y, None
     dev = resolve_device(device)
-    C_t = torch.tensor(C.values, dtype=torch.float32, device=dev)
+    if C is None:
+        C_t = torch.zeros((Y.shape[1], 0), dtype=torch.float32, device=dev)
+    else:
+        C_t = torch.tensor(C.values, dtype=torch.float32, device=dev)
     rez = Residualizer(C_t, tensorqtl_flavor=tensorqtl_flavor)
     (Y_resid,) = rez.transform(move_to_device(Y, dev), center=True)
     return Y_resid, rez
+
+
+def project_interaction(I: torch.Tensor, rez: Optional[Residualizer]) -> torch.Tensor:
+    """
+    Residualize per-variant interaction columns ``I`` (``(m, n)`` or
+    ``(m, n, p)``) against the covariates in ``rez`` (centring only when
+    ``rez`` is ``None``), so that ``g:c`` terms enter the design the same way
+    ``g`` does (Frisch–Waugh; matches tensorQTL's interaction model).
+    """
+    if rez is None or getattr(rez, "rank", 0) == 0:
+        return I - I.mean(dim=-1 if I.dim() < 3 else 1, keepdim=True)
+    if I.dim() == 2:
+        return rez.transform(I, center=True)[0]
+    m, n, p = I.shape
+    return _unstack_channels(rez.transform(_stack_channels(I), center=True)[0], m, n, p)
+
+
+def _center_rows(M: torch.Tensor, center: bool) -> torch.Tensor:
+    """Centre along the sample axis (last dim) when ``center`` is set."""
+    if not center or M is None:
+        return M
+    return M - M.mean(dim=-1 if M.dim() < 3 else 1, keepdim=True)
+
+
+def _center_y(y, center: bool, group: bool):
+    """Normalise ``y`` to a 1D tensor (or list of them in group mode), centred."""
+    if group:
+        if isinstance(y, (list, tuple)):
+            y_list = [torch.as_tensor(yi) if not torch.is_tensor(yi) else yi for yi in y]
+        else:
+            Y = y if torch.is_tensor(y) else torch.as_tensor(y)
+            y_list = [Y] if Y.ndim == 1 else [Y[i, :] for i in range(Y.shape[0])]
+        return [_center_rows(v, center) for v in y_list]
+    Y = y if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32)
+    return _center_rows(Y, center)
 
 
 def residualize_batch(
@@ -90,16 +167,8 @@ def residualize_batch(
         H = move_to_device(H, dev)
 
     if rez is None:
-        # Pass-through; normalize return type for group mode
-        if group:
-            if isinstance(y, (list, tuple)):
-                y_list = [torch.as_tensor(yi) if not torch.is_tensor(yi) else yi
-                          for yi in y]
-            else:
-                Y = y if torch.is_tensor(y) else torch.as_tensor(y)
-                y_list = [Y] if Y.ndim == 1 else [Y[i, :] for i in range(Y.shape[0])]
-            return y_list, G, H
-        return (y if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32)), G, H
+        # No covariates: centre everything (intercept-equivalent) and pass through.
+        return _center_y(y, center, group), _center_rows(G, center), _center_rows(H, center)
 
     # Build Y on the same device as G/rez
     if group:
@@ -190,14 +259,8 @@ def residualize_batch_dosage(
     D, L = ancestry_dosage_design(G, H)
 
     if rez is None:
-        if group:
-            if isinstance(y, (list, tuple)):
-                y_list = [torch.as_tensor(yi) if not torch.is_tensor(yi) else yi for yi in y]
-            else:
-                Y = y if torch.is_tensor(y) else torch.as_tensor(y)
-                y_list = [Y] if Y.ndim == 1 else [Y[i, :] for i in range(Y.shape[0])]
-            return y_list, D, L
-        return (y if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32)), D, L
+        # No covariates: centre everything (intercept-equivalent) and pass through.
+        return _center_y(y, center, group), _center_rows(D, center), _center_rows(L, center)
 
     if group:
         if isinstance(y, (list, tuple)):
@@ -250,18 +313,10 @@ def residualize_batch_interaction(
     H = move_to_device(H, dev)
 
     if rez is None:
-        if group:
-            if isinstance(y, (list, tuple)):
-                y_list = [torch.as_tensor(yi) if not torch.is_tensor(yi) else yi
-                          for yi in y]
-            else:
-                Y = y if torch.is_tensor(y) else torch.as_tensor(y)
-                y_list = [Y] if Y.ndim == 1 else [Y[i, :] for i in range(Y.shape[0])]
-            I = G.unsqueeze(-1) * H
-            return y_list, G, H, I
-        Y = y if torch.is_tensor(y) else torch.as_tensor(y, dtype=torch.float32)
+        # No covariates: centre everything (intercept-equivalent) and pass through.
         I = G.unsqueeze(-1) * H
-        return Y, G, H, I
+        return (_center_y(y, center, group), _center_rows(G, center),
+                _center_rows(H, center), _center_rows(I, center))
 
     if group:
         if isinstance(y, (list, tuple)):

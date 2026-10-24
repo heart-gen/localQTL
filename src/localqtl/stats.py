@@ -132,18 +132,32 @@ def _solve_true_dof(r2_perm, dof_init, tol=1e-4):
 
 
 def _beta_mle_on_p(p):
-    """Fit Beta(a, b) by maximum likelihood on [0, 1] p-values."""
-    p = np.clip(p, 1e-15, 1 - 1e-15)
-    m, v = p.mean(), p.var()
+    """
+    Fit Beta(a, b) by maximum likelihood on [0, 1] p-values.
+
+    Degenerate inputs (a single permutation, or zero variance) cannot be
+    fitted; ``(nan, nan)`` is returned so that ``pval_beta`` is NaN and callers
+    fall back to the empirical ``pval_perm``, instead of running an optimiser
+    that never converges.  The optimiser is iteration-capped.
+    """
+    p = np.clip(np.asarray(p, dtype=np.float64), 1e-15, 1 - 1e-15)
+    m, v = float(p.mean()), float(p.var())
+    if p.size < 2 or not np.isfinite(v) or v <= 1e-12:
+        return float("nan"), float("nan")
     a0 = max(m * (m * (1.0 - m) / v - 1.0), 1e-6)
     b0 = max(a0 * (1.0 / m - 1.0), 1e-6)
+    if not (np.isfinite(a0) and np.isfinite(b0)):
+        return float("nan"), float("nan")
 
     def nll(ab):
         a, b = ab
         if a <= 0 or b <= 0: return np.inf
         return -((a-1)*np.log(p).sum() + (b-1)*np.log(1.0-p).sum() - len(p)*betaln(a,b))
-    result = scipy.optimize.minimize(nll, x0=[a0, b0], method="Nelder-Mead")
+    result = scipy.optimize.minimize(nll, x0=[a0, b0], method="Nelder-Mead",
+                                     options={"maxiter": 2000, "maxfev": 4000})
     a, b = result.x
+    if not (np.isfinite(a) and np.isfinite(b) and a > 0 and b > 0):
+        return float(a0), float(b0)
     return float(a), float(b)
 
 
@@ -264,13 +278,17 @@ def nominal_pvals_tensorqtl(
 ):
     """
     TensorQTL-style nominal p-values.
-    - If H is None: use correlation route (dof = n - k_eff - 2) to match tensorQTL.
-    - Else: use the genotype-column t-stat (column 0) with dof = n - k_eff - p.
+
+    ``k_eff`` counts the degrees of freedom already consumed by centring (the
+    intercept) and the projected-out covariates (``Residualizer.k_eff``).
+    - If H is None: correlation route with dof = n - k_eff - 1 (tensorQTL's
+      ``n - 2 - k`` with k covariates).
+    - Else: genotype-column t-stat (column 0) with dof = n - k_eff - p.
     Returns (pvals, dof)
     """
     n = int(y_t.shape[0])
     if H_resid is None:
-        # correlation-based t -> p (tensorQTL uses n - k_eff - 2)
+        # correlation-based t -> p
         y_c = y_t - y_t.mean()
         G_c = G_resid - G_resid.mean(dim=1, keepdim=True)
         num = torch.mv(G_c, y_c)
@@ -278,7 +296,7 @@ def nominal_pvals_tensorqtl(
         r   = num / den
         r2  = (r * r).clamp(max=1 - 1e-12)
 
-        dof = max(n - int(k_eff) - 2, 1)
+        dof = max(n - int(k_eff) - 1, 1)
         # t = r * sqrt(dof / (1 - r^2))
         t_from_r = r * torch.sqrt(torch.tensor(dof, dtype=r.dtype, device=r.device) / (1.0 - r2))
         t_cpu = t_from_r.abs().detach().cpu().numpy()

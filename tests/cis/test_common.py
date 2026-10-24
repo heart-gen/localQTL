@@ -42,10 +42,25 @@ def test_residualize_matrix_with_covariates_centers_rows():
     assert rez is not None
     assert torch.allclose(Y_resid.sum(dim=1), torch.zeros(2), atol=1e-6)
 
-    # Without covariates the tensor should be returned unchanged
-    Y_passthrough, rez_none = residualize_matrix_with_covariates(Y, None, device="cpu")
-    assert rez_none is None
-    assert torch.allclose(Y_passthrough, Y)
+    # Without covariates we still get a (rank-0) residualizer that centres rows,
+    # which is what gives every downstream regression an intercept.
+    Y_centered, rez_none = residualize_matrix_with_covariates(Y, None, device="cpu")
+    assert isinstance(rez_none, Residualizer)
+    assert rez_none.rank == 0 and rez_none.k_eff == 1
+    assert torch.allclose(Y_centered, Y - Y.mean(dim=1, keepdim=True))
+    assert torch.allclose(Y_centered.sum(dim=1), torch.zeros(2), atol=1e-6)
+
+
+def test_residualize_batch_without_residualizer_centers_everything():
+    G = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    H = torch.arange(24, dtype=torch.float32).reshape(3, 4, 2)
+    y = torch.tensor([1.0, 2.0, 4.0, 8.0])
+    y_r, G_r, H_r = residualize_batch(y, G, H, None, center=True, group=False)
+    assert torch.allclose(y_r.sum(), torch.tensor(0.0), atol=1e-6)
+    assert torch.allclose(G_r.sum(dim=1), torch.zeros(3), atol=1e-6)
+    assert torch.allclose(H_r.sum(dim=1), torch.zeros(3, 2), atol=1e-6)
+    y_list, _, _ = residualize_batch([y, 2 * y], G, None, None, center=True, group=True)
+    assert len(y_list) == 2 and all(abs(float(v.sum())) < 1e-6 for v in y_list)
 
 
 def test_residualize_batch_supports_grouped_and_scalar_inputs():

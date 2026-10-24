@@ -79,8 +79,26 @@ def test_map_permutations_with_covariate_interaction_runs(toy_data):
 
     assert not result.empty
     assert result["pval_nominal"].notna().any()
-    assert result.shape[0] == 2
-    sizes = dict(zip(result["group_id"], result["group_size"]))
-    assert sizes["grp1"] == 2
-    assert sizes["grp2"] == 1
+    # one row per non-constant phenotype; no grouping was requested
+    expected_ids = {pid for pid in toy_data["phenotype_df"].index if pid != "geneConst"}
+    assert set(result["phenotype_id"]) == expected_ids
+    assert "group_id" not in result.columns
     assert ((result["pval_perm"] >= 0.0) & (result["pval_perm"] <= 1.0)).all()
+
+
+def test_lead_nominal_pval_matches_map_nominal_with_covariates(random_cohort):
+    """Regression: the permutation core must count covariates in the residual dof."""
+    from src.localqtl.cis.nominal import map_nominal
+    d = random_cohort(seed=5, n=40, m=6)
+    covariates_df = pd.DataFrame({"cov1": d["rng"].normal(size=40), "cov2": d["rng"].normal(size=40)},
+                                 index=d["samples"])
+    common = dict(genotype_df=d["genotype_df"], variant_df=d["variant_df"],
+                  phenotype_df=d["phenotype_df"], phenotype_pos_df=d["phenotype_pos_df"],
+                  covariates_df=covariates_df, device="cpu", window=1000,
+                  logger=SimpleLogger(verbose=False))
+    perm = map_permutations(nperm=3, seed=1, beta_approx=False, **common)
+    nom = map_nominal(nperm=None, out_dir=None, **common).set_index(["phenotype_id", "variant_id"])
+    for _, row in perm.iterrows():
+        ref = nom.loc[(row["phenotype_id"], row["variant_id"])]
+        np.testing.assert_allclose(row["pval_nominal"], ref["pval_nominal"], rtol=1e-4)
+        np.testing.assert_allclose(row["slope"], ref["slope"], rtol=1e-4)

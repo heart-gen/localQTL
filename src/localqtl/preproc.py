@@ -7,6 +7,7 @@ __all__ = [
     "calculate_maf",
     "allele_stats",
     "filter_by_maf",
+    "ancestry_allele_stats",
 ]
 
 def impute_mean_and_filter(
@@ -23,24 +24,21 @@ def impute_mean_and_filter(
     if allow_nonfinite:
         miss_mask = miss_mask | (~torch.isfinite(G_t))
 
-    # Monomorphic filter
-    mono = (G_t == G_t[:, [0]]).all(dim=1)
+    # Mean-impute first, then drop rows that are monomorphic *after* imputation
+    # (a row such as [-9, 1, 1, 1] is constant once imputed and would otherwise
+    # produce an all-zero centred predictor).
+    n_obs = (~miss_mask).sum(dim=1, keepdim=True)
+    sum_obs = torch.where(miss_mask, torch.zeros_like(G_t), G_t).sum(dim=1, keepdim=True)
+    mu = sum_obs / n_obs.clamp_min(1)
+    G_imputed = torch.where(miss_mask, mu, G_t)
+
+    mono = (G_imputed == G_imputed[:, [0]]).all(dim=1)
     keep_mask = ~mono
 
     if keep_mask.sum().item() == 0:
         return G_t.new_empty((0, G_t.shape[1])), keep_mask, miss_mask
 
-    G_kept = G_t[keep_mask]
-    miss_kept = miss_mask[keep_mask]
-    
-    # Mean-impute on kept rows
-    n_obs = (~miss_kept).sum(dim=1, keepdim=True)
-    sum_obs = torch.where(miss_kept, torch.zeros_like(G_kept),
-                          G_kept).sum(dim=1, keepdim=True)
-    mu = sum_obs / n_obs.clamp_min(1)
-    G_imputed = torch.where(miss_kept, mu, G_kept)
-
-    return G_imputed, keep_mask, miss_mask
+    return G_imputed[keep_mask], keep_mask, miss_mask
 
 
 def calculate_maf(G_t: torch.Tensor, *, ploidy: int = 2) -> torch.Tensor:
@@ -81,3 +79,30 @@ def filter_by_maf(G_t: torch.Tensor, maf_threshold: float, *, ploidy: int = 2):
     maf = calculate_maf(G_t, ploidy=ploidy)
     keep = maf >= maf_threshold
     return keep, maf
+
+
+def ancestry_allele_stats(G_t: torch.Tensor, H_t: torch.Tensor) -> dict[str, torch.Tensor]:
+    """
+    Per-ancestry in-sample allele statistics for the ancestry-specific dosage model.
+
+    ``G_t`` is ``(m, n)`` imputed dosages of the counted (alt) allele and ``H_t``
+    ``(m, n, K)`` (expected) ancestry counts per sample; a single channel is
+    expanded to ``[H, 2 - H]`` as in :func:`localqtl.cis.common.ancestry_dosage_design`.
+    With the phase unknown the expected alt-allele count carried on ancestry-``k``
+    haplotypes is ``G * L_k / 2`` (exact for hard calls).
+
+    Returns ``an`` (allele number), ``ac`` (counted-allele count), ``af``
+    (``ac / an``, NaN where ``an == 0``) and ``ma_count`` (minor-allele count
+    folded within the ancestry), each ``(m, K)`` float32. No per-ancestry
+    carrier count is reported: without phase a heterozygote with one
+    ancestry-``k`` haplotype cannot be assigned to either ancestry.
+    """
+    if H_t.dim() != 3:
+        raise ValueError("H_t must be (variants, samples, channels).")
+    H_t = H_t.to(dtype=torch.float32)
+    L = torch.cat([H_t, 2.0 - H_t], dim=2) if H_t.shape[2] == 1 else H_t
+    an = L.sum(dim=1)                                        # (m, K)
+    ac = (G_t.to(torch.float32).unsqueeze(-1) * L * 0.5).sum(dim=1)
+    af = torch.where(an > 0, ac / an.clamp_min(1e-12), torch.full_like(an, float("nan")))
+    ma_count = torch.minimum(ac, an - ac)
+    return {"an": an, "ac": ac, "af": af, "ma_count": ma_count}

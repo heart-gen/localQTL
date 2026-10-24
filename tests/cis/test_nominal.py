@@ -202,7 +202,9 @@ def test_dosage_model_columns_and_hard_call_dosages(toy_panel_2anc):
     cols = _dosage_columns(2)
     assert cols == ["slope_anc0", "slope_se_anc0", "tstat_anc0", "pval_anc0",
                     "slope_anc1", "slope_se_anc1", "tstat_anc1", "pval_anc1",
-                    "fstat_joint", "pval_joint", "z_diff_anc0_anc1", "pval_diff_anc0_anc1"]
+                    "fstat_joint", "pval_joint", "z_diff_anc0_anc1", "pval_diff_anc0_anc1",
+                    "an_anc0", "ac_anc0", "af_anc0", "ma_count_anc0",
+                    "an_anc1", "ac_anc1", "af_anc1", "ma_count_anc1"]
     assert all(c in res.columns for c in cols)
     assert "slope_gxh_anc0" not in res.columns
     # lead columns are the ancestry with the largest |t|
@@ -276,3 +278,214 @@ def test_dosage_model_argument_validation(toy_panel_2anc, covariates_df):
                          phenotype_df=d["phenotype_df"], phenotype_pos_df=d["phenotype_pos_df"],
                          haplotypes=d["panel"], ancestry_model="dosage", device="cpu", nperm=4,
                          logger=SimpleLogger(verbose=False))
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 regression tests: intercept without covariates, GxC + local ancestry,
+# ancestry_model whitelist, map_nominal_loci window handling.
+# ---------------------------------------------------------------------------
+
+def _ols(X, y):
+    """Plain numpy OLS with intercept -> (beta, se, t) for column 1 of X (after intercept)."""
+    X1 = np.column_stack([np.ones(len(y)), X])
+    XtX_inv = np.linalg.inv(X1.T @ X1)
+    beta = XtX_inv @ X1.T @ y
+    resid = y - X1 @ beta
+    dof = len(y) - X1.shape[1]
+    sigma2 = resid @ resid / dof
+    se = np.sqrt(np.diag(XtX_inv) * sigma2)
+    return beta, se, beta / se, dof
+
+
+def _random_cohort(seed=0, n=40, m=6):
+    rng = np.random.default_rng(seed)
+    samples = [f"S{i}" for i in range(n)]
+    G = rng.integers(0, 3, size=(m, n)).astype(np.float32)
+    variant_ids = [f"v{i}_chr1_{100 + 10 * i}" for i in range(m)]
+    genotype_df = pd.DataFrame(G, index=variant_ids, columns=samples)
+    variant_df = pd.DataFrame({"chrom": "chr1", "pos": [100 + 10 * i for i in range(m)]}, index=variant_ids)
+    y = 0.4 * G[0] + rng.normal(size=n)
+    phenotype_df = pd.DataFrame([y], index=["geneA"], columns=samples).astype(np.float32)
+    phenotype_pos_df = pd.DataFrame({"chr": ["chr1"], "start": [120], "end": [120]}, index=["geneA"])
+    return dict(genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+                phenotype_pos_df=phenotype_pos_df, samples=samples, G=G, y=y, rng=rng)
+
+
+def test_no_covariates_matches_intercept_ols():
+    d = _random_cohort()
+    res = map_nominal(genotype_df=d["genotype_df"], variant_df=d["variant_df"],
+                      phenotype_df=d["phenotype_df"], phenotype_pos_df=d["phenotype_pos_df"],
+                      covariates_df=None, device="cpu", nperm=None, out_dir=None,
+                      window=1000, logger=SimpleLogger(verbose=False))
+    res = res.set_index("variant_id")
+    for i, vid in enumerate(d["genotype_df"].index):
+        beta, se, t, dof = _ols(d["G"][i], d["y"])
+        np.testing.assert_allclose(res.loc[vid, "slope"], beta[1], rtol=1e-4)
+        np.testing.assert_allclose(res.loc[vid, "slope_se"], se[1], rtol=1e-3)
+        np.testing.assert_allclose(res.loc[vid, "tstat"], t[1], rtol=1e-3)
+
+
+def test_no_covariates_equals_constant_covariate():
+    d = _random_cohort(seed=1)
+    common = dict(genotype_df=d["genotype_df"], variant_df=d["variant_df"],
+                  phenotype_df=d["phenotype_df"], phenotype_pos_df=d["phenotype_pos_df"],
+                  device="cpu", nperm=None, out_dir=None, window=1000,
+                  logger=SimpleLogger(verbose=False))
+    ones = pd.DataFrame({"intercept": np.ones(len(d["samples"]))}, index=d["samples"])
+    a = map_nominal(covariates_df=None, **common).set_index("variant_id")
+    b = map_nominal(covariates_df=ones, **common).set_index("variant_id")
+    for col in ("slope", "slope_se", "tstat", "pval_nominal"):
+        np.testing.assert_allclose(a[col].to_numpy(), b.loc[a.index, col].to_numpy(), rtol=1e-4)
+
+
+def _random_panel_cohort(seed=3, n=60, m=6):
+    """Random cohort plus an in-memory two-ancestry LocalAncestryPanel on its variants."""
+    from rfmix_reader import from_legacy
+    from localqtl.haplotypeio import LocalAncestryPanel
+    d = _random_cohort(seed=seed, n=n, m=m)
+    var_df = d["variant_df"]
+    loci = pd.DataFrame({"chromosome": var_df["chrom"].astype(str).values,
+                         "physical_position": var_df["pos"].values})
+    g_anc = pd.DataFrame({"sample_id": d["samples"], "P0": 0.5, "P1": 0.5, "chrom": "1"})
+    codes = d["rng"].integers(0, 2, size=(m, n, 2))
+    admix = np.stack([(codes == a).sum(axis=-1) for a in range(2)], axis=-1).astype(np.int8)
+    d["panel"] = LocalAncestryPanel(from_legacy(loci, g_anc, admix))
+    d["admix"] = admix
+    return d
+
+
+def test_gxc_with_haplotypes_includes_ancestry_main_effects():
+    """GxC with a panel fits y ~ 1 + g + c + g*c + h (h = local-ancestry count)."""
+    d = _random_panel_cohort()
+    cov = pd.DataFrame({"c": d["rng"].normal(size=len(d["samples"]))}, index=d["samples"])
+    res = map_nominal(genotype_df=d["genotype_df"], variant_df=d["variant_df"],
+                      phenotype_df=d["phenotype_df"], phenotype_pos_df=d["phenotype_pos_df"],
+                      covariates_df=cov, haplotypes=d["panel"], interaction_covariate="c",
+                      device="cpu", nperm=None, out_dir=None, window=1000,
+                      logger=SimpleLogger(verbose=False)).set_index("variant_id")
+    assert "b_gi" in res.columns and len(res) == len(d["genotype_df"])
+    c = cov["c"].to_numpy()
+    c = (c - c.mean()) / c.std(ddof=0)          # prepare_interaction_covariate z-scores (ddof=0)
+    for i, vid in enumerate(d["genotype_df"].index):
+        g = d["G"][i].astype(np.float64)
+        h = d["admix"][i, :, 0].astype(np.float64)
+        beta, se, t, dof = _ols(np.column_stack([g, c, g * c, h]), d["y"])
+        np.testing.assert_allclose(res.loc[vid, "b_g"], beta[1], rtol=1e-3, atol=1e-5)
+        np.testing.assert_allclose(res.loc[vid, "b_gi"], beta[3], rtol=1e-3, atol=1e-5)
+        np.testing.assert_allclose(res.loc[vid, "se_gi"], se[3], rtol=2e-3, atol=1e-5)
+        np.testing.assert_allclose(res.loc[vid, "tstat_gi"], t[3], rtol=2e-3, atol=1e-5)
+
+
+def test_unknown_ancestry_model_rejected_everywhere(toy_data):
+    from src.localqtl.cis.permutations import map_permutations
+    from src.localqtl.cis.independent import map_independent
+    common = dict(genotype_df=toy_data["genotype_df"], variant_df=toy_data["variant_df"],
+                  phenotype_df=toy_data["phenotype_df"], phenotype_pos_df=toy_data["phenotype_pos_df"],
+                  device="cpu", logger=SimpleLogger(verbose=False))
+    with pytest.raises(ValueError, match="Unknown ancestry_model"):
+        map_nominal(nperm=None, out_dir=None, ancestry_model="mian", **common)
+    with pytest.raises(ValueError, match="Unknown ancestry_model"):
+        map_permutations(nperm=3, ancestry_model="mian", **common)
+    cis_df = pd.DataFrame({"phenotype_id": ["geneA"], "qval": [0.01], "pval_beta": [0.01]})
+    with pytest.raises(ValueError, match="Unknown ancestry_model"):
+        map_independent(cis_df=cis_df, nperm=3, ancestry_model="mian", **common)
+
+
+def test_map_nominal_loci_uses_exact_window():
+    from src.localqtl.cis.nominal import map_nominal_loci
+    d = _random_cohort(seed=2, n=30, m=8)       # positions 100..170 step 10
+    locus_df = pd.DataFrame({"phenotype_id": ["geneA", "geneA", "missing"],
+                             "chr": ["chr1", "chr1", "chr1"],
+                             "position": [120, 160, 120]})
+    res = map_nominal_loci(locus_df, d["genotype_df"], d["variant_df"], d["phenotype_df"],
+                           window=15, device="cpu", logger=SimpleLogger(verbose=False))
+    assert set(res["phenotype_id"]) == {"geneA__locus0", "geneA__locus1"}
+    for pid, center in (("geneA__locus0", 120), ("geneA__locus1", 160)):
+        pos = res.loc[res["phenotype_id"] == pid, "variant_id"].str.split("_").str[-1].astype(int)
+        assert pos.between(center - 15, center + 15).all()
+        assert len(pos) == 3                      # 110/120/130 or 150/160/170
+    # explicit start/end is used as-is (no extra padding)
+    res2 = map_nominal_loci(pd.DataFrame({"phenotype_id": ["geneA"], "chr": ["chr1"],
+                                          "start": [100], "end": [120]}),
+                            d["genotype_df"], d["variant_df"], d["phenotype_df"],
+                            device="cpu", logger=SimpleLogger(verbose=False))
+    assert sorted(res2["variant_id"].str.split("_").str[-1].astype(int)) == [100, 110, 120]
+    assert set(res2["phenotype_id"]) == {"geneA"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: per-ancestry in-sample allele statistics and min_ancestry_ac mask
+# ---------------------------------------------------------------------------
+
+def _expected_anc_stats(G, L):
+    """numpy reference: G (m,n) imputed dosages, L (m,n,K) ancestry counts."""
+    an = L.sum(axis=1)
+    ac = (G[:, :, None] * L * 0.5).sum(axis=1)
+    af = np.where(an > 0, ac / np.where(an > 0, an, 1), np.nan)
+    return an, ac, af, np.minimum(ac, an - ac)
+
+
+def test_dosage_per_ancestry_af_matches_numpy_hard_calls(toy_panel_2anc):
+    d = toy_panel_2anc
+    res = map_nominal(haplotypes=d["panel"], ancestry_model="dosage", **_dosage_common(d))
+    per_var = res.drop_duplicates("variant_id").set_index("variant_id")
+    G = d["genotype_df"].to_numpy(np.float64)
+    G = np.where(G == -9, np.nan, G)
+    G = np.where(np.isnan(G), np.nanmean(G, axis=1, keepdims=True), G)
+    L = d["admix"].astype(np.float64)                           # (variants, samples, 2)
+    an, ac, af, mac = _expected_anc_stats(G, L)
+    vidx = {v: i for i, v in enumerate(d["genotype_df"].index)}
+    for vid in per_var.index:
+        i = vidx[vid]
+        for k in range(2):
+            np.testing.assert_allclose(per_var.loc[vid, f"an_anc{k}"], an[i, k], rtol=1e-6)
+            np.testing.assert_allclose(per_var.loc[vid, f"ac_anc{k}"], ac[i, k], rtol=1e-5)
+            np.testing.assert_allclose(per_var.loc[vid, f"af_anc{k}"], af[i, k], rtol=1e-5)
+            np.testing.assert_allclose(per_var.loc[vid, f"ma_count_anc{k}"], mac[i, k], rtol=1e-5)
+        n = len(d["samples"])
+        np.testing.assert_allclose(per_var.loc[vid, "an_anc0"] + per_var.loc[vid, "an_anc1"], 2 * n)
+        np.testing.assert_allclose(per_var.loc[vid, "ac_anc0"] + per_var.loc[vid, "ac_anc1"],
+                                   2 * n * per_var.loc[vid, "af"], rtol=1e-5)
+
+
+def test_dosage_per_ancestry_af_posterior_panel(toy_panel_2anc_posterior):
+    d = toy_panel_2anc_posterior
+    res = map_nominal(haplotypes=d["panel_post"], ancestry_model="dosage", **_dosage_common(d))
+    per_var = res.drop_duplicates("variant_id").set_index("variant_id")
+    n = len(d["samples"])
+    # expected ancestry counts: posterior summed over the two haplotypes
+    L = d["posterior"].sum(axis=2).astype(np.float64)           # (variants, samples, 2)
+    assert np.all(np.isfinite(per_var[["an_anc0", "an_anc1"]].to_numpy()))
+    np.testing.assert_allclose(per_var["an_anc0"] + per_var["an_anc1"], 2 * n, rtol=1e-5)
+    vidx = {v: i for i, v in enumerate(d["genotype_df"].index)}
+    for vid in per_var.index:
+        np.testing.assert_allclose(per_var.loc[vid, "an_anc0"], L[vidx[vid], :, 0].sum(), rtol=1e-5)
+    # fractional counts are allowed
+    assert not np.allclose(per_var["an_anc0"].to_numpy(), np.round(per_var["an_anc0"].to_numpy()))
+
+
+def test_min_ancestry_ac_masks_only_that_ancestry(toy_panel_2anc):
+    d = toy_panel_2anc
+    base = map_nominal(haplotypes=d["panel"], ancestry_model="dosage", **_dosage_common(d))
+    thr = float(np.nanmedian(np.concatenate([base["ma_count_anc0"], base["ma_count_anc1"]]))) + 1e-6
+    res = map_nominal(haplotypes=d["panel"], ancestry_model="dosage", min_ancestry_ac=thr,
+                      **_dosage_common(d))
+    assert len(res) == len(base)                                  # rows are kept
+    np.testing.assert_allclose(res["fstat_joint"], base["fstat_joint"], rtol=1e-6, equal_nan=True)
+    for k in range(2):
+        masked = res[f"ma_count_anc{k}"] < thr
+        assert masked.any() and (~masked).any()
+        assert res.loc[masked, f"slope_anc{k}"].isna().all()
+        assert res.loc[masked, f"pval_anc{k}"].isna().all()
+        np.testing.assert_allclose(res.loc[~masked, f"slope_anc{k}"], base.loc[~masked, f"slope_anc{k}"])
+    either = (res["ma_count_anc0"] < thr) | (res["ma_count_anc1"] < thr)
+    assert res.loc[either, "pval_diff_anc0_anc1"].isna().all()
+    assert res.loc[~either, "pval_diff_anc0_anc1"].notna().all()
+    # lead columns come from an unmasked ancestry when one remains
+    one_masked = either & ~((res["ma_count_anc0"] < thr) & (res["ma_count_anc1"] < thr))
+    if one_masked.any():
+        keep_k = np.where(res.loc[one_masked, "ma_count_anc0"] < thr, 1, 0)
+        expected = np.where(keep_k == 0, res.loc[one_masked, "slope_anc0"], res.loc[one_masked, "slope_anc1"])
+        np.testing.assert_allclose(res.loc[one_masked, "slope"], expected)
+    with pytest.raises(ValueError, match="min_ancestry_ac"):
+        map_nominal(haplotypes=d["panel"], ancestry_model="main", min_ancestry_ac=1.0, **_dosage_common(d))
