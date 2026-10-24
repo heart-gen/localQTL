@@ -161,3 +161,46 @@ def test_cli_local_ancestry_cis(cli_inputs, tmp_path, monkeypatch):
           "--window", "10000", "--mode", "cis_nominal", "--ancestry_model", "dosage", "--min_ancestry_ac", "1"] + hap_args)
     pairs = pd.read_parquet(os.path.join(c["out"], "la.cis_qtl_pairs.chr1.parquet"))
     assert {"slope_anc0", "slope_anc1", "pval_joint", "af_anc0"} <= set(pairs.columns)
+
+
+def test_cli_cis_dosage_and_paired_covariate(cli_inputs, tmp_path, monkeypatch):
+    """--ancestry_model dosage in `cis` mode, and --paired_covariate in cis_independent/cis_susie."""
+    pytest.importorskip("rfmix_reader")
+    from rfmix_reader import from_legacy
+    from localqtl import cli
+    from localqtl.haplotypeio import LocalAncestryPanel
+    c = cli_inputs
+    var_df = c["variant_df"]
+    loci = pd.DataFrame({"chromosome": var_df["chrom"].astype(str).values,
+                         "physical_position": var_df["pos"].values})
+    g_anc = pd.DataFrame({"sample_id": c["samples"], "P0": 0.5, "P1": 0.5, "chrom": "1"})
+    codes = c["rng"].integers(0, 2, size=(len(var_df), len(c["samples"]), 2))
+    admix = np.stack([(codes == a).sum(axis=-1) for a in range(2)], axis=-1).astype(np.int8)
+    ds = from_legacy(loci, g_anc, admix)
+    monkeypatch.setattr(cli, "load_haplotypes",
+                        lambda args, sample_ids, logger: LocalAncestryPanel(ds, select_samples=list(sample_ids)))
+
+    # `cis` mode with the dosage model: permutations calibrate the joint F
+    _run([c["geno"], c["bed"], "dos", "--covariates", c["cov"], "-o", c["out"], "--device", "cpu",
+          "--window", "10000", "--mode", "cis", "--permutations", "30", "--haplotypes", "x",
+          "--ancestry_model", "dosage", "--min_ancestry_ac", "1"])
+    cis_df = pd.read_csv(os.path.join(c["out"], "dos.cis_qtl.txt.gz"), sep="\t")
+    assert {"slope_anc0", "slope_anc1", "pval_joint", "af_anc0", "pval_perm", "pval_beta"} <= set(cis_df.columns)
+    assert len(cis_df) == 3 and cis_df["pval_perm"].between(0, 1).all()
+
+    # a phenotype-specific covariate now also reaches cis_independent and cis_susie
+    paired = os.path.join(c["out"], "paired.txt")
+    pd.DataFrame(c["rng"].normal(size=(1, len(c["samples"]))),
+                 index=["gene1_0"], columns=c["samples"]).to_csv(paired, sep="\t")
+    base = [c["geno"], c["bed"], "pc", "--covariates", c["cov"], "-o", c["out"], "--device", "cpu",
+            "--window", "10000", "--paired_covariate", paired]
+    _run(base + ["--mode", "cis", "--permutations", "30"])
+    cis_file = os.path.join(c["out"], "pc.cis_qtl.txt.gz")
+    _run(base + ["--mode", "cis_independent", "--cis_output", cis_file, "--permutations", "30", "--fdr", "0.5"])
+    assert os.path.exists(os.path.join(c["out"], "pc.cis_independent_qtl.txt.gz"))
+    _run(base + ["--mode", "cis_susie", "--cis_output", cis_file, "--fdr", "0.5", "--max_effects", "2"])
+    assert os.path.exists(os.path.join(c["out"], "pc.SuSiE_summary.parquet"))
+
+    with pytest.raises(ValueError, match="dosage is only available"):
+        main([c["geno"], c["bed"], "x", "-o", c["out"], "--device", "cpu", "--mode", "cis_independent",
+              "--cis_output", cis_file, "--haplotypes", "x", "--ancestry_model", "dosage"])

@@ -485,7 +485,7 @@ def susie(X_t, y_t, L=10, scaled_prior_variance=0.2,
 # ---------------------------------------------------------------------------
 
 def map(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
-        covariates_df=None, L=10, scaled_prior_variance=0.2,
+        covariates_df=None, paired_covariate_df=None, L=10, scaled_prior_variance=0.2,
         estimate_residual_variance=True, estimate_prior_variance=True,
         tol=1e-3, coverage=0.95, min_abs_corr=0.5,
         summary_only=True, maf_threshold=0, max_iter=200, window=1000000,
@@ -505,6 +505,10 @@ def map(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
         Phenotype positions (index=phenotype_id, columns 'chr', 'start', 'end').
     covariates_df : pd.DataFrame, optional
         Covariates (samples x covariates).
+    paired_covariate_df : pd.DataFrame, optional
+        One phenotype-specific covariate (phenotypes x samples), appended to
+        ``covariates_df`` for the phenotypes it lists (tensorQTL
+        ``paired_covariate_df``); the others use ``covariates_df`` alone.
     summary_only : bool
         If True, return only the summary DataFrame. If False, also return
         full SuSiE outputs per phenotype.
@@ -534,9 +538,29 @@ def map(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
         logger.write(f'  * applying in-sample MAF >= {maf_threshold} filter')
 
     residualizer = None
+    covariates_t = None
     if covariates_df is not None:
-        residualizer = Residualizer(
-            torch.tensor(covariates_df.values, dtype=torch.float32, device=device))
+        covariates_t = torch.tensor(covariates_df.values, dtype=torch.float32, device=device)
+        residualizer = Residualizer(covariates_t)
+
+    paired_residualizers: dict = {}
+    if paired_covariate_df is not None:
+        if not paired_covariate_df.columns.equals(phenotype_df.columns):
+            missing = [s_ for s_ in phenotype_df.columns if s_ not in paired_covariate_df.columns]
+            if missing:
+                raise ValueError("paired_covariate_df must be phenotypes x samples with the "
+                                 f"phenotype samples (missing {len(missing)}, first: {missing[:5]})")
+            paired_covariate_df = paired_covariate_df[phenotype_df.columns]
+        unknown = paired_covariate_df.index.difference(phenotype_df.index)
+        if len(unknown):
+            raise ValueError(f"paired_covariate_df has {len(unknown)} phenotypes not in "
+                             f"phenotype_df (first: {list(unknown[:5])})")
+        logger.write('  * including phenotype-specific covariate')
+        for pid in paired_covariate_df.index:
+            extra = torch.tensor(paired_covariate_df.loc[pid].to_numpy(np.float32),
+                                 dtype=torch.float32, device=device).reshape(-1, 1)
+            cov_i = extra if covariates_t is None else torch.cat([covariates_t, extra], dim=1)
+            paired_residualizers[pid] = Residualizer(cov_i)
 
     igc = InputGeneratorCis(
         genotype_df=genotype_df, variant_df=variant_df,
@@ -576,9 +600,10 @@ def map(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
         if phenotype_t.dim() == 1:
             phenotype_t = phenotype_t.unsqueeze(0)
 
-        if residualizer is not None:
-            (genotypes_res_t,) = residualizer.transform(genotypes_t, center=True)
-            (phenotype_res_t,) = residualizer.transform(phenotype_t, center=True)
+        rez = paired_residualizers.get(phenotype_id, residualizer)
+        if rez is not None:
+            (genotypes_res_t,) = rez.transform(genotypes_t, center=True)
+            (phenotype_res_t,) = rez.transform(phenotype_t, center=True)
         else:
             genotypes_res_t = genotypes_t
             phenotype_res_t = phenotype_t

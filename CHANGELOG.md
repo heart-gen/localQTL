@@ -10,6 +10,37 @@ To release: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`, u
 compare links at the bottom, merge, and only then tag `vX.Y.Z`. The release workflow builds
 the GitHub release body from that section and stops if the tag has none.
 
+## [Unreleased]
+
+### Added
+
+- **Permutations for the ancestry-specific dosage model.**
+  `map_permutations(ancestry_model="dosage")` calibrates the joint signal: the per-variant
+  statistic is the joint Wald F over the K ancestry effects and the permutation statistic is
+  its maximum over the cis-window, so `pval_perm` and `pval_beta` apply to that joint test
+  while the per-ancestry columns of `map_nominal` (`slope_anc{k}`, `pval_joint`,
+  `z_diff_anc{i}_anc{j}`, `an/ac/af/ma_count_anc{k}`) are reported for the lead variant.
+  Because the test is an F test rather than a correlation, the Beta approximation is fitted
+  to the permuted minimum p-values directly, so `true_dof` is the residual degrees of freedom
+  and `pval_true_dof` is `NaN`. Null phenotypes give uniform `pval_perm` and `pval_beta`
+  (verified in the test suite). `min_ancestry_ac` masks the reported per-ancestry estimates
+  without changing the joint test or the variant ranking. Phenotype groups,
+  `interaction_covariate` and `paired_covariate_df` are rejected in this mode, and
+  `map_independent` still does not implement it.
+- New kernels `prep_ctx_for_dosage_perm`, `dosage_fstat` and `dosage_perm_chunk_fmax`: the
+  per-variant `(X'X)^-1` and the inverse of its ancestry block do not depend on the
+  phenotype, so each permutation chunk costs a few batched matmuls. They reproduce
+  `run_batch_dosage_regression` to float32 precision.
+- **Phenotype-specific covariates in `map_independent` and `susie.map`** (`paired_covariate_df`,
+  `--paired_covariate` on the command line, also for the `cis_independent` and `cis_susie`
+  modes), matching the support added to `map_nominal` and `map_permutations` in 0.2.0.
+  Phenotypes absent from the table use the shared covariates alone; phenotype groups are not
+  supported. A paired covariate is exactly equivalent to adding that column to `covariates_df`
+  for that phenotype.
+- `CisMapper.map_permutations` forwards `paired_covariate_df` and `min_ancestry_ac`.
+- The CLI accepts `--ancestry_model dosage` in `cis` mode as well as `cis_nominal`, and passes
+  `--min_ancestry_ac` to the permutation scan.
+
 ## [0.3.0] - 2026-10-24
 
 External validation of lead variants against the AlphaGenome Atlas and the IGVF

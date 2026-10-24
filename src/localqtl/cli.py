@@ -119,7 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help='Use posterior-expected ancestry counts (RFMix .fb input with a cache)')
     la.add_argument('--ancestry_model', default='main', choices=['main', 'interaction', 'dosage'],
                     help="Local-ancestry model for cis modes: 'main' (covariates; the only option for trans), "
-                         "'interaction' (GxH), 'dosage' (per-ancestry effects; cis_nominal only)")
+                         "'interaction' (GxH), 'dosage' (per-ancestry effects; 'cis' and 'cis_nominal')")
     la.add_argument('--min_ancestry_ac', default=0.0, type=float,
                     help='Dosage model: mask ancestries with fewer in-sample minor alleles than this')
     misc = parser.add_argument_group('localQTL options')
@@ -232,8 +232,8 @@ def main(argv=None) -> int:
         raise ValueError("Output from 'cis' mode must be provided (--cis_output).")
     if args.interaction is not None and args.mode not in ['cis_nominal', 'trans']:
         raise ValueError("Interactions are only supported in 'cis_nominal' or 'trans' mode.")
-    if args.ancestry_model == 'dosage' and args.mode != 'cis_nominal':
-        raise ValueError("--ancestry_model dosage is only available in 'cis_nominal' mode.")
+    if args.ancestry_model == 'dosage' and args.mode not in ('cis', 'cis_nominal'):
+        raise ValueError("--ancestry_model dosage is only available in 'cis' and 'cis_nominal' modes.")
     if args.ancestry_model == 'interaction' and args.mode not in ('cis', 'cis_nominal', 'cis_independent'):
         raise ValueError("--ancestry_model interaction is only available in cis modes.")
     if args.haplotypes is not None and args.mode in ('cis_susie', 'trans_susie'):
@@ -331,7 +331,7 @@ def main(argv=None) -> int:
         kw = dict(covariates_df=covariates_df, group_s=group_s, paired_covariate_df=paired_covariate_df,
                   nperm=args.permutations, window=args.window, beta_approx=not args.disable_beta_approx,
                   maf_threshold=maf_threshold, logger=logger, seed=args.seed, device=device,
-                  perm_chunk=args.perm_chunk, **la_kwargs)
+                  perm_chunk=args.perm_chunk, min_ancestry_ac=args.min_ancestry_ac, **la_kwargs)
         if pgr is None:
             res_df = map_permutations(genotype_df, variant_df, phenotype_df, phenotype_pos_df, **kw)
         else:
@@ -406,7 +406,8 @@ def main(argv=None) -> int:
             summary_df = from_tensorqtl_columns(summary_df.reset_index())
         kw = dict(covariates_df=covariates_df, group_s=group_s, fdr=args.fdr, nperm=args.permutations,
                   window=args.window, maf_threshold=maf_threshold, logger=logger, seed=args.seed,
-                  device=device, beta_approx=not args.disable_beta_approx, perm_chunk=args.perm_chunk, **la_kwargs)
+                  device=device, beta_approx=not args.disable_beta_approx, perm_chunk=args.perm_chunk,
+                  paired_covariate_df=paired_covariate_df, **la_kwargs)
         if pgr is None:
             res_df = map_independent(genotype_df, variant_df, summary_df, phenotype_df, phenotype_pos_df, **kw)
         else:
@@ -429,7 +430,8 @@ def main(argv=None) -> int:
         phenotype_ids = phenotype_df.index[phenotype_df.index.isin(signif_df['phenotype_id'].unique())]
         phenotype_df = phenotype_df.loc[phenotype_ids]
         phenotype_pos_df = phenotype_pos_df.loc[phenotype_ids]
-        kw = dict(covariates_df=covariates_df, L=args.max_effects, maf_threshold=maf_threshold, max_iter=500,
+        kw = dict(covariates_df=covariates_df, paired_covariate_df=paired_covariate_df,
+                  L=args.max_effects, maf_threshold=maf_threshold, max_iter=500,
                   window=args.window, summary_only=False, logger=logger, device=device)
         if pgr is None:
             summary_df, res = susie.map(genotype_df, variant_df, phenotype_df, phenotype_pos_df, **kw)

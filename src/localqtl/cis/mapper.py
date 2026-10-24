@@ -121,7 +121,9 @@ class CisMapper:
             perm_chunk: int = 4096, maf_threshold: Optional[float] = None,
             seed: Optional[int] = None,
             ancestry_model: str = "main",
-            interaction_covariate: Optional[object] = None
+            interaction_covariate: Optional[object] = None,
+            paired_covariate_df: Optional[pd.DataFrame] = None,
+            min_ancestry_ac: float = 0.0,
     ) -> pd.DataFrame:
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
         return _map_permutations(
@@ -145,6 +147,8 @@ class CisMapper:
             verbose=getattr(self.logger, "verbose", True),
             ancestry_model=ancestry_model,
             interaction_covariate=interaction_covariate,
+            paired_covariate_df=paired_covariate_df,
+            min_ancestry_ac=min_ancestry_ac,
         )
 
     def map_independent(

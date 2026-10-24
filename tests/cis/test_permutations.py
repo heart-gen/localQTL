@@ -156,3 +156,113 @@ def test_covariate_interaction_lead_matches_ols(random_cohort):
     se = np.sqrt(np.diag((res @ res) / dof * np.linalg.inv(X1.T @ X1)))
     np.testing.assert_allclose(r.slope, b[3], rtol=1e-3)
     np.testing.assert_allclose(r.pval_nominal, 2 * st.t.sf(abs(b[3] / se[3]), dof), rtol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# ancestry-specific dosage model
+# ---------------------------------------------------------------------------
+def _dosage_cohort(seed=4, n=80, m=10, effect=0.8):
+    """Random cohort with a two-ancestry panel and an effect on variant 3."""
+    from tests.conftest import make_random_panel
+    rng = np.random.default_rng(seed)
+    samples = [f"S{i}" for i in range(n)]
+    G = rng.integers(0, 3, size=(m, n)).astype(np.float32)
+    gdf = pd.DataFrame(G, index=[f"v{i}" for i in range(m)], columns=samples)
+    vdf = pd.DataFrame({"chrom": "chr1", "pos": 100 + 10 * np.arange(m)}, index=gdf.index)
+    panel, admix = make_random_panel(vdf, samples, seed=seed + 1)
+    y = effect * G[3] + rng.normal(size=n)
+    pdf = pd.DataFrame([y], index=["geneA"], columns=samples).astype(np.float32)
+    pos = pd.DataFrame({"chr": ["chr1"], "start": [140], "end": [140]}, index=["geneA"])
+    cov = pd.DataFrame(rng.normal(size=(n, 2)), index=samples, columns=["c1", "c2"])
+    return dict(genotype_df=gdf, variant_df=vdf, phenotype_df=pdf, phenotype_pos_df=pos,
+                covariates_df=cov, panel=panel, admix=admix, samples=samples, rng=rng, G=G, y=y)
+
+
+def test_dosage_permutations_match_the_nominal_dosage_scan():
+    d = _dosage_cohort()
+    lg = SimpleLogger(verbose=False)
+    kw = dict(haplotypes=d["panel"], ancestry_model="dosage", device="cpu", window=1000, logger=lg)
+    perm = map_permutations(d["genotype_df"], d["variant_df"], d["phenotype_df"],
+                            d["phenotype_pos_df"], d["covariates_df"], nperm=200, seed=1, **kw)
+    nom = map_nominal(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+                      d["covariates_df"], out_dir=None, **kw)
+    assert len(perm) == 1
+    r = perm.iloc[0]
+    lead = nom.loc[nom["pval_joint"].idxmin()]
+    assert r["variant_id"] == lead["variant_id"] == "v3"
+    # float32: the permutation path reaches F through a precomputed inverse,
+    # the nominal path through a solve, so tiny p-values differ in the last digit
+    np.testing.assert_allclose(r["pval_nominal"], lead["pval_joint"], rtol=1e-4)
+    np.testing.assert_allclose(r["fstat_joint"], lead["fstat_joint"], rtol=1e-4)
+    for k in (0, 1):
+        np.testing.assert_allclose(r[f"slope_anc{k}"], lead[f"slope_anc{k}"], rtol=1e-4)
+        np.testing.assert_allclose(r[f"af_anc{k}"], lead[f"af_anc{k}"], rtol=1e-5)
+        np.testing.assert_allclose(r[f"an_anc{k}"], lead[f"an_anc{k}"], rtol=1e-5)
+    from src.localqtl.cis.nominal import _dosage_columns
+    assert set(_dosage_columns(2)) <= set(perm.columns)
+    dof = int(r["true_dof"])
+    np.testing.assert_allclose(r["r2_nominal"], 2 * r["fstat_joint"] / (2 * r["fstat_joint"] + dof),
+                               rtol=1e-5)
+    assert r["pval_perm"] < 0.05 and r["pval_beta"] < 0.05
+    assert np.isnan(r["pval_true_dof"])      # no t-style dof re-estimation for an F test
+
+
+def test_dosage_permutations_are_calibrated_under_the_null():
+    """Phenotypes with no genotype effect give ~uniform permutation p-values."""
+    from tests.conftest import make_random_panel
+    rng = np.random.default_rng(99)
+    n, m, P = 70, 12, 60
+    samples = [f"S{i}" for i in range(n)]
+    G = rng.integers(0, 3, size=(m, n)).astype(np.float32)
+    gdf = pd.DataFrame(G, index=[f"v{i}" for i in range(m)], columns=samples)
+    vdf = pd.DataFrame({"chrom": "chr1", "pos": 100 + 10 * np.arange(m)}, index=gdf.index)
+    panel, _ = make_random_panel(vdf, samples, seed=3)
+    Y = rng.normal(size=(P, n)).astype(np.float32)
+    pdf = pd.DataFrame(Y, index=[f"g{i}" for i in range(P)], columns=samples)
+    pos = pd.DataFrame({"chr": "chr1", "start": 150, "end": 150}, index=pdf.index)
+    out = map_permutations(gdf, vdf, pdf, pos, None, haplotypes=panel, ancestry_model="dosage",
+                           nperm=200, device="cpu", seed=2, window=1000,
+                           logger=SimpleLogger(verbose=False))
+    assert len(out) == P
+    for col in ("pval_perm", "pval_beta"):
+        p = out[col].to_numpy(float)
+        p = p[np.isfinite(p)]
+        assert p.size >= P - 2
+        assert 0.35 < p.mean() < 0.65, f"{col} mean {p.mean()}"
+        assert np.mean(p < 0.05) < 0.20, f"{col} tail {np.mean(p < 0.05)}"
+    assert np.corrcoef(out["pval_perm"], out["pval_beta"])[0, 1] > 0.9
+
+
+def test_dosage_permutations_min_ancestry_ac_and_validation():
+    d = _dosage_cohort()
+    lg = SimpleLogger(verbose=False)
+    kw = dict(haplotypes=d["panel"], ancestry_model="dosage", device="cpu", window=1000,
+              logger=lg, nperm=50, seed=1)
+    masked = map_permutations(d["genotype_df"], d["variant_df"], d["phenotype_df"],
+                              d["phenotype_pos_df"], d["covariates_df"],
+                              min_ancestry_ac=1e9, **kw)
+    r = masked.iloc[0]
+    assert np.isnan(r["slope_anc0"]) and np.isnan(r["slope_anc1"])
+    assert np.isnan(r["z_diff_anc0_anc1"])
+    assert np.isfinite(r["fstat_joint"]) and np.isfinite(r["pval_perm"])
+    assert np.isfinite(r["af_anc0"])        # allele statistics are still reported
+    with pytest.raises(ValueError, match="min_ancestry_ac"):
+        map_permutations(d["genotype_df"], d["variant_df"], d["phenotype_df"],
+                         d["phenotype_pos_df"], d["covariates_df"], haplotypes=d["panel"],
+                         ancestry_model="main", min_ancestry_ac=5, nperm=10, device="cpu", logger=lg)
+    with pytest.raises(ValueError, match="dosage"):
+        map_permutations(d["genotype_df"], d["variant_df"], d["phenotype_df"],
+                         d["phenotype_pos_df"], d["covariates_df"], haplotypes=d["panel"],
+                         ancestry_model="dosage", group_s=pd.Series({"geneA": "grp"}),
+                         nperm=10, device="cpu", logger=lg)
+    with pytest.raises(ValueError, match="dosage"):
+        map_permutations(d["genotype_df"], d["variant_df"], d["phenotype_df"],
+                         d["phenotype_pos_df"], d["covariates_df"], haplotypes=d["panel"],
+                         ancestry_model="dosage", nperm=10, device="cpu", logger=lg,
+                         paired_covariate_df=pd.DataFrame(
+                             d["rng"].normal(size=(1, len(d["samples"]))),
+                             index=["geneA"], columns=d["samples"]))
+    with pytest.raises(ValueError, match="requires haplotypes"):
+        map_permutations(d["genotype_df"], d["variant_df"], d["phenotype_df"],
+                         d["phenotype_pos_df"], d["covariates_df"], ancestry_model="dosage",
+                         nperm=10, device="cpu", logger=lg)

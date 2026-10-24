@@ -169,8 +169,23 @@ With a hard-call panel (`.msp.tsv`) the same model reduces to the classic
 ancestry-specific genotype regression. Note that substituting posterior
 expectations for the unknown haplotype ancestries does not propagate that
 uncertainty into the standard errors; joint-likelihood or multiple-imputation
-estimation is future work. `ancestry_model="dosage"` is currently available
-for `map_nominal` only (no permutations, no `interaction_covariate`).
+estimation is future work.
+
+`map_permutations(ancestry_model="dosage")` calibrates the scan: the
+per-variant statistic is the joint Wald F over the K ancestry effects and the
+permutation statistic is its maximum over the cis-window, so `pval_perm` and
+`pval_beta` apply to the *joint* signal while the per-ancestry columns are
+reported for the lead variant. Because the joint test is an F test rather
+than a correlation, the Beta approximation is fitted to the permuted minimum
+p-values directly; `true_dof` is therefore the residual degrees of freedom and
+`pval_true_dof` is `NaN`. The dosage model is available in `map_nominal` and
+`map_permutations` (and in the `cis` / `cis_nominal` CLI modes), but not with
+phenotype groups, `interaction_covariate`, `paired_covariate_df` or
+`map_independent`.
+
+```python
+perm_df = mapper.map_permutations(nperm=10_000, ancestry_model="dosage", min_ancestry_ac=10)
+```
 
 ### Covariate interaction scans
 
@@ -213,8 +228,10 @@ enter as main effects.
 
 Phenotype-specific covariates (one extra covariate per phenotype, e.g. a local
 PEER factor) are passed as `paired_covariate_df` (phenotypes x samples) to
-`map_nominal` and `map_permutations`; phenotypes absent from it use the shared
-covariates only.
+`map_nominal`, `map_permutations`, `map_independent` and `susie.map`, and on
+the command line with `--paired_covariate`. Phenotypes absent from the table
+use the shared covariates only, so one call can mix both. Grouped phenotypes
+are not supported.
 
 For analyses that combine nominal scans, permutations, and independent signal
 calling, the `CisMapper` class offers a thin object-oriented façade:

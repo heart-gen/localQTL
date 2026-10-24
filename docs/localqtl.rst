@@ -206,8 +206,32 @@ skips the pair-level output.  ``interaction_df`` is mutually exclusive with
 ``ancestry_model="interaction"``.
 
 ``paired_covariate_df`` (phenotypes x samples) adds one phenotype-specific
-covariate to the shared covariates in :func:`localqtl.cis.map_nominal` and
-:func:`localqtl.cis.map_permutations`.
+covariate to the shared covariates in :func:`localqtl.cis.map_nominal`,
+:func:`localqtl.cis.map_permutations`, :func:`localqtl.cis.map_independent`
+and :func:`localqtl.susie.map` (``--paired_covariate`` on the command line).
+Phenotypes absent from the table use the shared covariates alone; phenotype
+groups are not supported.
+
+Permutations for the ancestry-specific dosage model
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:func:`localqtl.cis.map_permutations` accepts ``ancestry_model="dosage"``.
+The per-variant statistic is the joint Wald F over the K ancestry effects and
+the permutation statistic is its maximum over the cis-window, so ``pval_perm``
+and ``pval_beta`` calibrate the *joint* ancestry signal; ``pval_nominal`` is
+the joint p-value of the lead variant and the per-ancestry columns of
+:func:`localqtl.cis.map_nominal` are reported for it.  Because the joint test
+is an F test rather than a correlation, the Beta approximation is fitted to
+the permuted minimum p-values directly: ``true_dof`` is the residual degrees
+of freedom and ``pval_true_dof`` is ``NaN``.  Phenotype groups,
+``interaction_covariate`` and ``paired_covariate_df`` are not supported in
+this mode, and :func:`localqtl.cis.map_independent` does not implement it.
+
+.. code-block:: python
+
+   perm_df = map_permutations(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
+                              covariates_df, haplotypes=panel, ancestry_model="dosage",
+                              nperm=10_000, min_ancestry_ac=10, seed=1)
 
 trans-QTL mapping and tensorQTL post-processing
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
