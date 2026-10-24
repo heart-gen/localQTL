@@ -1,0 +1,147 @@
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Versions follow the git tags (`vX.Y.Z`); the package version is derived from the tag.
+
+## [0.2.0] - 2026-10-24
+
+Ancestry-resolved cis-xQTL mapping with external allele-frequency QC, and
+feature parity with tensorQTL (trans mapping, eigenMT, multi-term interactions,
+post-processing and a command line). Two regression fixes change numeric
+output; see *Upgrading from 0.1* in the README.
+
+### Added
+
+- **Posterior-aware ancestry-specific dosage model.** `map_nominal(ancestry_model="dosage")`
+  fits one effect per ancestry from the expected ancestry-specific alternate-allele dosage
+  (`D_k = G * L_k / 2`), reports `slope_anc{k}`, the joint test `fstat_joint` / `pval_joint`,
+  pairwise `z_diff_anc{i}_anc{j}` / `pval_diff_anc{i}_anc{j}` from the full covariance of the
+  ancestry betas, and the per-ancestry in-sample allele statistics `an_anc{k}`, `ac_anc{k}`,
+  `af_anc{k}`, `ma_count_anc{k}`. `min_ancestry_ac` masks ancestries with too few minor alleles.
+  `LocalAncestryPanel(use_posterior=True)` serves posterior-expected counts from RFMix `.fb` output.
+- **Allele metadata.** `PgenReader.variant_df`, `PlinkReader.variant_df` and `load_genotypes`
+  carry `chrom, pos, ref, alt` with `alt` the counted (dosage) allele;
+  `genotypeio.alleles_from_variant_ids` parses `chr1_123_A_G_b38`-style IDs.
+- **`localqtl.freq`: external allele frequencies and ancestry-aware QC.** `FrequencyTable`
+  (GRCh38, keyed by `chrom, pos, ref, alt`, allele-aware lookup that re-orients swapped alleles
+  and flags strand-ambiguous sites), importers for gnomAD v4 sites VCFs (including the
+  local-ancestry-tract fields, detected from the header), the gnomAD local-ancestry release,
+  NCBI ALFA, and `bcftools query` output (no pysam needed); `ancestry_allele_frequencies`
+  (in-sample per-ancestry AF), `compare_allele_frequencies` / `summarize_af_concordance`,
+  `annotate_with_frequency`, frequency- and ancestry-stratified calibration
+  (`calibration_by_frequency`, `calibration_by_frequency_dosage`, genomic-control lambda,
+  QQ tables) and `run_frequency_benchmark` with a permutation null. Ancestry labels map to
+  reference groups only through an explicit `ancestry_map`. Optional extra `annotate` (pysam)
+  for tabix access.
+- **`map_nominal_loci`** (exported; pads the window exactly once; several loci per phenotype)
+  and `CisMapper.map_nominal_loci`.
+- **tensorQTL parity.**
+  - `localqtl.trans`: `GenotypeGeneratorTrans`, `map_trans` (sparse or dense output, single
+    `interaction_s`, optional `LocalAncestryPanel` main-effect covariates), `filter_cis`,
+    `map_trans_permutations` (genome-wide or leave-one-chromosome-out null) and
+    `apply_permutations`.
+  - `localqtl.eigenmt`: `lw_shrink`, `compute_tests`, `run_eigenmt`, `padjust_bh`.
+  - `map_nominal`: `interaction_df` (one or several terms, tensorQTL column naming),
+    `maf_threshold_interaction`, `paired_covariate_df`, `write_top` / `write_stats`
+    (`--best_only`), `run_eigenmt` and `top_assoc_path`; the top association per phenotype
+    (or group) is written to `<out_prefix>.top_assoc.txt.gz` or returned in
+    `results.attrs["top_assoc"]`. `map_permutations` accepts `paired_covariate_df`.
+  - `localqtl.post`: `calculate_afc` (mixQTL total-read-count model), `calculate_replication`
+    (with `compute_pi1`, interaction and paired covariates), `annotate_genes`, `linreg`, `trc`;
+    re-exports `calculate_qvalues` and `get_significant_pairs`.
+  - `localqtl.compat`: `to_tensorqtl_columns` / `from_tensorqtl_columns`
+    (`true_dof` <-> `true_df`, `se_gi` <-> `b_gi_se`, ...).
+  - `genotypeio.get_sample_ids`, `parse_genotypes`, `get_vcf_region`, `get_vcf_variants`
+    (pysam when installed, otherwise the `tabix` binary); `pgen.get_chunk_size` and
+    `pgen.generate_paired_chunks`.
+  - `stats.fit_beta_parameters`; `preproc.filter_maf_interaction` and `interaction_half_mask`.
+  - **Command line** `python -m localqtl` / `localqtl` with tensorQTL's modes (`cis`,
+    `cis_nominal`, `cis_independent`, `cis_susie`, `trans`, `trans_susie`), arguments and output
+    file names, plus `--haplotypes`, `--la_format`, `--la_source`, `--la_cache_dir`,
+    `--use_posterior`, `--ancestry_model`, `--min_ancestry_ac`, `--device`, `--perm_chunk` and
+    `--localqtl_names`. Output columns use tensorQTL's spelling unless `--localqtl_names` is given.
+- API stubs for the planned `localqtl.annotate.alphagenome` and `localqtl.annotate.igvf`
+  modules (they raise `NotImplementedError`).
+- Continuous integration: tests on Python 3.11–3.13 and a docs build on every push and pull
+  request; tagged releases build, publish to PyPI (trusted publishing) and create a GitHub
+  release whose body is this file's section.
+
+### Changed
+
+- **Degrees of freedom.** `Residualizer.k_eff` now counts the centring (intercept) degree of
+  freedom in addition to the covariate rank, and every kernel uses `dof = n - k_eff - p`. Standard
+  errors from the batched kernels were previously too small by a factor of
+  `sqrt((n - k - 1) / (n - k - 2))` and inconsistent with the correlation-based p-values.
+- **No-covariate runs fit an intercept.** With `covariates_df=None` the residualizer has rank 0
+  and centres every matrix, instead of fitting through the origin.
+- **Interaction models match full OLS.** The `g:i` column is built from the raw genotypes and the
+  interaction main effect is residualized against the covariates (Frisch–Waugh), in the nominal,
+  permutation and independent cores; previously the product used the residualized genotype,
+  which biased all interaction coefficients whenever covariates were present. `map_nominal`
+  with a local-ancestry panel now keeps the ancestry main effects in the GxC model, as the
+  permutation and independent scans already did.
+- `ancestry_model` is validated everywhere (`'main'`, `'interaction'`, `'dosage'`); misspelled
+  values no longer run the main model silently.
+- `map_nominal_loci` padded `position` by the window twice; it now pads once.
+- `impute_mean_and_filter` drops rows that become monomorphic only after mean imputation.
+- `read_phenotype_bed` keeps the case of sample IDs (they were lowercased).
+- The dosage-model Parquet schema gained the per-ancestry allele-count columns (appended after
+  the pairwise-difference block). The `af` column is documented as the in-sample frequency of
+  the counted (`alt`) allele.
+- Build backend: `poetry-dynamic-versioning` (the version is read from the git tag, also for
+  `pip install` from a checkout).
+
+### Fixed
+
+- `map_independent`: the grouped core referenced an undefined name; the forward pass could loop
+  forever when a conditioned variant was re-selected; the Beta fit could hang on degenerate
+  permutation sets (it now returns NaN and callers fall back to `pval_perm`); a NaN `true_dof`
+  with `beta_approx=False` crashed the integer result buffer.
+- `PgenReader(select_samples=...)` passed a Python list to pgenlib, which rejected it.
+- Tests that asserted group columns on an ungrouped run, and a permutation test that hung on
+  the forward-pass loop above, were corrected.
+
+## [0.1.4] - 2026-03-28
+
+- SuSiE fine-mapping (`localqtl.susie`), COLOC colocalization (`localqtl.coloc`) and
+  `interaction_covariate` (genotype-by-covariate) scans; cis post-processing helpers
+  `annotate_with_susie`, `annotate_with_coloc`, `annotate_ancestry_difference`.
+- Ancestry-specific effect columns for the GxH `ancestry_model="interaction"` scan.
+- Lazy GPU array/dataframe backends (CuPy, cuDF) with CPU fallback; optional `gpu` extra.
+- rfmix-reader `>= 0.6` per-chromosome `LocalAncestryPanel` (`RFMixReader`, `FlareReader`,
+  `open_panel`).
+- p-values computed with SciPy on CPU to avoid clamping; degrees-of-freedom and AMP fixes in
+  the permutation kernels.
+
+## [0.1.3] - 2025-11-12
+
+- Read the Docs configuration and refreshed documentation; `nperm` defaults to no permutations.
+- Fixed the degrees-of-freedom call and the `alpha_perm` naming in the permutation scan.
+
+## [0.1.2] - 2025-11-03
+
+- Permutation kernels without quadratic memory, shared GPU permutations across phenotypes,
+  covariate and permutation reuse in `map_independent`, batch progress logging.
+- `_torch_utils` device helpers; `preload_haplotypes` for every cis mapper.
+
+## [0.1.1] - 2025-11-01
+
+- `pandas-plink-ng` replaces the git install of `pandas-plink`; optional haplotype preloading
+  to torch.
+
+## [0.1.0] - 2025-11-01
+
+- First release: tensorQTL-style cis-QTL mapping (`map_nominal`, `map_permutations`,
+  `map_independent`, `CisMapper`) in PyTorch with local-ancestry haplotype input from RFMix
+  (`InputGeneratorCisWithHaps`), PLINK 1/2 readers, streaming Parquet sinks and pure-Python
+  q-values.
+
+[0.2.0]: https://github.com/heart-gen/localQTL/compare/v0.1.4...v0.2.0
+[0.1.4]: https://github.com/heart-gen/localQTL/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/heart-gen/localQTL/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/heart-gen/localQTL/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/heart-gen/localQTL/compare/v0.1.0-dev...v0.1.1
+[0.1.0]: https://github.com/heart-gen/localQTL/releases/tag/v0.1.0-dev

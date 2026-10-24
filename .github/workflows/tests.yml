@@ -1,0 +1,53 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # poetry-dynamic-versioning reads the git tags
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install poetry
+        run: |
+          pipx install poetry
+          pipx inject poetry "poetry-dynamic-versioning[plugin]"
+      - name: Install package with test dependencies
+        # CPU-only torch is enough for the test suite; the `gpu` extra is not installed.
+        run: poetry install --with dev --extras annotate
+      - name: Run test suite
+        run: poetry run pytest -q -p no:cacheprovider
+      - name: CLI smoke check
+        run: poetry run localqtl --help
+
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install poetry
+        run: |
+          pipx install poetry
+          pipx inject poetry "poetry-dynamic-versioning[plugin]"
+      - name: Install package with the docs group
+        run: poetry install --with docs
+      - name: Build the docs
+        run: poetry run python -m sphinx -b html docs docs/_build/html

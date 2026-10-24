@@ -86,6 +86,23 @@ To work against the latest repository state, fall back to an editable install:
 
    pip install -e .
 
+Upgrading from 0.1
+------------------
+
+Version 0.2.0 changes numeric output in three places (see the
+`changelog <https://github.com/heart-gen/localQTL/blob/main/CHANGELOG.md>`_):
+the batched kernels count the intercept in the degrees of freedom
+(``dof = n - k_eff - p``; 0.1 standard errors were too small by
+``sqrt((n - k - 1) / (n - k - 2))``), runs without covariates fit an intercept
+instead of passing through the origin, and interaction scans now equal a full
+OLS fit of ``y ~ 1 + g + i + g:i + C`` (the ``g:i`` column was built from the
+residualized genotype before). Re-run affected scans rather than mixing
+results across versions. ``variant_df`` from the PLINK readers carries
+``ref``/``alt`` with ``alt`` the counted allele, the dosage-model Parquet
+files gained per-ancestry count columns, ``read_phenotype_bed`` keeps the case
+of sample IDs, and the command line writes tensorQTL column names by default
+(``localqtl.compat`` converts between the two spellings).
+
 Quick Start
 -----------
 

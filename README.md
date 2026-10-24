@@ -62,6 +62,32 @@ pip install -e ".[gpu]"
 > **Note:** the `gpu` extra pins CUDA 12 wheels (`cupy-cuda12x`, `cudf-cu12`,
 > `dask-cudf-cu12`); match them to the CUDA toolkit on your system.
 
+Release notes are in [CHANGELOG.md](CHANGELOG.md).
+
+### Upgrading from 0.1
+
+Version 0.2.0 changes numeric output in three places; re-run affected scans
+rather than mixing results across versions.
+
+- **Standard errors and degrees of freedom.** The batched kernels now count the
+  intercept in the degrees of freedom (`dof = n - k_eff - p`, with `k_eff`
+  including the centring step). Standard errors from 0.1 were too small by
+  `sqrt((n - k - 1) / (n - k - 2))`; t-statistics and p-values shift accordingly.
+- **Runs without covariates** now fit an intercept (every matrix is centred).
+  In 0.1 they were fitted through the origin.
+- **Interaction scans** (`interaction_covariate`, and the new `interaction_df`)
+  now equal a full OLS fit of `y ~ 1 + g + i + g:i + C`. In 0.1 the `g:i`
+  column was built from the residualized genotype, which biased the
+  interaction coefficients whenever covariates were given.
+
+Other things to know: `variant_df` from the PLINK readers carries `ref`/`alt`
+with `alt` the counted allele; the dosage-model Parquet files have additional
+per-ancestry count columns after the pairwise-difference block (read columns by
+name); `read_phenotype_bed` no longer lowercases sample IDs; `ancestry_model`
+must be one of `main`, `interaction`, `dosage`. The command line writes
+tensorQTL column names (`true_df`, `b_gi_se`, ...) by default; the Python API
+keeps `true_dof`, `se_gi`, ... and `localqtl.compat` converts between the two.
+
 ## Quickstart
 
 Below is a minimal example that runs a nominal cis-QTL scan against PLINK-formatted
