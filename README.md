@@ -24,6 +24,9 @@ workflows, while adding ancestry-aware use cases.
 - **Fine-mapping and colocalization helpers** via `localqtl.susie`,
   `localqtl.coloc`, and cis post-processing utilities that annotate nominal or
   permutation outputs with credible sets and COLOC posterior support.
+- **External validation of lead variants**: AlphaGenome Atlas molecular-effect
+  scores and IGVF Catalog regulatory links (`localqtl.annotate`), as live
+  clients or from exported tables.
 - **tensorQTL feature parity**: trans-QTL mapping (`localqtl.trans`), eigenMT
   (`localqtl.eigenmt`), multi-term `interaction_df` scans with top-association
   output, phenotype-specific `paired_covariate_df`, aFC / replication / gene
@@ -37,7 +40,8 @@ Install the latest release from PyPI:
 ```bash
 pip install localqtl              # CPU / PyTorch only
 pip install "localqtl[gpu]"       # + CuPy and cuDF (CUDA 12 wheels)
-pip install "localqtl[annotate]"  # + pysam, for tabix access to gnomAD / ALFA frequency VCFs
+pip install "localqtl[annotate]"       # + pysam, for tabix access to gnomAD / ALFA frequency VCFs
+pip install "localqtl[annotate-live]"  # + requests, for the IGVF Catalog REST client
 ```
 
 The core depends on PyTorch, numpy/scipy/pandas, pgenlib and rfmix-reader.
@@ -420,6 +424,55 @@ genotypes in chunks. Output columns use tensorQTL's spelling unless
 `--localqtl_names` is given; `--device`, `--perm_chunk`, `--haplotypes`,
 `--la_format`, `--la_source`, `--la_cache_dir`, `--use_posterior`,
 `--ancestry_model` and `--min_ancestry_ac` are localQTL additions.
+
+### External validation: AlphaGenome Atlas and IGVF Catalog
+
+`localqtl.annotate` compares lead xQTL variants with external evidence. Both
+clients work live or from files, so a cached table reproduces an analysis
+without network access or an API key.
+
+**AlphaGenome Atlas** supplies predicted molecular effects per variant and
+gene. The live client needs the SDK (`pip install alphagenome`, non-commercial
+licence) and an API key in `$ALPHAGENOME_API_KEY`.
+
+```python
+from localqtl.annotate import alphagenome as ag
+
+scores = ag.score_lead_variants(lead_df, ontology_terms=["UBERON:0001873"],  # caudate nucleus
+                                scorers=["RNA_SEQ"], cache_path="atlas_scores.parquet")
+scores = ag.read_atlas_scores("atlas_scores.parquet")        # offline rerun
+
+annotated = ag.annotate_with_alphagenome(dosage_df, scores, variant_df=variant_df)
+```
+
+Variants are matched on `(chrom, pos, ref, alt)` and genes without their
+version suffix. Each row gains `ag_raw_score`, `ag_quantile_score`,
+`ag_biosample`, `ag_n_tracks` and `ag_sign_concordant`, the last comparing the
+sign of the measured `slope` (the strongest ancestry in the dosage model) with
+the predicted effect.
+
+**IGVF Catalog** supplies independently measured regulatory links: variant to
+gene (eQTL, spliceQTL, CRISPR screens, Variant-EFFECTS) and element to gene
+(ENCODE-rE2G, scE2G, Perturb-seq, CRISPR screens).
+
+```python
+from localqtl.annotate import igvf
+
+links = igvf.query_variant_gene_links(lead_df, variant_df=variant_df,
+                                      methods=["eQTL"], cache_path="igvf_links.parquet")
+elements = igvf.query_element_gene_links(regions_df, methods=["ENCODE-rE2G"])
+elements = igvf.read_bedpe_links("ENCODE-rE2G.bedpe", method="ENCODE-rE2G")  # bulk download
+
+compared = igvf.compare_with_regulatory_links(dosage_df, elements, variant_df, max_distance=0)
+summary = igvf.summarize_link_concordance(compared)   # per ancestry: frac_supported
+```
+
+The Catalog is queried by region (at most 10 kb per request, so positions are
+merged into as few requests as possible) and reports **0-based** positions,
+which the client converts to the 1-based convention of `variant_df`. Results
+gain `n_links`, `same_gene_support`, `best_method`, `best_source`,
+`distance_to_element` and, for the dosage model, `supported_anc{k}` (that
+ancestry is significant *and* the pair has independent support).
 
 ### Fine-mapping and colocalization
 

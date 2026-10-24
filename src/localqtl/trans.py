@@ -543,10 +543,11 @@ def map_trans_permutations(genotype_df, covariates_df=None, permutations=None, *
 
     Returns
     -------
-    pd.Series (``chr_s is None``) with ``num_samples, dof, beta_shape1,
-    beta_shape2, true_dof, minp_true_dof, minp_empirical`` or a DataFrame
-    with one row per chromosome; both are consumed by
-    :func:`apply_permutations`.
+    pandas.Series or pandas.DataFrame
+        Without ``chr_s`` a Series with ``num_samples``, ``dof``,
+        ``beta_shape1``, ``beta_shape2``, ``true_dof``, ``minp_true_dof`` and
+        ``minp_empirical``; with ``chr_s`` a DataFrame with one row per
+        chromosome.  Both are consumed by :func:`apply_permutations`.
     """
     dev = resolve_device(device)
     logger = logger or SimpleLogger(verbose=verbose)

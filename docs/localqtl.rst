@@ -747,6 +747,45 @@ beta approximation used during permutation scans:
    # Convert R^2 back to a two-sided p-value for downstream filtering
    p_from_r2 = pval_from_corr_r2(r2=0.25, dof=perm_df["true_dof"].iloc[0])
 
+External validation: AlphaGenome Atlas and IGVF Catalog
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:mod:`localqtl.annotate` compares lead variants with external evidence, either
+through a live client or from a previously exported table (so an analysis can
+be reproduced without network access or an API key).
+
+:mod:`localqtl.annotate.alphagenome` queries the AlphaGenome Atlas for
+predicted molecular effects.  The live path needs the ``alphagenome`` SDK
+(``pip install alphagenome``; non-commercial licence) and an API key in
+``$ALPHAGENOME_API_KEY``; :func:`~localqtl.annotate.alphagenome.read_atlas_scores`
+reads an exported tidy-score table instead.
+
+.. code-block:: python
+
+   from localqtl.annotate import alphagenome as ag
+
+   scores = ag.score_lead_variants(lead_df, scorers=["RNA_SEQ"],
+                                   ontology_terms=["UBERON:0001873"],
+                                   cache_path="atlas_scores.parquet")
+   annotated = ag.annotate_with_alphagenome(dosage_df, scores, variant_df=variant_df)
+
+:mod:`localqtl.annotate.igvf` queries the IGVF Catalog for variant->gene and
+element->gene regulatory links (``pip install "localqtl[annotate-live]"`` for
+the REST client), or reads downloaded BEDPE prediction sets.
+
+.. code-block:: python
+
+   from localqtl.annotate import igvf
+
+   links = igvf.query_variant_gene_links(lead_df, variant_df=variant_df, methods=["eQTL"])
+   compared = igvf.compare_with_regulatory_links(dosage_df, links, variant_df)
+   summary = igvf.summarize_link_concordance(compared)
+
+The Catalog accepts at most 10 kb per region query and reports 0-based
+positions; the client merges the lead variants into as few requests as
+possible and converts every position to the 1-based convention used by
+``variant_df``.
+
 API reference
 -------------
 
@@ -798,7 +837,21 @@ Allele frequencies and QC
 * :func:`localqtl.freq.calibration_by_frequency_dosage`
 * :func:`localqtl.freq.run_frequency_benchmark`
 * :mod:`localqtl.freq`
+
+External validation
+~~~~~~~~~~~~~~~~~~~
+
+* :func:`localqtl.annotate.alphagenome.score_lead_variants`
+* :func:`localqtl.annotate.alphagenome.read_atlas_scores`
+* :func:`localqtl.annotate.alphagenome.annotate_with_alphagenome`
+* :func:`localqtl.annotate.igvf.query_variant_gene_links`
+* :func:`localqtl.annotate.igvf.query_element_gene_links`
+* :func:`localqtl.annotate.igvf.read_bedpe_links`
+* :func:`localqtl.annotate.igvf.compare_with_regulatory_links`
+* :func:`localqtl.annotate.igvf.summarize_link_concordance`
 * :mod:`localqtl.annotate`
+
+Every public module is also documented in full in :doc:`api`.
 
 Genotype and phenotype I/O
 ~~~~~~~~~~~~~~~~~~~~~~~~~~

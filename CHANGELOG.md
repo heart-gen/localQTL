@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Versions follow the git tags (`vX.Y.Z`); the package version is derived from the tag.
 
+## [Unreleased]
+
+### Added
+
+- **`localqtl.annotate.alphagenome`: AlphaGenome Atlas molecular-effect scores.**
+  `score_lead_variants` queries the Atlas for the lead variants (live client via the
+  `alphagenome` SDK and an API key in `$ALPHAGENOME_API_KEY`, batched, with an optional
+  `cache_path`), `read_atlas_scores` / `write_atlas_scores` handle exported tidy-score tables
+  so an analysis reruns offline, and `annotate_with_alphagenome` joins the scores onto results
+  by `(chrom, pos, ref, alt)` and gene (version suffixes ignored), adding `ag_raw_score`,
+  `ag_quantile_score`, `ag_biosample`, `ag_n_tracks` and `ag_sign_concordant`. The SDK is
+  licensed for non-commercial use and is not locked as a dependency; install it separately.
+- **`localqtl.annotate.igvf`: IGVF Catalog regulatory links.**
+  `query_variant_gene_links` and `query_element_gene_links` page through the public REST API
+  (region queries of at most 10 kb, retries on 429/5xx, optional method / source / biosample
+  filters and a `cache_path`), `read_bedpe_links` reads downloaded ENCODE-rE2G / scE2G
+  prediction sets, and `read_links` / `write_links` round-trip cached tables.
+  `compare_with_regulatory_links` flags QTL pairs whose variant has a direct variant->gene link
+  or lies in an element linked to the same gene (`n_links`, `same_gene_support`, `best_method`,
+  `best_source`, `distance_to_element`, and `supported_anc{k}` for the dosage model), and
+  `summarize_link_concordance` reports the supported fraction per ancestry, method or source.
+  The Catalog reports 0-based positions; every position returned by the client is 1-based, as
+  in `variant_df`.
+- Optional extra `annotate-live` (`requests`) for the IGVF REST client; the cached-table and
+  BEDPE readers need nothing beyond the core dependencies.
+- `docs/api.rst`: autodoc pages for every public module, linked from the documentation index.
+- A `live` pytest marker for the tests that call external APIs; they are skipped unless
+  `pytest --run-live` is given.
+
+### Changed
+
+- Documentation: the Sphinx build no longer replaces heavy dependencies with empty module
+  stubs (they broke `import localqtl.cis.nominal` during autodoc, so no API member was
+  documented); unavailable GPU-only and optional packages are mocked by `autodoc_mock_imports`
+  instead, and `nitpick_ignore_regex` silences the free-text parameter types numpydoc renders
+  as cross-references. Several docstrings that numpydoc mis-parsed (a `Returns` description on
+  the type line) were rewritten.
+
 ## [0.2.0] - 2026-10-24
 
 Ancestry-resolved cis-xQTL mapping with external allele-frequency QC, and
@@ -139,6 +177,7 @@ output; see *Upgrading from 0.1* in the README.
   (`InputGeneratorCisWithHaps`), PLINK 1/2 readers, streaming Parquet sinks and pure-Python
   q-values.
 
+[Unreleased]: https://github.com/heart-gen/localQTL/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/heart-gen/localQTL/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/heart-gen/localQTL/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/heart-gen/localQTL/compare/v0.1.2...v0.1.3

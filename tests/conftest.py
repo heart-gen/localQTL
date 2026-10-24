@@ -389,3 +389,17 @@ def make_cohort_with_chroms(seed=5, n=60, m_per_chrom=(8, 6), n_pheno_per_chrom=
     covariates_df = pd.DataFrame(rng.normal(size=(n, 2)), index=samples, columns=["PC1", "PC2"])
     return dict(genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
                 phenotype_pos_df=phenotype_pos_df, covariates_df=covariates_df, samples=samples, rng=rng)
+
+
+def pytest_addoption(parser):
+    parser.addoption("--run-live", action="store_true", default=False,
+                     help="run tests that call external APIs (IGVF Catalog, AlphaGenome Atlas)")
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--run-live"):
+        return
+    skip_live = pytest.mark.skip(reason="needs --run-live (external API)")
+    for item in items:
+        if "live" in item.keywords:
+            item.add_marker(skip_live)

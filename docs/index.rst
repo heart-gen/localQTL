@@ -6,6 +6,7 @@ localQTL documentation
    :caption: Contents
 
    localqtl
+   api
 
 .. seealso::
    The `project README <../README.md>`_ provides a concise overview and

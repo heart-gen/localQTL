@@ -406,12 +406,11 @@ def prepare_interaction_covariate(
     sample_ids: pd.Index,
 ) -> Optional[np.ndarray]:
     """
-    Normalize and align a sample-level interaction covariate to sample_ids.
-    Accepts:
-      - str: column name in covariates_df
-      - pd.Series with sample IDs in the index
-      - 1D array-like matching sample_ids order
-    Returns float32 array (n_samples,) centered and scaled (z-score).
+    Normalize and align a sample-level interaction covariate to ``sample_ids``.
+
+    Accepts a column name in ``covariates_df``, a :class:`pandas.Series`
+    indexed by sample ID, or a 1D array-like already in ``sample_ids`` order.
+    Returns a float32 array ``(n_samples,)``, centred and scaled (z-score).
     """
     if interaction_covariate is None:
         return None
