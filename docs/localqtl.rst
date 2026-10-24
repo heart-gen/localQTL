@@ -60,6 +60,7 @@ Poetry
 
    poetry install                 # CPU / PyTorch only
    poetry install --extras gpu    # + CuPy and cuDF (CUDA 12 wheels)
+   poetry install --extras annotate  # + pysam for gnomAD / ALFA tabix importers
 
 Pip
 ~~~
@@ -72,6 +73,7 @@ editable source checkout; the ``gpu`` extra adds the CuPy / cuDF backends
 
    pip install localqtl
    pip install "localqtl[gpu]"
+   pip install "localqtl[annotate]"
 
 To work against the latest repository state, fall back to an editable install:
 
@@ -283,7 +285,14 @@ Per ancestry: ``slope_anc{k}``, ``slope_se_anc{k}``, ``tstat_anc{k}``,
 :math:`\beta_k = 0`; ``z_diff_anc{i}_anc{j}`` / ``pval_diff_anc{i}_anc{j}``
 test :math:`\beta_i = \beta_j` using the covariance of the ancestry betas.
 The standard ``slope`` / ``pval_nominal`` columns carry the ancestry with the
-strongest effect.  With a hard-call panel the model reduces to the classic
+strongest effect.  Every row also reports the in-sample per-ancestry allele
+statistics ``an_anc{k}`` (allele number :math:`\sum_i L_{ik}`), ``ac_anc{k}``
+(expected alt-allele count on ancestry-*k* haplotypes :math:`\sum_i D_{ik}`),
+``af_anc{k}`` and ``ma_count_anc{k}`` (minor-allele count within the ancestry;
+fractional for posterior-expected counts).  ``min_ancestry_ac=<count>`` masks
+(``NaN``) the effect estimates and pairwise differences of ancestries with
+fewer in-sample minor alleles than that, keeping the row, the pooled columns
+and ``fstat_joint``.  With a hard-call panel the model reduces to the classic
 ancestry-specific genotype regression.  Substituting posterior expectations
 does not propagate the assignment uncertainty into the standard errors
 (joint-likelihood / multiple-imputation estimation is future work), and the
@@ -317,6 +326,116 @@ Sample alignment and mapping
    perm_df = mapper.map_permutations(nperm=1_000, beta_approx=True)
    perm_df = mapper.calculate_qvalues(perm_df, fdr=0.05)
    lead_df = mapper.map_independent(cis_df=perm_df, fdr=0.05)
+
+External allele frequencies and ancestry QC
+-------------------------------------------
+
+:mod:`localqtl.freq` compares in-sample (per-ancestry) allele frequencies
+with external references and summarises p-value calibration by frequency bin
+and ancestry.
+
+Allele metadata
+~~~~~~~~~~~~~~~
+
+:attr:`localqtl.pgen.PgenReader.variant_df`, :attr:`localqtl.genotypeio.PlinkReader.variant_df`
+and :func:`localqtl.genotypeio.load_genotypes` carry ``chrom, pos, ref, alt``
+where ``alt`` is the counted (dosage) allele: pgenlib reports ALT counts, and
+for PLINK 1 files the ``2 - bed`` flip makes the dosage count ``.bim`` column 5
+(A1; ALT for ``plink2 --make-bed`` / ``plink --keep-allele-order``).  The
+``af`` column of every result is the in-sample frequency of that allele.
+Tables with only ``chrom``/``pos`` keep working;
+:func:`localqtl.genotypeio.alleles_from_variant_ids` parses GTEx-style
+``chr1_123_A_G_b38`` IDs.
+
+Frequency tables
+~~~~~~~~~~~~~~~~
+
+A :class:`localqtl.freq.FrequencyTable` is keyed by ``(chrom, pos, ref, alt)``
+on GRCh38 and holds ``af_<group>``, ``ac_<group>``, ``an_<group>`` columns.
+:meth:`~localqtl.freq.FrequencyTable.lookup` joins it onto a ``variant_df``
+allele-aware: exact matches first, then swapped ``ref``/``alt`` rows
+(re-oriented as ``1 - af``, ``an - ac``), with ``match_type``,
+``allele_flipped``, ``strand_ambiguous`` (A/T, C/G) and
+``missing_in_reference`` flags.  Only GRCh38 tables are accepted; strand flips
+are flagged, never corrected.
+
+.. code-block:: python
+
+   from localqtl import freq
+
+   # gnomAD v4.1 sites VCFs (tabix; only the regions around your variants are
+   # read; local-ancestry tract AF/AC/AN fields are detected from the header
+   # and exposed as groups ``lai_<suffix>``)
+   gnomad = freq.from_gnomad_vcf("gnomad.genomes.v4.1.sites.chr*.vcf.bgz",
+                                 variant_df=variant_df, groups=("afr", "nfe"))
+   # NCBI ALFA: one GRCh38 VCF whose sample columns are populations
+   alfa = freq.from_alfa_vcf("freq.vcf.gz", variant_df=variant_df,
+                             populations=("AFR", "AFA", "EUR"))
+   # without pysam: ``bcftools query -H`` output (recipes in localqtl.freq.bcftools)
+   table = freq.from_bcftools_query_tsv("gnomad.chr22.freq.tsv")
+   table.write("gnomad_chr22.freq.parquet")
+
+Valid gnomAD group keys are listed in :data:`localqtl.freq.GNOMAD_V4_GROUPS`
+(``afr, ami, amr, asj, eas, fin, mid, nfe, remaining, sas``) and ALFA codes in
+:data:`localqtl.freq.ALFA_POPULATION_NAMES` (``EUR, AFO, EAS, AFA, LAC, LEN,
+OAS, SAS, OTR, AFR, ASN, TOT``).  The gnomAD local-ancestry-informed release
+covers bi-allelic SNPs with MAF > 0.1 % in the African/African American
+(AFR/EUR tracts) and Admixed American (AFR/EUR/AMR tracts) groups.
+
+Ancestry-frequency QC
+~~~~~~~~~~~~~~~~~~~~~
+
+The mapping from panel ancestry labels to reference groups is **always
+explicit**; there are no defaults.
+
+.. code-block:: python
+
+   ancestry_map = {"AFR": "afr", "EUR": "nfe"}        # panel label -> table group
+
+   insample = freq.ancestry_allele_frequencies(genotype_df, variant_df, panel)
+   cmp_df = freq.compare_allele_frequencies(insample, gnomad, ancestry_map)
+   summary = freq.summarize_af_concordance(cmp_df)
+
+``compare_allele_frequencies`` adds, per ancestry, ``af_in``, ``af_ref``,
+``af_diff``, ``logodds_diff``, a two-proportion ``z`` and a ``discordant`` flag
+(``|diff| > 0.10`` or ``|z| > 4`` by default), the admixture-weighted expected
+pooled frequency, and the lookup flags.  ``summarize_af_concordance`` gives
+Pearson/Spearman *r*, mean absolute difference and the discordant, flipped and
+missing fractions per reference-MAF bin.
+
+Calibration benchmark
+~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   dosage_df = freq.annotate_with_frequency(
+       dosage_df, variant_df, gnomad, ancestry_map=ancestry_map,
+       ancestry_labels=list(panel.ancestries))                 # adds af_ref_<g>, af_ref_anc{k}
+   calib = freq.calibration_by_frequency_dosage(
+       dosage_df, ancestry_labels=list(panel.ancestries), by="af_ref_anc")
+
+   bench = freq.run_frequency_benchmark(
+       genotype_df, variant_df, phenotype_df, phenotype_pos_df, panel, gnomad,
+       ancestry_map, drop_discordant=True, n_null=1)
+   bench.write("qc/")
+
+:func:`~localqtl.freq.calibration_by_frequency` reports, per frequency bin,
+the genomic-control :math:`\lambda`, the fraction of p-values below each
+``alpha``, the median p-value and a Kolmogorov-Smirnov uniformity test; the
+dosage variant does so for each ``pval_anc{k}`` (binned by in-sample
+``af_anc{k}``, reference ``af_ref_anc{k}`` or ``ma_count_anc{k}``) and for
+``pval_joint``.  :func:`~localqtl.freq.run_frequency_benchmark` chains the
+comparison, optional exclusion of discordant / flipped / ambiguous variants,
+the dosage scan and the calibration tables, and repeats the scan on
+sample-permuted phenotypes as a null.
+
+Planned annotation modules
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:mod:`localqtl.annotate.alphagenome` (AlphaGenome Atlas molecular-effect scores
+for lead variants; non-commercial API) and :mod:`localqtl.annotate.igvf` (IGVF
+Catalog variant->gene and element->gene regulatory links) define their public
+signatures and constants now; the implementations follow in a later release.
 
 Advanced topics
 ---------------
@@ -553,13 +672,33 @@ Core mapping API
 * :func:`localqtl.cis.map_nominal`
 * :func:`localqtl.cis.map_permutations`
 * :func:`localqtl.cis.map_independent`
+* :func:`localqtl.cis.map_nominal_loci`
 * :class:`localqtl.cis.CisMapper`
 * :mod:`localqtl.cis`
+
+Allele frequencies and QC
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* :class:`localqtl.freq.FrequencyTable`
+* :func:`localqtl.freq.read_frequency_table`
+* :func:`localqtl.freq.from_gnomad_vcf`
+* :func:`localqtl.freq.from_alfa_vcf`
+* :func:`localqtl.freq.from_bcftools_query_tsv`
+* :func:`localqtl.freq.ancestry_allele_frequencies`
+* :func:`localqtl.freq.compare_allele_frequencies`
+* :func:`localqtl.freq.summarize_af_concordance`
+* :func:`localqtl.freq.annotate_with_frequency`
+* :func:`localqtl.freq.calibration_by_frequency`
+* :func:`localqtl.freq.calibration_by_frequency_dosage`
+* :func:`localqtl.freq.run_frequency_benchmark`
+* :mod:`localqtl.freq`
+* :mod:`localqtl.annotate`
 
 Genotype and phenotype I/O
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 * :class:`localqtl.genotypeio.PlinkReader`
+* :func:`localqtl.genotypeio.alleles_from_variant_ids`
 * :class:`localqtl.genotypeio.InputGeneratorCis`
 * :class:`localqtl.haplotypeio.RFMixReader`
 * :class:`localqtl.haplotypeio.InputGeneratorCisWithHaps`
