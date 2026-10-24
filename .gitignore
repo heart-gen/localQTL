@@ -3,3 +3,4 @@ tests/logs/
 tests/results/
 .coverage
 dist/
+docs/_build/

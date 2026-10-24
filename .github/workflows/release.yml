@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  test:
+    uses: ./.github/workflows/tests.yml
+
+  build-and-publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # PyPI trusted publishing
+      contents: write   # GitHub release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the version comes from the tag, so tags must be present
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install poetry
+        run: |
+          pipx install poetry
+          pipx inject poetry "poetry-dynamic-versioning[plugin]"
+      # The GitHub release body is this version's CHANGELOG section (Keep a
+      # Changelog heading `## [X.Y.Z] - date`). A tag without a changelog
+      # section fails here, before anything is built or uploaded.
+      - name: Release notes from CHANGELOG.md
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          {
+            echo "\`pip install localqtl==$v\`"
+            echo
+            awk -v v="$v" '$0 ~ "^## \\[" v "\\]" {p=1; next} /^## \[/ {p=0} p' CHANGELOG.md
+          } > "$RUNNER_TEMP/release_notes.md"
+          [ "$(wc -l < "$RUNNER_TEMP/release_notes.md")" -gt 3 ] || { echo "no CHANGELOG section for $v"; exit 1; }
+          cat "$RUNNER_TEMP/release_notes.md"
+      - name: Build
+        id: build
+        run: |
+          rm -rf dist
+          poetry build
+      - name: Check built version matches the tag
+        run: |
+          whl=$(ls dist/*.whl)
+          [[ "$whl" == dist/localqtl-"${GITHUB_REF_NAME#v}"-* ]] || { echo "wheel $whl does not match tag ${GITHUB_REF_NAME}"; exit 1; }
+      # Trusted publishing, so there is no token: PyPI must list a publisher for
+      # heart-gen/localQTL, workflow release.yml, environment pypi.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # a re-run of a tag already uploaded by hand must not fail on the files being there
+          skip-existing: true
+      # The release names the tag and carries the artifacts even if the upload
+      # failed; `always()` would also run after a failed build, hence the guard.
+      - name: GitHub release
+        if: always() && steps.build.outcome == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: ${{ runner.temp }}/release_notes.md
+          generate_release_notes: true
+          # the PyPI action writes *.publish.attestation files into dist/; attach only the packages
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
