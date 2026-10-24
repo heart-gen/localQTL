@@ -23,6 +23,7 @@ from ._buffer import (
     ensure_capacity, write_row,
     buffers_to_dataframe
 )
+from .nominal import _paired_covariate_context
 from .common import (
     residualize_matrix_with_covariates,
     validate_ancestry_model,
@@ -75,9 +76,12 @@ def _run_permutation_core(
         ancestry_model: str | None = None,
         n_ancestries: int | None = None,
         interaction_covariate_t: torch.Tensor | None = None,
+        paired_ctx: dict | None = None,
 ) -> pd.DataFrame:
     """
     One top association per phenotype with empirical permutation p-value (no grouping).
+    ``paired_ctx`` maps phenotype IDs to ``(Residualizer, residualized y)`` for
+    phenotype-specific covariates (see ``map_nominal``).
     Compatible with InputGeneratorCis and InputGeneratorCisWithHaps (ungrouped only).
     """
     expected_columns = [
@@ -145,6 +149,11 @@ def _run_permutation_core(
             # Skip groups in this core (keep parity with tensorQTL's per-phenotype map_cis)
             raise ValueError("Group mode not supported in _run_permutation_core.")
 
+        # Phenotype-specific (paired) covariates: swap in that phenotype's residualizer
+        rez_b = rez
+        if paired_ctx and pid in paired_ctx:
+            rez_b, p = paired_ctx[pid]
+
         # Tensors
         y_t = to_device_tensor(p, device, dtype=torch.float32)
         G_t = to_device_tensor(G_block, device, dtype=torch.float32)
@@ -189,13 +198,13 @@ def _run_permutation_core(
         covar_interaction = interaction_covariate_t is not None
         if interaction_mode:
             y_resid_t, G_resid, H_resid, I_resid = residualize_batch_interaction(
-                y_t, G_t, H_t, rez, center=True, group=False
+                y_t, G_t, H_t, rez_b, center=True, group=False
             )
         else:
-            y_resid_t, G_resid, H_resid = residualize_batch(y_t, G_t, H_t, rez, center=True)
+            y_resid_t, G_resid, H_resid = residualize_batch(y_t, G_t, H_t, rez_b, center=True)
 
         # Compute effective covariate rank for DoF
-        k_eff = rez.k_eff if rez is not None else 1
+        k_eff = rez_b.k_eff if rez_b is not None else 1
 
         if interaction_mode:
             if H_resid is None:
@@ -283,8 +292,10 @@ def _run_permutation_core(
             c_t = interaction_covariate_t
             if c_t.device != G_resid.device:
                 c_t = c_t.to(G_resid.device)
-            I_t = project_interaction(G_resid * c_t, rez)
-            c_rep = c_t.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
+            # g:c from the raw genotypes and c itself are projected like g (Frisch–Waugh)
+            I_t = project_interaction(G_t * c_t, rez_b)
+            c_res = project_interaction(c_t.unsqueeze(0), rez_b)[0]
+            c_rep = c_res.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
             if H_resid is None:
                 H_cov = torch.cat([G_resid.unsqueeze(-1), c_rep], dim=2)
             else:
@@ -664,8 +675,9 @@ def _run_permutation_core_group(
                 c_t = interaction_covariate_t
                 if c_t.device != G_resid.device:
                     c_t = c_t.to(G_resid.device)
-                I_t = project_interaction(G_resid * c_t, rez)
-                c_rep = c_t.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
+                I_t = project_interaction(G_t * c_t, rez)
+                c_res = project_interaction(c_t.unsqueeze(0), rez)[0]
+                c_rep = c_res.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
                 if H_resid is None:
                     H_cov = torch.cat([G_resid.unsqueeze(-1), c_rep], dim=2)
                 else:
@@ -823,6 +835,7 @@ def map_permutations(
         perm_indices_mode: str = "generator", mixed_precision: str | None = None,
         ancestry_model: str = "main",
         interaction_covariate: Optional[object] = None,
+        paired_covariate_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Empirical cis-QTL mapping (one top variant per phenotype) with permutations.
@@ -833,6 +846,9 @@ def map_permutations(
     preload_haplotypes : bool, default True
         When haplotypes are provided, pre-load them into a contiguous torch.Tensor
         on the requested device to avoid per-batch host<->device transfers.
+    paired_covariate_df : DataFrame (phenotypes x samples), optional
+        One phenotype-specific covariate added to the shared covariates for the
+        phenotypes it lists (tensorQTL ``paired_covariate_df``); ungrouped only.
     """
     device = device if device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
     torch_device = torch.device(device)
@@ -865,6 +881,10 @@ def map_permutations(
 
     if nperm is None or nperm <= 0:
         raise ValueError("nperm must be a positive integer for map_permutations.")
+    if paired_covariate_df is not None and group_s is not None:
+        raise ValueError("paired_covariate_df is not supported with phenotype groups.")
+    if paired_covariate_df is not None:
+        logger.write("  * including phenotype-specific covariate")
     validate_ancestry_model(
         ancestry_model, haplotypes=haplotypes, interaction_covariate=interaction_covariate,
         allow_dosage=False, caller="map_permutations",
@@ -901,6 +921,8 @@ def map_permutations(
         Y_resid, rez = residualize_matrix_with_covariates(Y, covariates_use,
                                                           device, tensorqtl_flavor)
 
+    paired_ctx = _paired_covariate_context(paired_covariate_df, covariates_use, ig.phenotype_df.index,
+                                           phenotype_df, device, tensorqtl_flavor)
     ig.phenotype_df = pd.DataFrame(Y_resid.cpu().numpy(), index=ig.phenotype_df.index,
                                    columns=ig.phenotype_df.columns)
 
@@ -949,6 +971,7 @@ def map_permutations(
                         ancestry_model=ancestry_model,
                         n_ancestries=n_anc,
                         interaction_covariate_t=interaction_cov_t,
+                        paired_ctx=paired_ctx,
                     )
             results.append(chrom_df)
             if logger.verbose:

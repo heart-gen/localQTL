@@ -5,6 +5,7 @@ https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/genotypeio.py
 import numpy as np
 import pandas as pd
 import os, gzip, sys, re
+import subprocess
 import threading, queue, bisect
 from pandas_plink import read_plink
 
@@ -12,8 +13,8 @@ sys.path.insert(1, os.path.dirname(__file__))
 from .phenotypeio import read_phenotype_bed
 
 try:
-    import pgen
-except ImportError as e:
+    from . import pgen
+except ImportError:
     pgen = None
 
 __all__ = [
@@ -26,7 +27,21 @@ __all__ = [
     "alleles_from_variant_ids",
     "get_cis_ranges",
     "InputGeneratorCis",
+    "get_sample_ids",
+    "parse_genotypes",
+    "get_vcf_region",
+    "get_vcf_variants",
 ]
+
+
+def __getattr__(name):
+    # tensorQTL exposes the trans generator from genotypeio; it lives in localqtl.trans
+    # (which imports this module), so resolve it lazily.
+    if name == "GenotypeGeneratorTrans":
+        from .trans import GenotypeGeneratorTrans
+        return GenotypeGeneratorTrans
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 class BackgroundGenerator(threading.Thread):
     def __init__(self, generator, max_prefetch=10):
@@ -245,6 +260,163 @@ def alleles_from_variant_ids(variant_df: pd.DataFrame, pattern=_VARIANT_ID_PATTE
     if "pos" not in out.columns:
         out["pos"] = pd.to_numeric(parts["pos"], errors="coerce").to_numpy()
     return out
+
+
+# ---------------------------------------------------------------------------
+# VCF helpers (tabix-indexed VCFs; pysam when installed, else the tabix binary)
+# ---------------------------------------------------------------------------
+_GT_CODES = {
+    '0/0': 0.0, '0|0': 0.0, '0/1': 1.0, '1/0': 1.0, '0|1': 1.0, '1|0': 1.0,
+    '1/1': 2.0, '1|1': 2.0, './.': np.nan, '.|.': np.nan, '.': np.nan,
+    '0': 0.0, '1': 1.0,
+}
+
+
+def _vcf_open_text(vcfpath):
+    return gzip.open(vcfpath, 'rt') if str(vcfpath).endswith(('.gz', '.bgz')) else open(vcfpath, 'rt')
+
+
+def get_sample_ids(vcfpath):
+    """Sample IDs from the ``#CHROM`` header line of a VCF."""
+    with _vcf_open_text(vcfpath) as f:
+        for line in f:
+            if line.startswith('#CHROM'):
+                return line.rstrip('\n').split('\t')[9:]
+            if not line.startswith('#'):
+                break
+    raise ValueError(f"No #CHROM header line found in {vcfpath}")
+
+
+def parse_genotypes(x, field='GT'):
+    """Convert a list of per-sample ``GT`` strings (or ``DS`` dosages) to float32 (missing -> NaN)."""
+    if field == 'GT':
+        out = np.empty(len(x), dtype=np.float32)
+        for k, v in enumerate(x):
+            if v in _GT_CODES:
+                out[k] = _GT_CODES[v]
+            else:
+                alleles = [a for a in re.split(r'[/|]', v) if a != '']
+                if not alleles or any(a == '.' for a in alleles):
+                    out[k] = np.nan
+                else:
+                    out[k] = float(sum(int(a) != 0 for a in alleles))
+        return out
+    if field == 'DS':
+        return np.array([np.nan if v in ('.', '') else float(v) for v in x], dtype=np.float32)
+    raise ValueError(f"Unsupported FORMAT field {field!r} (use 'GT' or 'DS')")
+
+
+def _get_field_ix(line, field):
+    fmt = line[8].split(':')
+    if field not in fmt:
+        raise ValueError(f"FORMAT field {field!r} not found in {':'.join(fmt)}")
+    return fmt.index(field)
+
+
+def _fetch_vcf_records(vcfpath, regions):
+    """Records (split lines) overlapping each ``'chr:start-end'`` / ``'chr'`` region string."""
+    out = []
+    try:
+        import pysam
+        tb = pysam.TabixFile(str(vcfpath))
+        contigs = set(tb.contigs)
+        for region in regions:
+            chrom, _, span = str(region).partition(':')
+            if chrom not in contigs:
+                alt = chrom[3:] if chrom.startswith('chr') else f'chr{chrom}'
+                if alt in contigs:
+                    chrom = alt
+                else:
+                    continue
+            if span:
+                start, _, end = span.partition('-')
+                end = end or start
+                it = tb.fetch(chrom, max(int(start) - 1, 0), int(end))
+            else:
+                it = tb.fetch(chrom)
+            out.extend(line.split('\t') for line in it)
+        tb.close()
+        return out
+    except ImportError:
+        pass
+    for region in regions:
+        s = subprocess.check_output(['tabix', str(vcfpath), str(region)]).decode().strip()
+        if s:
+            out.extend(line.split('\t') for line in s.split('\n'))
+    return out
+
+
+def get_vcf_region(region_str, vcfpath, field='GT', sample_ids=None, select_samples=None, impute_missing=True):
+    """
+    Load a VCF region (``'chr:start-end'`` or ``'chr'``) as ``(DataFrame
+    variants x samples, pd.Series variant -> pos)``; requires a tabix index
+    (pysam, or the ``tabix`` binary).  Missing calls are mean-imputed per
+    variant when ``impute_missing``.
+    """
+    records = _fetch_vcf_records(vcfpath, [region_str])
+    if sample_ids is None:
+        sample_ids = get_sample_ids(vcfpath)
+    if not records:
+        return pd.DataFrame(columns=sample_ids, dtype=np.float32), pd.Series(dtype=np.int64)
+    variant_ids = [r[2] for r in records]
+    pos_s = pd.Series([int(r[1]) for r in records], index=variant_ids)
+    ix = _get_field_ix(records[0], field)
+    g = np.array([parse_genotypes([i.split(':')[ix] for i in r[9:]], field=field) for r in records])
+    df = pd.DataFrame(g, index=variant_ids, columns=sample_ids)
+    if select_samples is not None:
+        df = df[list(select_samples)]
+    if impute_missing:
+        n = 0
+        vals = df.to_numpy()
+        for v in vals:
+            m = np.isnan(v)
+            if m.any():
+                v[m] = np.mean(v[~m]) if (~m).any() else 0.0
+                n += 1
+        df = pd.DataFrame(vals, index=df.index, columns=df.columns)
+        if n > 0:
+            print(f'    imputed at least 1 sample in {n} sites')
+    return df, pos_s
+
+
+def get_vcf_variants(variant_ids, vcfpath, field='GT', sample_ids=None):
+    """
+    Load a set of variants (IDs like ``chr1_123_A_G_b38`` / ``1:123:A:G``, or
+    any IDs present in the VCF ``ID`` column when ``variant_ids`` is a mapping
+    ``id -> 'chr:pos'``) as a DataFrame (variants x samples).  Variants with
+    missing calls are dropped (tensorQTL behaviour).
+    """
+    if isinstance(variant_ids, dict):
+        id_to_region = {k: str(v) for k, v in variant_ids.items()}
+    else:
+        id_to_region = {}
+        for vid in variant_ids:
+            m = _VARIANT_ID_PATTERN.match(str(vid))
+            if m is None:
+                raise ValueError(f"Cannot parse chromosome/position from variant ID {vid!r}; "
+                                 "pass a dict variant_id -> 'chr:pos' instead.")
+            chrom = m.group('chrom')
+            if str(vid).lower().startswith('chr'):
+                chrom = f"chr{chrom}"
+            id_to_region[vid] = f"{chrom}:{m.group('pos')}-{m.group('pos')}"
+    regions = sorted(set(id_to_region.values()), key=lambda r: (r.split(':')[0], int(r.split(':')[1].split('-')[0])))
+    records = _fetch_vcf_records(vcfpath, regions)
+    if sample_ids is None:
+        sample_ids = get_sample_ids(vcfpath)
+    wanted = set(id_to_region)
+    records = [r for r in records if r[2] in wanted]
+    if not records:
+        return pd.DataFrame(columns=sample_ids, dtype=np.float32)
+    ix = _get_field_ix(records[0], field)
+    rows, ids = [], []
+    for r in records:
+        g = parse_genotypes([i.split(':')[ix] for i in r[9:]], field=field)
+        if field == 'GT' and np.isnan(g).any():  # tensorQTL drops variants with missing calls
+            continue
+        rows.append(g); ids.append(r[2])
+    if not rows:
+        return pd.DataFrame(np.empty((0, len(sample_ids)), dtype=np.float32), columns=sample_ids)
+    return pd.DataFrame(np.array(rows, dtype=np.float32), index=ids, columns=sample_ids)
 
 
 def load_genotypes(genotype_path, select_samples=None, dosages=False):

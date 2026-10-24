@@ -17,6 +17,8 @@ __all__ = [
     "read_pvar",
     "read_psam",
     "PgenReader",
+    "get_chunk_size",
+    "generate_paired_chunks",
 ]
 
 
@@ -107,8 +109,8 @@ class PgenReader(object):
     def set_samples(self, sample_ids=None):
         """Restrict to a subset of samples (order preserved)."""
         sample_idxs = [self.sample_ids.index(i) for i in sample_ids]
-        self.sample_ids = sample_ids
-        self.sample_idxs = sample_idxs
+        self.sample_ids = list(sample_ids)
+        self.sample_idxs = np.array(sample_idxs, dtype=np.uint32)
 
     def get_range(self, chrom, start=None, end=None):
         """
@@ -210,3 +212,70 @@ class PgenReader(object):
             return torch.as_tensor(alleles, device=self.device)
         return pd.DataFrame(alleles, index=self.sample_ids,
                             columns=["allele1", "allele2"])
+
+
+def get_chunk_size(memory_gb, samples):
+    """Number of variants (int8 genotypes) that fit in ``memory_gb`` for ``samples`` samples."""
+    return int(memory_gb * 1024 ** 3 // int(samples))
+
+
+def generate_paired_chunks(pgr, phenotype_df, phenotype_pos_df, chunk_size, window=1_000_000,
+                           dosages=False, verbose=True):
+    """
+    Generate paired genotype-phenotype chunks for data sets whose genotypes do
+    not fit in memory (tensorQTL ``generate_paired_chunks``).
+
+    ``chunk_size`` is the maximum number of variants loaded at once (at least
+    the largest cis-window), or ``'chr'`` for one chunk per chromosome.
+    Phenotypes must be sorted by chromosome and position.  Yields
+    ``(genotype_df, variant_df, phenotype_df_chunk, phenotype_pos_df_chunk, chunk_index)``;
+    ``variant_df`` carries ``chrom, pos, ref, alt``.
+    """
+    from .genotypeio import get_cis_ranges
+
+    variant_df = pgr.variant_df[['chrom', 'pos', 'ref', 'alt']]
+    keep = phenotype_pos_df['chr'].astype(str).isin([str(c) for c in pgr.variant_dfs])
+    if (~keep).any():
+        print(f"    ** dropping {int((~keep).sum())} phenotypes on chrs. without genotypes")
+    phenotype_pos_df = phenotype_pos_df.loc[keep]
+    phenotype_df = phenotype_df.loc[phenotype_pos_df.index]
+    cis_ranges, drop_ids = get_cis_ranges(phenotype_pos_df, pgr.variant_dfs, window, verbose=verbose)
+    if drop_ids:
+        print(f"    ** dropping {len(drop_ids)} phenotypes without variants in cis-window")
+        phenotype_pos_df = phenotype_pos_df.drop(drop_ids)
+        phenotype_df = phenotype_df.drop(drop_ids)
+    range_df = pd.DataFrame(cis_ranges, index=['start', 'end']).T.loc[phenotype_pos_df.index]
+    range_df = range_df.join(phenotype_pos_df['chr'])
+    if not (np.diff(range_df['start'].to_numpy()) >= 0).all():
+        raise ValueError("Phenotypes must be sorted by chromosome and position for chunked processing.")
+
+    if chunk_size == 'chr':
+        chrlen_s = range_df['chr'].value_counts(sort=False).loc[pd.unique(range_df['chr'])]
+        start_ixs = [0] + chrlen_s.cumsum().tolist()
+    else:
+        chunk_size = int(chunk_size)
+        max_cis_var = int((range_df['end'] - range_df['start'] + 1).max())
+        if max_cis_var > chunk_size:
+            raise ValueError(f"Max. chunk size must be at least largest cis-window ({max_cis_var})")
+        start_ixs = [0]
+        while start_ixs[-1] < range_df.shape[0]:
+            end_ix = bisect.bisect_left(range_df['end'].values, range_df['start'].values[start_ixs[-1]] + chunk_size)
+            if end_ix <= start_ixs[-1]:
+                end_ix = start_ixs[-1] + 1
+            start_ixs.append(end_ix)
+        start_ixs[-1] = range_df.shape[0]
+
+    nchunks = len(start_ixs) - 1
+    for ci in range(nchunks):
+        if verbose:
+            print(f"Processing genotype-phenotype chunk {ci + 1}/{nchunks}")
+        ix = slice(start_ixs[ci], start_ixs[ci + 1])
+        chunk_df = range_df.iloc[ix]
+        v0, v1 = int(chunk_df['start'].values[0]), int(chunk_df['end'].values[-1])
+        arr = pgr.read_range(v0, v1, impute_mean=False, dosages=dosages,
+                             dtype=np.float32 if dosages else np.int8)
+        if torch.is_tensor(arr):
+            arr = arr.detach().cpu().numpy()
+        var_df = variant_df.iloc[v0:v1 + 1]
+        gt_df = pd.DataFrame(arr, index=var_df.index, columns=pgr.sample_ids)
+        yield gt_df, var_df, phenotype_df.iloc[ix], phenotype_pos_df.iloc[ix], ci

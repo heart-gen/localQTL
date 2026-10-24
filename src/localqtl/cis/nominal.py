@@ -9,8 +9,10 @@ from ..utils import SimpleLogger
 from ..stats import nominal_pvals_tensorqtl, get_t_pval, get_f_pval
 from ..iosinks import AsyncParquetSink
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
-from ..preproc import impute_mean_and_filter, allele_stats, filter_by_maf, ancestry_allele_stats
+from ..preproc import (impute_mean_and_filter, allele_stats, filter_by_maf, ancestry_allele_stats,
+                       filter_maf_interaction, interaction_half_mask)
 from ..regression_kernels import (
+    Residualizer,
     run_batch_regression,
     run_batch_interaction_regression,
     run_batch_dosage_regression,
@@ -66,20 +68,12 @@ def _dosage_columns(n_ancestries: int) -> list[str]:
     return cols
 
 
-def _covariate_interaction_columns() -> list[str]:
-    """Canonical columns for the y ~ g + i + g:i interaction model."""
-    return [
-        "b_g", "se_g", "tstat_g", "pval_g",
-        "b_i", "se_i", "tstat_i", "pval_i",
-        "b_gi", "se_gi", "tstat_gi", "pval_gi",
-    ]
-
-
 def _nominal_parquet_schema(
         include_perm: bool,
         ancestry_model: str | None = None,
         n_ancestries: int | None = None,
         covariate_interaction: bool = False,
+        interaction_names: list[str] | None = None,
 ) -> pa.Schema:
     fields = [
         pa.field("phenotype_id", pa.string()),
@@ -101,7 +95,7 @@ def _nominal_parquet_schema(
         for col in _dosage_columns(int(n_ancestries)):
             fields.append(pa.field(col, pa.float32()))
     if covariate_interaction:
-        for col in _covariate_interaction_columns():
+        for col in _covariate_interaction_columns(interaction_names):
             fields.append(pa.field(col, pa.float32()))
     if include_perm:
         fields.append(pa.field("perm_max_r2", pa.float32()))
@@ -173,6 +167,36 @@ def _buffers_to_arrow(buffers: dict[str, np.ndarray], schema: pa.Schema, n_rows:
     return pa.Table.from_arrays(arrays, schema=schema)
 
 
+def _covariate_interaction_columns(names: list[str] | None = None) -> list[str]:
+    """
+    Columns of the ``y ~ g + i + g:i`` covariate-interaction model.  With one
+    interaction term the canonical ``b_g/se_g/tstat_g/pval_g``, ``b_i...``,
+    ``b_gi...`` names are used; with several terms the variable names are
+    substituted (tensorQTL convention): ``b_<name>``, ``se_<name>``,
+    ``tstat_<name>``, ``pval_<name>`` for the main effects and ``b_g-<name>``
+    ... for the genotype x term interactions.
+    """
+    if names is None or len(names) <= 1:
+        return [
+            "b_g", "se_g", "tstat_g", "pval_g",
+            "b_i", "se_i", "tstat_i", "pval_i",
+            "b_gi", "se_gi", "tstat_gi", "pval_gi",
+        ]
+    cols = ["b_g", "se_g", "tstat_g", "pval_g"]
+    for v in names:
+        cols.extend([f"b_{v}", f"se_{v}", f"tstat_{v}", f"pval_{v}"])
+    for v in names:
+        cols.extend([f"b_g-{v}", f"se_g-{v}", f"tstat_g-{v}", f"pval_g-{v}"])
+    return cols
+
+
+def _interaction_term_columns(names: list[str] | None, k: int) -> tuple[str, str]:
+    """Suffixes of the main-effect and interaction columns of term ``k`` (``("i", "gi")`` or names)."""
+    if names is None or len(names) <= 1:
+        return "i", "gi"
+    return str(names[k]), f"g-{names[k]}"
+
+
 def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float = 0.0,
                       chrom: str | None = None, sink: "AsyncParquetSink | None" = None,
                       target_rows: int | None = None, logger: SimpleLogger | None = None,
@@ -180,11 +204,23 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                       ancestry_model: str | None = None,
                       n_ancestries: int | None = None,
                       interaction_covariate_t: torch.Tensor | None = None,
-                      min_ancestry_ac: float = 0.0):
+                      min_ancestry_ac: float = 0.0,
+                      interaction_names: list[str] | None = None,
+                      interaction_mask_t: torch.Tensor | None = None,
+                      maf_threshold_interaction: float = 0.0,
+                      paired_ctx: dict | None = None,
+                      top_rows: list | None = None,
+                      run_eigenmt: bool = False,
+                      collect_pairs: bool = True):
     """
     Shared inner loop for nominal (and optional permutation) mapping.
     Handles both InputGeneratorCis (no haps) and InputGeneratorCisWithHaps (haps).
     If sink is provided, stream out rows as Parquet and return None.
+
+    ``interaction_covariate_t`` is ``(n,)`` or ``(n, ni)``; ``paired_ctx`` maps
+    phenotype IDs to ``(Residualizer, residualized y)`` for phenotype-specific
+    covariates; ``top_rows`` (a list) collects the top interaction association
+    per phenotype / group; ``collect_pairs=False`` skips the pair-level output.
     """
     # Variant metadata
     idx_to_id = variant_df.index.to_numpy()
@@ -192,6 +228,9 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
 
     include_perm = nperm is not None and nperm > 0
     covar_interaction = interaction_covariate_t is not None
+    ni = 0
+    if covar_interaction:
+        ni = 1 if interaction_covariate_t.dim() == 1 else int(interaction_covariate_t.shape[1])
     expected_columns = [
         "phenotype_id", "variant_id", "start_distance",
         "end_distance", "slope", "slope_se", "tstat", "pval_nominal",
@@ -207,19 +246,20 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
         expected_columns.extend(dosage_columns)
     covar_int_columns: list[str] = []
     if covar_interaction:
-        covar_int_columns = _covariate_interaction_columns()
+        covar_int_columns = _covariate_interaction_columns(interaction_names)
         expected_columns.extend(covar_int_columns)
     if include_perm:
         expected_columns.append("perm_max_r2")
 
-    if target_rows is None:
+    if target_rows is None and collect_pairs:
         if chrom is None:
             target_rows = _count_cis_pairs(ig, chrom=None)
         else:
             target_rows = _count_cis_pairs(ig, chrom)
 
     all_extra_cols = interaction_columns + dosage_columns + covar_int_columns
-    buffers = _allocate_buffers(expected_columns, include_perm, target_rows, all_extra_cols)
+    buffers = (_allocate_buffers(expected_columns, include_perm, target_rows, all_extra_cols)
+               if collect_pairs else None)
     cursor = processed = 0
     variant_cache: dict[bytes, tuple[np.ndarray, np.ndarray]] = {}
 
@@ -228,6 +268,8 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
         total_phenotypes = ig.phenotype_df.shape[0]
     if logger is None:
         logger = SimpleLogger(verbose=True, timestamps=True)
+    if run_eigenmt:
+        from ..eigenmt import compute_tests
 
     progress_interval = max(1, total_phenotypes // 10) if total_phenotypes else 0
     chrom_label = f"{chrom}" if chrom is not None else "all chromosomes"
@@ -244,12 +286,13 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 P_list, id_list = [p], [pid]
             else:
                 raise ValueError(f"Unexpected ungrouped batch length: len={len(batch)}")
+            group_id = None
         else: # Grouped
             if len(batch) == 5:
-                P, G_block, v_idx, ids, _group_id = batch
+                P, G_block, v_idx, ids, group_id = batch
                 H_block = None
             elif len(batch) == 6:
-                P, G_block, v_idx, H_block, ids, _group_id = batch
+                P, G_block, v_idx, H_block, ids, group_id = batch
             else:
                 raise ValueError(f"Unexpected grouped batch shape: len={len(batch)}")
             if isinstance(P, (list, tuple)):
@@ -258,6 +301,12 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 P = np.asarray(P)
                 P_list = [P[i, :] for i in range(P.shape[0])] if P.ndim == 2 else [P]
             id_list = list(ids)
+
+        # Phenotype-specific (paired) covariates: swap in that phenotype's residualizer
+        rez_b = rez
+        if paired_ctx and not group_mode and id_list[0] in paired_ctx:
+            rez_b, y_paired = paired_ctx[id_list[0]]
+            P_list = [y_paired]
 
         # Tensors
         G_t = torch.tensor(G_block, dtype=torch.float32, device=device)
@@ -299,6 +348,15 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
             if H_t is not None:
                 H_t = H_t[keep_maf]
 
+        # Interaction MAF filter (both halves of the interaction variable)
+        if covar_interaction and (interaction_mask_t is not None or maf_threshold_interaction > 0):
+            G_t, keep_int = filter_maf_interaction(G_t, interaction_mask_t, maf_threshold_interaction)
+            if G_t.shape[0] == 0:
+                continue
+            v_idx = v_idx[keep_int.detach().cpu().numpy()]
+            if H_t is not None:
+                H_t = H_t[keep_int]
+
         # Sanity checks to catch any future drift
         assert G_t.shape[0] == v_idx.shape[0], "G_t and v_idx out of sync"
         if H_t is not None:
@@ -306,11 +364,11 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
 
         # Allele statistics on imputed genotypes
         af_t, ma_samples_t, ma_count_t = allele_stats(G_t, ploidy=2)
- 
+        tests_emt = compute_tests(G_t) if (run_eigenmt and covar_interaction and top_rows is not None) else None
+
         # Residualize in one call; returns y as list in group mode
         interaction_mode = ancestry_model == "interaction" and H_t is not None
         dosage_mode = ancestry_model == "dosage" and H_t is not None
-        covar_interaction = interaction_covariate_t is not None
         # Per-ancestry allele statistics from the raw (imputed, un-residualized) block
         anc_stats_np: dict[str, np.ndarray] | None = None
         if dosage_mode:
@@ -318,18 +376,18 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                             for k, v in ancestry_allele_stats(G_t, H_t).items()}
         if interaction_mode:
             y_resid, G_resid, H_resid, I_resid = residualize_batch_interaction(
-                P_list if group_mode else P_list[0], G_t, H_t, rez, center=True,
+                P_list if group_mode else P_list[0], G_t, H_t, rez_b, center=True,
                 group=group_mode
             )
         elif dosage_mode:
             y_resid, D_resid, L_resid = residualize_batch_dosage(
-                P_list if group_mode else P_list[0], G_t, H_t, rez, center=True,
+                P_list if group_mode else P_list[0], G_t, H_t, rez_b, center=True,
                 group=group_mode
             )
             G_resid, H_resid = G_t, None
         else:
             y_resid, G_resid, H_resid = residualize_batch(
-                P_list if group_mode else P_list[0], G_t, H_t, rez, center=True,
+                P_list if group_mode else P_list[0], G_t, H_t, rez_b, center=True,
                 group=group_mode
             )
         y_iter = list(zip(y_resid, id_list)) if group_mode else [(y_resid, id_list[0])]
@@ -342,7 +400,20 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
             var_ids = idx_to_id[v_idx]
             var_pos = pos_arr[v_idx].astype(np.int32, copy=False)
             variant_cache[cache_key] = (var_ids, var_pos)
-        k_eff = rez.k_eff if rez is not None else 1
+        k_eff = rez_b.k_eff if rez_b is not None else 1
+
+        # Covariate-interaction design shared by the phenotypes of this window
+        if covar_interaction:
+            c_t = interaction_covariate_t
+            if c_t.device != G_resid.device:
+                c_t = c_t.to(G_resid.device)
+            c2 = c_t.unsqueeze(-1) if c_t.dim() == 1 else c_t                   # (n, ni)
+            # i and g:i (built from the raw genotypes) enter the design residualized
+            # like g (Frisch–Waugh), as in tensorQTL
+            i_res_t = project_interaction(c2.T.contiguous(), rez_b).T.contiguous()   # (n, ni)
+            gi_t = project_interaction(G_t.unsqueeze(-1) * c2.unsqueeze(0), rez_b)       # (m, n, ni)
+
+        best_group_top = None  # grouped interaction: best over phenotypes in the group
 
         # Per-phenotype regressions in this window
         for y_t, pid in y_iter:
@@ -413,12 +484,6 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 n = int(y_t.shape[0])
                 dof = max(n - int(k_eff) - (1 + 2 * pH), 1)
 
-                # Genotype main effect for standard columns
-                g_beta = betas_all[:, 0].detach().cpu().numpy()
-                g_se = ses_all[:, 0].detach().cpu().numpy()
-                g_tstat = tstats_all[:, 0].detach().cpu().numpy()
-                g_pval = get_t_pval(g_tstat, dof)
-
                 # Per-ancestry G×H interaction effects
                 gxh_slope = np.full((G_resid.shape[0], n_anc), np.nan, dtype=np.float32)
                 gxh_se = np.full_like(gxh_slope, np.nan)
@@ -443,23 +508,22 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 pvals = gxh_p[row_ix, best_k]
                 perm_max_r2 = np.nan if include_perm else None
             elif covar_interaction:
-                c_t = interaction_covariate_t
-                if c_t.device != G_resid.device:
-                    c_t = c_t.to(G_resid.device)
-
-                # Joint model: y ~ g + c + g*c (+ local-ancestry main effects H);
-                # the g*c column is residualized like g (Frisch–Waugh).
-                gi_t = project_interaction(G_resid * c_t, rez)
+                # Joint model: y ~ g + i_1..i_ni + g*i_1..g*i_ni (+ local-ancestry main effects H)
                 cov_int_result = run_batch_interaction_regression(
-                    y=y_t, G=G_resid, interaction=c_t, k_eff=k_eff, device=device,
+                    y=y_t, G=G_resid, interaction=i_res_t, k_eff=k_eff, device=device,
                     H=H_resid, gi=gi_t,
                 )
                 int_dof = cov_int_result["dof"]
 
-                # Standard columns: G×C interaction effect (backward compat)
-                slope = cov_int_result["b_gi"].detach().cpu().numpy()
-                slope_se = cov_int_result["se_gi"].detach().cpu().numpy()
-                tstat = cov_int_result["tstat_gi"].detach().cpu().numpy()
+                # Standard columns: the strongest G×I interaction term per variant
+                b_gi = cov_int_result["b_gi"].detach().cpu().numpy().reshape(G_resid.shape[0], ni)
+                se_gi = cov_int_result["se_gi"].detach().cpu().numpy().reshape(G_resid.shape[0], ni)
+                t_gi = cov_int_result["tstat_gi"].detach().cpu().numpy().reshape(G_resid.shape[0], ni)
+                best_k = np.nanargmax(np.where(np.isnan(t_gi), -1.0, np.abs(t_gi)), axis=1)
+                row_ix = np.arange(G_resid.shape[0])
+                slope = b_gi[row_ix, best_k]
+                slope_se = se_gi[row_ix, best_k]
+                tstat = t_gi[row_ix, best_k]
                 pvals = get_t_pval(tstat, int_dof)
                 perm_max_r2 = None
             else:
@@ -499,52 +563,93 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                 floats = floats_t.detach().to("cpu", non_blocking=True).numpy()
                 ints   = ints_t.detach().to("cpu", non_blocking=True).numpy()
 
-            row_slice = slice(cursor, cursor + n_variants)
-
-            buffers["phenotype_id"][row_slice] = str(pid)
-            buffers["variant_id"][row_slice] = var_ids
-            np.subtract(var_pos, ig.phenotype_start[pid],
-                        out=buffers["start_distance"][row_slice])
-            np.subtract(var_pos, ig.phenotype_end[pid],
-                        out=buffers["end_distance"][row_slice])
-
             beta_np, se_np, tstat_np, pval_np, af_np = (floats[:, i] for i in range(5))
             ma_samples_np, ma_count_np = ints[:, 0], ints[:, 1]
 
-            buffers["slope"][row_slice] = beta_np
-            buffers["slope_se"][row_slice] = se_np
-            buffers["tstat"][row_slice] = tstat_np
-            buffers["pval_nominal"][row_slice] = pval_np
-            buffers["af"][row_slice] = af_np
-            buffers["ma_samples"][row_slice] = ma_samples_np
-            buffers["ma_count"][row_slice] = ma_count_np
-            if interaction_mode and interaction_columns:
-                for anc_idx in range(len(interaction_columns) // 4):
-                    base = anc_idx * 4
-                    buffers[interaction_columns[base + 0]][row_slice] = gxh_slope[:, anc_idx]
-                    buffers[interaction_columns[base + 1]][row_slice] = gxh_se[:, anc_idx]
-                    buffers[interaction_columns[base + 2]][row_slice] = gxh_t[:, anc_idx]
-                    buffers[interaction_columns[base + 3]][row_slice] = gxh_p[:, anc_idx]
-            if dosage_mode and dosage_vals is not None:
-                for col in dosage_columns:
-                    buffers[col][row_slice] = dosage_vals[col]
+            # Covariate-interaction columns (per term) and the top association
+            cov_int_cols: dict[str, np.ndarray] | None = None
             if covar_interaction and cov_int_result is not None:
                 int_dof = cov_int_result["dof"]
-                for prefix in ("g", "i", "gi"):
-                    b_np = cov_int_result[f"b_{prefix}"].detach().cpu().numpy()
-                    se_np = cov_int_result[f"se_{prefix}"].detach().cpu().numpy()
-                    t_np = cov_int_result[f"tstat_{prefix}"].detach().cpu().numpy()
-                    p_np = get_t_pval(t_np, int_dof)
-                    buffers[f"b_{prefix}"][row_slice] = b_np
-                    buffers[f"se_{prefix}"][row_slice] = se_np
-                    buffers[f"tstat_{prefix}"][row_slice] = t_np
-                    buffers[f"pval_{prefix}"][row_slice] = p_np
+                cov_int_cols = {}
+                for pre in ("g",):
+                    b_ = cov_int_result["b_g"].detach().cpu().numpy()
+                    s_ = cov_int_result["se_g"].detach().cpu().numpy()
+                    t_ = cov_int_result["tstat_g"].detach().cpu().numpy()
+                    cov_int_cols.update({"b_g": b_, "se_g": s_, "tstat_g": t_, "pval_g": get_t_pval(t_, int_dof)})
+                b_i = cov_int_result["b_i"].detach().cpu().numpy().reshape(n_variants, ni)
+                se_i = cov_int_result["se_i"].detach().cpu().numpy().reshape(n_variants, ni)
+                t_i = cov_int_result["tstat_i"].detach().cpu().numpy().reshape(n_variants, ni)
+                for k in range(ni):
+                    suf_i, suf_gi = _interaction_term_columns(interaction_names, k)
+                    cov_int_cols[f"b_{suf_i}"] = b_i[:, k]
+                    cov_int_cols[f"se_{suf_i}"] = se_i[:, k]
+                    cov_int_cols[f"tstat_{suf_i}"] = t_i[:, k]
+                    cov_int_cols[f"pval_{suf_i}"] = get_t_pval(t_i[:, k], int_dof)
+                    cov_int_cols[f"b_{suf_gi}"] = b_gi[:, k]
+                    cov_int_cols[f"se_{suf_gi}"] = se_gi[:, k]
+                    cov_int_cols[f"tstat_{suf_gi}"] = t_gi[:, k]
+                    cov_int_cols[f"pval_{suf_gi}"] = get_t_pval(t_gi[:, k], int_dof)
+                if top_rows is not None:
+                    score = np.nanmax(np.abs(t_gi), axis=1)
+                    if np.all(np.isnan(score)):
+                        ix = 0
+                    else:
+                        ix = int(np.nanargmax(score))
+                    top = {
+                        "phenotype_id": str(pid), "variant_id": var_ids[ix],
+                        "start_distance": int(var_pos[ix] - ig.phenotype_start[pid]),
+                        "end_distance": int(var_pos[ix] - ig.phenotype_end[pid]),
+                        "af": float(af_np[ix]), "ma_samples": int(ma_samples_np[ix]),
+                        "ma_count": int(ma_count_np[ix]),
+                    }
+                    for col in covar_int_columns:
+                        top[col] = float(cov_int_cols[col][ix])
+                    if tests_emt is not None:
+                        top["tests_emt"] = int(tests_emt)
+                    if group_mode:
+                        top["group_id"] = group_id
+                        top["num_phenotypes"] = len(id_list)
+                        if best_group_top is None or float(score[ix]) > best_group_top[0]:
+                            best_group_top = (float(score[ix]), top)
+                    else:
+                        top_rows.append(top)
 
-            if include_perm:
-                fill_value = np.nan if perm_max_r2 is None else perm_max_r2
-                buffers["perm_max_r2"][row_slice] = fill_value
+            if buffers is not None:
+                row_slice = slice(cursor, cursor + n_variants)
 
-            cursor += n_variants
+                buffers["phenotype_id"][row_slice] = str(pid)
+                buffers["variant_id"][row_slice] = var_ids
+                np.subtract(var_pos, ig.phenotype_start[pid],
+                            out=buffers["start_distance"][row_slice])
+                np.subtract(var_pos, ig.phenotype_end[pid],
+                            out=buffers["end_distance"][row_slice])
+
+                buffers["slope"][row_slice] = beta_np
+                buffers["slope_se"][row_slice] = se_np
+                buffers["tstat"][row_slice] = tstat_np
+                buffers["pval_nominal"][row_slice] = pval_np
+                buffers["af"][row_slice] = af_np
+                buffers["ma_samples"][row_slice] = ma_samples_np
+                buffers["ma_count"][row_slice] = ma_count_np
+                if interaction_mode and interaction_columns:
+                    for anc_idx in range(len(interaction_columns) // 4):
+                        base = anc_idx * 4
+                        buffers[interaction_columns[base + 0]][row_slice] = gxh_slope[:, anc_idx]
+                        buffers[interaction_columns[base + 1]][row_slice] = gxh_se[:, anc_idx]
+                        buffers[interaction_columns[base + 2]][row_slice] = gxh_t[:, anc_idx]
+                        buffers[interaction_columns[base + 3]][row_slice] = gxh_p[:, anc_idx]
+                if dosage_mode and dosage_vals is not None:
+                    for col in dosage_columns:
+                        buffers[col][row_slice] = dosage_vals[col]
+                if cov_int_cols is not None:
+                    for col in covar_int_columns:
+                        buffers[col][row_slice] = cov_int_cols[col]
+
+                if include_perm:
+                    fill_value = np.nan if perm_max_r2 is None else perm_max_r2
+                    buffers["perm_max_r2"][row_slice] = fill_value
+
+                cursor += n_variants
             processed += 1
             if (
                     logger.verbose and total_phenotypes and progress_interval
@@ -555,9 +660,16 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                     f"      processed {processed}/{total_phenotypes} phenotypes on {chrom_label}"
                 )
 
+        if best_group_top is not None and top_rows is not None:
+            top_rows.append(best_group_top[1])
+
+    if buffers is None:
+        return None
+
     if sink is not None:
         schema = _nominal_parquet_schema(include_perm, ancestry_model, n_ancestries,
-                                         covariate_interaction=covar_interaction)
+                                         covariate_interaction=covar_interaction,
+                                         interaction_names=interaction_names)
         table = _buffers_to_arrow(buffers, schema, cursor)
         sink.write(table)
         return None
@@ -586,6 +698,101 @@ def _n_ancestries(haplotypes, ancestry_model: str) -> int | None:
     return 2 if k == 1 else k
 
 
+def _prepare_interaction_terms(interaction_df, interaction_covariate, covariates_df, sample_ids):
+    """
+    Normalise ``interaction_df`` (DataFrame samples x terms, or Series) and the
+    legacy ``interaction_covariate`` (one term; z-scored) into
+    ``(tensor (n, ni) or None, names or None, covariates_to_project)``.
+    """
+    if interaction_df is not None and interaction_covariate is not None:
+        raise ValueError("Pass either interaction_df or interaction_covariate, not both.")
+    covariates_use = covariates_df
+    if interaction_df is not None:
+        if isinstance(interaction_df, pd.Series):
+            interaction_df = interaction_df.to_frame(name=interaction_df.name or "i")
+        if not isinstance(interaction_df, pd.DataFrame):
+            raise ValueError("interaction_df must be a DataFrame (samples x terms) or a Series.")
+        idx = pd.Index(interaction_df.index.astype(str))
+        want = pd.Index(pd.Index(sample_ids).astype(str))
+        missing = want.difference(idx)
+        if len(missing):
+            raise ValueError(f"interaction_df is missing {len(missing)} samples (first: {list(missing[:5])})")
+        vals = interaction_df.set_index(idx).loc[want].to_numpy(dtype=np.float64)
+        if not np.all(np.isfinite(vals)):
+            raise ValueError("interaction_df contains non-finite values.")
+        if (vals.std(axis=0) <= 0).any():
+            raise ValueError("interaction_df has a constant column.")
+        names = [str(c) for c in interaction_df.columns]
+        if len(set(names)) != len(names):
+            raise ValueError("interaction_df column names must be unique.")
+        reserved = {"g", "i", "gi"} | set(_covariate_interaction_columns())
+        bad = [n for n in names if n in reserved]
+        if bad and len(names) > 1:
+            raise ValueError(f"interaction_df column names {bad} collide with output columns; rename them.")
+        # a term also present among the covariates is projected as an interaction, not a covariate
+        if covariates_df is not None:
+            drop = [c for c in covariates_df.columns if str(c) in names]
+            if drop:
+                covariates_use = covariates_df.drop(columns=drop)
+        return vals.astype(np.float32), names, covariates_use
+    if interaction_covariate is not None:
+        if isinstance(interaction_covariate, str) and covariates_df is not None \
+                and interaction_covariate in covariates_df.columns:
+            covariates_use = covariates_df.drop(columns=[interaction_covariate])
+        vec = prepare_interaction_covariate(interaction_covariate, covariates_df, sample_ids)
+        name = interaction_covariate if isinstance(interaction_covariate, str) else \
+            (getattr(interaction_covariate, "name", None) or "i")
+        return vec.reshape(-1, 1), [str(name)], covariates_use
+    return None, None, covariates_use
+
+
+def _paired_covariate_context(paired_covariate_df, covariates_df, phenotype_df_resid_index, phenotype_df_raw,
+                              device, tensorqtl_flavor):
+    """
+    Phenotype-specific covariates (tensorQTL ``paired_covariate_df``,
+    phenotypes x samples): one Residualizer per phenotype that includes the
+    shared covariates plus that phenotype's extra column, and the phenotype
+    residualized with it.
+    """
+    if paired_covariate_df is None:
+        return None
+    if not paired_covariate_df.columns.equals(phenotype_df_raw.columns):
+        raise ValueError("paired_covariate_df must be phenotypes x samples with the phenotype sample order.")
+    unknown = paired_covariate_df.index.difference(phenotype_df_raw.index)
+    if len(unknown):
+        raise ValueError(f"paired_covariate_df has {len(unknown)} phenotypes not in phenotype_df (first: {list(unknown[:5])})")
+    ctx = {}
+    C = covariates_df.values if covariates_df is not None else np.empty((phenotype_df_raw.shape[1], 0))
+    for pid in paired_covariate_df.index:
+        if pid not in phenotype_df_resid_index:
+            continue
+        Ci = np.c_[C, paired_covariate_df.loc[pid].to_numpy(dtype=np.float64)]
+        rez_i = Residualizer(torch.tensor(Ci, dtype=torch.float32, device=device), tensorqtl_flavor=tensorqtl_flavor)
+        y = torch.tensor(phenotype_df_raw.loc[pid].to_numpy(dtype=np.float32), device=device).unsqueeze(0)
+        ctx[pid] = (rez_i, rez_i.transform(y, center=True)[0].squeeze(0))
+    return ctx
+
+
+def _finalize_top_assoc(top_rows, interaction_names, run_eigenmt, group_mode) -> pd.DataFrame:
+    """Top interaction association per phenotype (group) with optional eigenMT correction."""
+    if not top_rows:
+        return pd.DataFrame()
+    top_df = pd.DataFrame(top_rows).set_index("phenotype_id")
+    if run_eigenmt and "tests_emt" in top_df.columns and (interaction_names is None or len(interaction_names) == 1):
+        from ..eigenmt import padjust_bh
+        pval_gi = top_df["pval_gi"].to_numpy(dtype=np.float64)
+        scale = top_df["tests_emt"].to_numpy(dtype=np.float64)
+        if group_mode and "num_phenotypes" in top_df.columns:
+            scale = scale * top_df["num_phenotypes"].to_numpy(dtype=np.float64)
+        top_df["pval_emt"] = np.minimum(scale * pval_gi, 1.0)
+        ok = np.isfinite(top_df["pval_emt"].to_numpy())
+        adj = np.full(len(top_df), np.nan)
+        if ok.any():
+            adj[ok] = padjust_bh(top_df["pval_emt"].to_numpy()[ok])
+        top_df["pval_adj_bh"] = adj
+    return top_df
+
+
 def map_nominal(
         genotype_df: pd.DataFrame, variant_df: pd.DataFrame, phenotype_df: pd.DataFrame,
         phenotype_pos_df: pd.DataFrame, covariates_df: Optional[pd.DataFrame] = None,
@@ -599,6 +806,13 @@ def map_nominal(
         ancestry_model: str = "main",
         interaction_covariate: Optional[object] = None,
         min_ancestry_ac: float = 0.0,
+        interaction_df: Optional[object] = None,
+        maf_threshold_interaction: float = 0.0,
+        paired_covariate_df: Optional[pd.DataFrame] = None,
+        write_top: bool = True,
+        write_stats: bool = True,
+        run_eigenmt: bool = False,
+        top_assoc_path: Optional[str] = None,
     ) -> pd.DataFrame:
     """
     Nominal cis-QTL scan with optional permutations and local ancestry.
@@ -622,11 +836,50 @@ def map_nominal(
         (``ma_count_anc{k}``) is below this value get NaN effect estimates and
         NaN pairwise differences; the variant row is kept and ``fstat_joint``
         is unchanged.
+    interaction_covariate : str, Series or array, optional
+        One genotype-by-covariate interaction term (z-scored).
+    interaction_df : DataFrame (samples x terms) or Series, optional
+        tensorQTL-style interaction term(s), used as given (not scaled); fits
+        ``y ~ g + i_1..i_k + g:i_1..g:i_k`` (+ local-ancestry main effects with
+        a panel).  With one term the output columns are ``b_g/se_g/tstat_g/
+        pval_g``, ``b_i/...``, ``b_gi/...``; with several terms the variable
+        names are substituted (``b_<name>``, ``b_g-<name>``, ...).  The
+        ``slope``/``pval_nominal`` columns report the strongest ``g:i`` term.
+    maf_threshold_interaction : float, default 0
+        With exactly one interaction term, keep variants with MAF >= this value
+        in both the lower and upper half of the interaction variable
+        (tensorQTL default 0.05; the CLI uses that default).
+    paired_covariate_df : DataFrame (phenotypes x samples), optional
+        One phenotype-specific covariate (e.g. a cell-type proportion or
+        a local PEER factor); phenotypes absent from it use the shared
+        covariates only.  Ungrouped mapping only.
+    write_top, write_stats : bool
+        Interaction scans only: write the top association per phenotype to
+        ``top_assoc_path`` (default ``<out_dir>/<out_prefix>.top_assoc.txt.gz``)
+        and the pair-level Parquet files.  ``write_stats=False`` (tensorQTL's
+        ``--best_only``) skips the pair-level output.
+    run_eigenmt : bool
+        Interaction scans only: add ``tests_emt`` (eigenMT effective number of
+        tests) to the top associations and, with one term, ``pval_emt`` and
+        ``pval_adj_bh``.
+
+    Returns
+    -------
+    ``out_dir=None``: the pair-level DataFrame (interaction scans also carry
+    ``.attrs["top_assoc"]``), or the top-association DataFrame when
+    ``write_stats=False``.  With ``out_dir``: ``None`` (files written), or the
+    top-association DataFrame when ``write_top=False``.
     """
     device = device if device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
     torch_device = torch.device(device)
     logger = logger or SimpleLogger(verbose=verbose, timestamps=True)
     sync = (torch.cuda.synchronize if device == "cuda" else None)
+
+    # Interaction term(s)
+    interaction_arr, interaction_names, covariates_use = _prepare_interaction_terms(
+        interaction_df, interaction_covariate, covariates_df, phenotype_df.columns)
+    has_interaction = interaction_arr is not None
+    ni = 0 if interaction_arr is None else int(interaction_arr.shape[1])
 
     # Header (tensorQTL-style)
     logger.write("cis-QTL mapping: nominal associations for all variant–phenotype pairs")
@@ -634,11 +887,13 @@ def map_nominal(
     logger.write(f"  * {phenotype_df.shape[1]} samples")
     logger.write(f"  * {phenotype_df.shape[0]} phenotypes")
     logger.write(f"  * {variant_df.shape[0]} variants")
-    logger.write(f"  * cis-window: \u00B1{window:,}")
+    logger.write(f"  * cis-window: ±{window:,}")
     if maf_threshold and maf_threshold > 0:
         logger.write(f"  * applying in-sample {maf_threshold:g} MAF filter")
-    if covariates_df is not None:
-        logger.write(f"  * {covariates_df.shape[1]} covariates")
+    if covariates_use is not None:
+        logger.write(f"  * {covariates_use.shape[1]} covariates")
+    if paired_covariate_df is not None:
+        logger.write("  * including phenotype-specific covariate")
     if haplotypes is not None:
         K = int(haplotypes.shape[2])
         logger.write(f"  * including local ancestry channels (K={K})")
@@ -647,9 +902,16 @@ def map_nominal(
     elif ancestry_model == "dosage":
         logger.write("  * ancestry model: ancestry-specific dosage "
                      f"({'posterior-expected' if getattr(haplotypes, 'use_posterior', False) else 'hard-call'} ancestry counts)")
-    if interaction_covariate is not None:
-        logger.write("  * covariate interaction: GxC"
+    if has_interaction:
+        logger.write(f"  * including {ni} interaction term(s): {', '.join(interaction_names)}"
                      + (" (+ local ancestry main effects)" if haplotypes is not None else ""))
+        if maf_threshold_interaction and maf_threshold_interaction > 0:
+            if ni == 1:
+                logger.write(f"    * using {maf_threshold_interaction:g} MAF threshold (both halves)")
+            else:
+                logger.write("    * maf_threshold_interaction ignored with >1 interaction terms")
+        if run_eigenmt:
+            logger.write("    * computing eigenMT correction for the top associations")
     if nperm is not None:
         logger.write(f"  * computing tensorQTL-style nominal p-values and {nperm:,} permutations")
 
@@ -669,7 +931,8 @@ def map_nominal(
 
     # Validate interaction / dosage arguments
     validate_ancestry_model(
-        ancestry_model, haplotypes=haplotypes, interaction_covariate=interaction_covariate,
+        ancestry_model, haplotypes=haplotypes,
+        interaction_covariate=interaction_arr if has_interaction else None,
         allow_dosage=True, caller="map_nominal",
     )
     if ancestry_model == "dosage" and nperm is not None and nperm > 0:
@@ -678,24 +941,29 @@ def map_nominal(
         if ancestry_model != "dosage":
             raise ValueError("min_ancestry_ac is only meaningful with ancestry_model='dosage'.")
         logger.write(f"  * masking ancestry effects with in-sample minor-allele count < {min_ancestry_ac:g}")
+    if paired_covariate_df is not None and group_s is not None:
+        raise ValueError("paired_covariate_df is not supported with phenotype groups.")
+    if has_interaction and nperm is not None and nperm > 0:
+        raise ValueError("interaction terms do not support nperm (permutations).")
+    if (not write_stats or run_eigenmt) and not has_interaction:
+        raise ValueError("write_stats=False / run_eigenmt require an interaction term.")
 
-    # Prepare covariates: drop interaction column from covariates if it was named there
-    covariates_use = covariates_df
-    if isinstance(interaction_covariate, str) and covariates_df is not None:
-        if interaction_covariate in covariates_df.columns:
-            covariates_use = covariates_df.drop(columns=[interaction_covariate])
-    interaction_vec = prepare_interaction_covariate(
-        interaction_covariate, covariates_df, phenotype_df.columns
-    )
     interaction_cov_t = None
-    if interaction_vec is not None:
-        interaction_cov_t = torch.as_tensor(interaction_vec, dtype=torch.float32, device=device)
+    interaction_mask_t = None
+    if has_interaction:
+        interaction_cov_t = torch.as_tensor(interaction_arr, dtype=torch.float32, device=device)
+        if ni == 1 and maf_threshold_interaction and maf_threshold_interaction > 0:
+            interaction_mask_t = interaction_half_mask(interaction_arr[:, 0]).to(device)
+        else:
+            maf_threshold_interaction = 0.0
 
     # Residualize once using the filtered phenotypes from the generator
     Y = torch.tensor(ig.phenotype_df.values, dtype=torch.float32, device=device)
     with logger.time_block(" Residualizing phenotypes", sync=sync):
         Y_resid, rez = residualize_matrix_with_covariates(Y, covariates_use,
                                                           device, tensorqtl_flavor)
+    paired_ctx = _paired_covariate_context(paired_covariate_df, covariates_use, ig.phenotype_df.index,
+                                           phenotype_df, device, tensorqtl_flavor)
 
     ig.phenotype_df = pd.DataFrame(
         Y_resid.cpu().numpy(), index=ig.phenotype_df.index, columns=ig.phenotype_df.columns
@@ -703,13 +971,27 @@ def map_nominal(
 
     # Pre-compute per-chromosome phenotype counts for logging
     phenotype_counts = ig.phenotype_pos_df['chr'].value_counts().to_dict()
+    n_anc = _n_ancestries(haplotypes, ancestry_model)
+    top_rows: list | None = [] if has_interaction else None
+    group_mode = group_s is not None
+    core_kwargs = dict(
+        maf_threshold=maf_threshold, logger=logger, ancestry_model=ancestry_model,
+        n_ancestries=n_anc, interaction_covariate_t=interaction_cov_t,
+        min_ancestry_ac=min_ancestry_ac, interaction_names=interaction_names,
+        interaction_mask_t=interaction_mask_t, maf_threshold_interaction=maf_threshold_interaction,
+        paired_ctx=paired_ctx, top_rows=top_rows, run_eigenmt=run_eigenmt,
+        collect_pairs=write_stats,
+    )
+
+    def _top_df():
+        return _finalize_top_assoc(top_rows, interaction_names, run_eigenmt, group_mode)
 
     if out_dir is not None:
         os.makedirs(out_dir, exist_ok=True)
         include_perm = nperm is not None and nperm > 0
-        n_anc = _n_ancestries(haplotypes, ancestry_model)
         schema = _nominal_parquet_schema(include_perm, ancestry_model, n_anc,
-                                         covariate_interaction=interaction_cov_t is not None)
+                                         covariate_interaction=has_interaction,
+                                         interaction_names=interaction_names)
         with logger.time_block("Nominal scan (per-chrom streaming)", sync=sync, sec=False):
             for chrom in ig.chrs:
                 out_path = os.path.join(out_dir, f"{out_prefix}.{chrom}.parquet")
@@ -718,27 +1000,34 @@ def map_nominal(
                     logger.write(f"    Mapping chromosome {chrom} ({chrom_total} phenotypes)")
                 chrom_start = time.time()
                 with logger.time_block(f"{chrom}: map_nominal", sync=sync):
-                    target_rows = _count_cis_pairs(ig, chrom)
-                    with AsyncParquetSink(
-                            out_path, schema=schema, compression=compression,
-                            row_group_size=DEFAULT_ROW_GROUP_SIZE,
-                            use_dictionary=("phenotype_id",), write_statistics=False,
-                            column_order=list(schema.names), max_queue_items=4,
-                    ) as sink:
+                    if write_stats:
+                        target_rows = _count_cis_pairs(ig, chrom)
+                        with AsyncParquetSink(
+                                out_path, schema=schema, compression=compression,
+                                row_group_size=DEFAULT_ROW_GROUP_SIZE,
+                                use_dictionary=("phenotype_id",), write_statistics=False,
+                                column_order=list(schema.names), max_queue_items=4,
+                        ) as sink:
+                            _run_nominal_core(
+                                ig, variant_df, rez, nperm, device, chrom=chrom, sink=sink,
+                                target_rows=target_rows, total_phenotypes=chrom_total, **core_kwargs,
+                            )
+                    else:
                         _run_nominal_core(
-                            ig, variant_df, rez, nperm, device,
-                            maf_threshold=maf_threshold, chrom=chrom, sink=sink,
-                            target_rows=target_rows, logger=logger,
-                            total_phenotypes=chrom_total,
-                            ancestry_model=ancestry_model,
-                            n_ancestries=n_anc,
-                            interaction_covariate_t=interaction_cov_t,
-                            min_ancestry_ac=min_ancestry_ac,
+                            ig, variant_df, rez, nperm, device, chrom=chrom, sink=None,
+                            total_phenotypes=chrom_total, **core_kwargs,
                         )
-                        # logger.write(f"{chrom}: ~{sink.rows:,} rows written")
                 if logger.verbose:
                     elapsed = time.time() - chrom_start
                     logger.write(f"    Chromosome {chrom} completed in {elapsed:.2f}s")
+        if has_interaction:
+            top_df = _top_df()
+            if write_top:
+                path = top_assoc_path or os.path.join(out_dir, f"{out_prefix}.top_assoc.txt.gz")
+                top_df.to_csv(path, sep="\t", float_format="%.6g")
+                logger.write(f"  * wrote top associations to {path}")
+            else:
+                return top_df
         return None if not return_df else pd.DataFrame([])
 
     total_phenotypes = int(ig.phenotype_df.shape[0])
@@ -747,16 +1036,16 @@ def map_nominal(
     overall_start = time.time()
     with logger.time_block("Computing associations (nominal)", sync=sync):
         results = _run_nominal_core(ig, variant_df, rez, nperm, device,
-                                    maf_threshold=maf_threshold,
-                                    chrom=None, sink=None, logger=logger,
-                                    total_phenotypes=total_phenotypes,
-                                    ancestry_model=ancestry_model,
-                                    n_ancestries=_n_ancestries(haplotypes, ancestry_model),
-                                    interaction_covariate_t=interaction_cov_t,
-                                    min_ancestry_ac=min_ancestry_ac)
+                                    chrom=None, sink=None, total_phenotypes=total_phenotypes,
+                                    **core_kwargs)
     if logger.verbose:
         elapsed = time.time() - overall_start
         logger.write(f"    Completed nominal scan in {elapsed / 60:.2f} min")
+    if has_interaction:
+        top_df = _top_df()
+        if results is None:
+            return top_df
+        results.attrs["top_assoc"] = top_df
     return results
 
 

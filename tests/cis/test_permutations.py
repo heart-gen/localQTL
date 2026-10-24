@@ -1,8 +1,10 @@
 import numpy as np
 import pandas as pd
 import torch
+import pytest
 
 from src.localqtl.cis.permutations import map_permutations
+from src.localqtl.cis.nominal import map_nominal
 from src.localqtl.utils import SimpleLogger
 
 
@@ -102,3 +104,55 @@ def test_lead_nominal_pval_matches_map_nominal_with_covariates(random_cohort):
         ref = nom.loc[(row["phenotype_id"], row["variant_id"])]
         np.testing.assert_allclose(row["pval_nominal"], ref["pval_nominal"], rtol=1e-4)
         np.testing.assert_allclose(row["slope"], ref["slope"], rtol=1e-4)
+
+
+def test_paired_covariate_lead_matches_map_nominal(random_cohort):
+    from scipy import stats as st
+    d = random_cohort(seed=11, n=60, m=6)
+    rng = d["rng"]
+    cov = pd.DataFrame(rng.normal(size=(60, 2)), index=d["samples"], columns=["a", "b"])
+    paired = pd.DataFrame(rng.normal(size=(1, 60)), index=["geneA"], columns=d["samples"])
+    lg = SimpleLogger(verbose=False)
+    perm = map_permutations(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"], cov,
+                            paired_covariate_df=paired, nperm=30, device="cpu", seed=1, logger=lg)
+    nom = map_nominal(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"], cov,
+                      paired_covariate_df=paired, device="cpu", out_dir=None, logger=lg)
+    r = perm.iloc[0]
+    nr = nom[nom.variant_id == r.variant_id].iloc[0]
+    np.testing.assert_allclose(r.slope, nr.slope, rtol=1e-5)
+    np.testing.assert_allclose(r.pval_nominal, nr.pval_nominal, rtol=1e-4)
+    assert r.variant_id == nom.sort_values("pval_nominal").variant_id.iloc[0]
+    # and it is the OLS fit with the extra covariate
+    g = d["genotype_df"].loc[r.variant_id].to_numpy(np.float64)
+    X1 = np.column_stack([np.ones(60), g, cov.values, paired.values[0]])
+    b = np.linalg.lstsq(X1, d["y"], rcond=None)[0]
+    res = d["y"] - X1 @ b
+    dof = 60 - X1.shape[1]
+    se = np.sqrt(np.diag((res @ res) / dof * np.linalg.inv(X1.T @ X1)))
+    np.testing.assert_allclose(r.slope, b[1], rtol=1e-4)
+    np.testing.assert_allclose(r.pval_nominal, 2 * st.t.sf(abs(b[1] / se[1]), dof), rtol=1e-4)
+    with pytest.raises(ValueError, match="groups"):
+        map_permutations(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"], cov,
+                         paired_covariate_df=paired, group_s=pd.Series({"geneA": "g"}), nperm=10, device="cpu",
+                         logger=lg)
+
+
+def test_covariate_interaction_lead_matches_ols(random_cohort):
+    from scipy import stats as st
+    d = random_cohort(seed=12, n=60, m=6)
+    rng = d["rng"]
+    cov = pd.DataFrame(rng.normal(size=(60, 2)), index=d["samples"], columns=["a", "c"])
+    perm = map_permutations(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"], cov,
+                            interaction_covariate="c", nperm=20, device="cpu", seed=1,
+                            logger=SimpleLogger(verbose=False))
+    r = perm.iloc[0]
+    g = d["genotype_df"].loc[r.variant_id].to_numpy(np.float64)
+    c = cov["c"].to_numpy()
+    cz = (c - c.mean()) / c.std()
+    X1 = np.column_stack([np.ones(60), g, cz, g * cz, cov[["a"]].values])
+    b = np.linalg.lstsq(X1, d["y"], rcond=None)[0]
+    res = d["y"] - X1 @ b
+    dof = 60 - X1.shape[1]
+    se = np.sqrt(np.diag((res @ res) / dof * np.linalg.inv(X1.T @ X1)))
+    np.testing.assert_allclose(r.slope, b[3], rtol=1e-3)
+    np.testing.assert_allclose(r.pval_nominal, 2 * st.t.sf(abs(b[3] / se[3]), dof), rtol=1e-3)

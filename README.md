@@ -24,6 +24,11 @@ workflows, while adding ancestry-aware use cases.
 - **Fine-mapping and colocalization helpers** via `localqtl.susie`,
   `localqtl.coloc`, and cis post-processing utilities that annotate nominal or
   permutation outputs with credible sets and COLOC posterior support.
+- **tensorQTL feature parity**: trans-QTL mapping (`localqtl.trans`), eigenMT
+  (`localqtl.eigenmt`), multi-term `interaction_df` scans with top-association
+  output, phenotype-specific `paired_covariate_df`, aFC / replication / gene
+  annotation (`localqtl.post`), tabix VCF readers, chunked pgen processing and a
+  `localqtl` command line with tensorQTL's modes and output file names.
 
 ## Installation
 
@@ -139,11 +144,11 @@ for `map_nominal` only (no permutations, no `interaction_covariate`).
 
 ### Covariate interaction scans
 
-`map_nominal`, `map_permutations`, `map_independent`, and `CisMapper` also
-support sample-level genotype-by-covariate interaction models through the
-`interaction_covariate` argument. Pass either a covariate-column name, a
-`pandas.Series` indexed by sample ID, or a 1D array aligned to the sample
-order.
+`map_nominal`, `map_permutations`, `map_independent`, and `CisMapper` support
+genotype-by-covariate interaction models. `interaction_df` (tensorQTL's
+argument: a DataFrame of samples x terms, or a Series) fits
+`y ~ g + i_1..i_k + g:i_1..g:i_k`; the legacy `interaction_covariate` takes one
+z-scored term (column name, Series or array).
 
 ```python
 from localqtl.cis import map_nominal
@@ -154,18 +159,32 @@ results = map_nominal(
     phenotype_df=phenotype_df,
     phenotype_pos_df=phenotype_pos_df,
     covariates_df=covariates_df,
-    interaction_covariate="age",
+    interaction_df=covariates_df[["age"]],   # one or several terms
+    maf_threshold_interaction=0.05,          # MAF >= 5 % in both halves of the term
+    run_eigenmt=True,                        # tests_emt / pval_emt / pval_adj_bh on the top hits
     device="auto",
     out_dir=None,
 )
-
+top_df = results.attrs["top_assoc"]          # one row per phenotype (written to
+                                             # <out_prefix>.top_assoc.txt.gz with out_dir)
 print(results[["variant_id", "pval_nominal", "pval_g", "pval_i", "pval_gi"]].head())
 ```
 
-This emits the standard nominal columns plus canonical joint-model statistics
-for `y ~ g + i + g:i`: `b_g`, `b_i`, `b_gi`, their standard errors, t-stats,
-and p-values. `interaction_covariate` cannot be combined with
-`ancestry_model="interaction"`.
+With one term the output carries `b_g`, `b_i`, `b_gi` plus their standard
+errors (`se_*`), t-statistics and p-values; with several terms the variable
+names are substituted (`b_age`, `pval_g-age`, ...). The `slope` /
+`pval_nominal` columns report the strongest `g:i` term. The `i` and `g:i`
+columns are residualized against the covariates like `g` (Frisch–Waugh), so the
+estimates equal a full OLS fit of `y ~ 1 + g + i + g:i + C`. Pass
+`write_stats=False` (tensorQTL `--best_only`) to keep only the top
+associations. `interaction_df` cannot be combined with
+`ancestry_model="interaction"`; with a local-ancestry panel the ancestry counts
+enter as main effects.
+
+Phenotype-specific covariates (one extra covariate per phenotype, e.g. a local
+PEER factor) are passed as `paired_covariate_df` (phenotypes x samples) to
+`map_nominal` and `map_permutations`; phenotypes absent from it use the shared
+covariates only.
 
 For analyses that combine nominal scans, permutations, and independent signal
 calling, the `CisMapper` class offers a thin object-oriented façade:
@@ -316,6 +335,66 @@ Only GRCh38 tables are accepted; strand flips are flagged, never corrected. The
 gnomAD local-ancestry-informed release covers bi-allelic SNPs with MAF > 0.1 %
 in the African/African American and Admixed American groups.
 
+### trans-QTL mapping, eigenMT and post-processing (tensorQTL parity)
+
+`localqtl.trans` mirrors tensorQTL's `trans` module: `map_trans` (sparse or
+dense output, optional single `interaction_s`), `filter_cis`,
+`map_trans_permutations` (genome-wide null of shuffled normal phenotypes, per
+chromosome with `chr_s`) and `apply_permutations`. A `LocalAncestryPanel`
+passed as `haplotypes` (with `variant_df`) adds each variant's local-ancestry
+counts as main-effect covariates.
+
+```python
+from localqtl import trans, eigenmt, post
+
+pairs_df = trans.map_trans(genotype_df, phenotype_df, covariates_df,
+                           haplotypes=panel, variant_df=variant_df,
+                           pval_threshold=1e-5, maf_threshold=0.05, return_r2=True)
+pairs_df = trans.filter_cis(pairs_df, phenotype_pos_df, variant_df, window=5_000_000)
+null = trans.map_trans_permutations(genotype_df, covariates_df, nperms=10_000, seed=1)
+pairs_df = trans.apply_permutations(null, pairs_df)        # pval_perm, pval_beta
+
+tests_emt = eigenmt.run_eigenmt(genotype_df, variant_df, phenotype_df, phenotype_pos_df)
+afc_df = post.calculate_afc(assoc_df, counts_df, genotype_df, covariates_df=covariates_df)
+pi1, rep_df = post.calculate_replication(cis_df.set_index("phenotype_id"), genotype_df2,
+                                         phenotype_df2, covariates_df2, compute_pi1=True)
+annotated = post.annotate_genes(cis_df.set_index("phenotype_id"), "gencode.v39.genes.gtf")
+```
+
+Other parity helpers: `genotypeio.get_vcf_region` / `get_vcf_variants`
+(tabix VCF slices through pysam or the `tabix` binary),
+`pgen.generate_paired_chunks` (genotype/phenotype chunks for cohorts whose
+genotypes do not fit in memory), and `localqtl.compat` to translate column
+names (`true_dof` <-> `true_df`, `se_gi` <-> `b_gi_se`, ...).
+
+### Command line
+
+`python -m localqtl` (or the `localqtl` console script) accepts tensorQTL's
+arguments and writes tensorQTL's file names, plus local-ancestry options:
+
+```bash
+localqtl geno pheno.bed.gz prefix --mode cis --covariates covariates.txt --permutations 10000
+localqtl geno pheno.bed.gz prefix --mode cis_nominal --covariates covariates.txt \
+        --interaction age.txt --maf_threshold_interaction 0.05 --cis_output prefix.cis_qtl.txt.gz
+localqtl geno pheno.bed.gz prefix --mode cis_independent --cis_output prefix.cis_qtl.txt.gz
+localqtl geno pheno.bed.gz prefix --mode trans --pval_threshold 1e-5 --return_r2
+# local ancestry (RFMix prefix, FLARE prefix or an rfmix_reader Zarr cache)
+localqtl geno pheno.bed.gz prefix --mode cis_nominal --haplotypes rfmix/out --la_source msp \
+        --ancestry_model dosage --min_ancestry_ac 10
+```
+
+Modes: `cis` (`<prefix>.cis_qtl.txt.gz`), `cis_nominal`
+(`<prefix>.cis_qtl_pairs.<chr>.parquet`, `<prefix>.cis_qtl_top_assoc.txt.gz`
+for interaction scans, `<prefix>.cis_qtl.signif_pairs.parquet` with
+`--cis_output`), `cis_independent` (`<prefix>.cis_independent_qtl.txt.gz`),
+`cis_susie` / `trans_susie` (`<prefix>.SuSiE_summary.parquet`,
+`<prefix>.SuSiE.pickle`) and `trans` (`<prefix>.trans_qtl_pairs.parquet` or
+`.txt.gz`; dense `--return_dense` outputs). `--chunk_size N|chr` streams PLINK 2
+genotypes in chunks. Output columns use tensorQTL's spelling unless
+`--localqtl_names` is given; `--device`, `--perm_chunk`, `--haplotypes`,
+`--la_format`, `--la_source`, `--la_cache_dir`, `--use_posterior`,
+`--ancestry_model` and `--min_ancestry_ac` are localQTL additions.
+
 ### Fine-mapping and colocalization
 
 The branch also adds SuSiE fine-mapping and COLOC colocalization helpers for
@@ -374,4 +453,6 @@ Run the test suite with:
 poetry run pytest
 ```
 
-This exercises the core cis-QTL mapping routines using small synthetic datasets.
+This exercises the cis- and trans-QTL mapping routines, the frequency QC
+helpers and the command line (via toy PLINK 2 files) using small synthetic
+datasets; the regression kernels are checked against numpy OLS.

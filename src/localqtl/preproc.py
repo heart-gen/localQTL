@@ -1,5 +1,6 @@
 ## Adapted from tensorqtl
 ## https://github.com/broadinstitute/tensorqtl/blob/master/tensorqtl/core.py
+import numpy as np
 import torch
 
 __all__ = [
@@ -8,6 +9,8 @@ __all__ = [
     "allele_stats",
     "filter_by_maf",
     "ancestry_allele_stats",
+    "filter_maf_interaction",
+    "interaction_half_mask",
 ]
 
 def impute_mean_and_filter(
@@ -106,3 +109,40 @@ def ancestry_allele_stats(G_t: torch.Tensor, H_t: torch.Tensor) -> dict[str, tor
     af = torch.where(an > 0, ac / an.clamp_min(1e-12), torch.full_like(an, float("nan")))
     ma_count = torch.minimum(ac, an - ac)
     return {"an": an, "ac": ac, "af": af, "ma_count": ma_count}
+
+
+def interaction_half_mask(interaction: "torch.Tensor | np.ndarray") -> torch.Tensor:
+    """
+    tensorQTL's split of the samples into the lower and upper half of a
+    (single) interaction variable: ``True`` marks the upper half (stable sort,
+    ties resolved by sample order).  Used by :func:`filter_maf_interaction`.
+    """
+    vals = interaction.detach().cpu().numpy() if torch.is_tensor(interaction) else np.asarray(interaction)
+    vals = vals.reshape(-1)
+    order = np.argsort(vals, kind="mergesort")
+    mask = np.ones(vals.shape[0], dtype=bool)
+    mask[order[: vals.shape[0] // 2]] = False
+    return torch.as_tensor(mask)
+
+
+def filter_maf_interaction(
+        G_t: torch.Tensor,
+        interaction_mask_t: torch.Tensor | None = None,
+        maf_threshold_interaction: float = 0.05,
+):
+    """
+    Variant filter for interaction scans (tensorQTL ``filter_maf_interaction``):
+    drops monomorphic sites (all 0, all 1 or all 2) and, when
+    ``interaction_mask_t`` (``True`` = upper half of the interaction variable)
+    is given, keeps only variants with MAF >= ``maf_threshold_interaction`` in
+    *both* halves of the samples, so that the interaction is estimable in each.
+
+    Returns ``(G_kept, keep_mask)``.
+    """
+    mask = ~((G_t == 0).all(1) | (G_t == 1).all(1) | (G_t == 2).all(1))
+    if interaction_mask_t is not None and maf_threshold_interaction and maf_threshold_interaction > 0:
+        im = interaction_mask_t.to(device=G_t.device, dtype=torch.bool)
+        upper = calculate_maf(G_t[:, im]) >= maf_threshold_interaction - 1e-7
+        lower = calculate_maf(G_t[:, ~im]) >= maf_threshold_interaction - 1e-7
+        mask = mask & upper & lower
+    return G_t[mask], mask

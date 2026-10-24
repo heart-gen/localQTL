@@ -53,14 +53,13 @@ def read_phenotype_bed(path, as_tensor=False, device="cpu", dtype="float32"):
     else:
         raise ValueError(f"Unsupported file type: {path}")
 
-    # Normalize columns
-    cols = [c.lower().replace("#chr", "chr").replace("#", "") for c in df.columns]
+    # Normalize the coordinate / ID columns only; sample IDs keep their case
+    cols = list(df.columns)
+    cols[:3] = [str(c).lower().replace("#chr", "chr").replace("#", "") for c in cols[:3]]
+    cols[3] = "id"
     df.columns = cols
-
-    # Ensure phenotype ID is index
-    if df.columns[3] != "id":
-        df.rename(columns={df.columns[3]: "id"}, inplace=True)
     df.set_index("id", inplace=True)
+    df.columns = df.columns.astype(str)
 
     # Adjust coordinates
     if "start" in df.columns:

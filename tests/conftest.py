@@ -298,3 +298,94 @@ def make_random_cohort(seed=0, n=40, m=6, chrom="chr1", effect=0.4):
 def random_cohort():
     """Factory fixture: ``random_cohort(seed=..., n=..., m=...)``."""
     return make_random_cohort
+
+
+def ols_fit(y, X):
+    """numpy OLS with intercept -> (betas, ses, dof) for the columns of X (intercept excluded)."""
+    X1 = np.column_stack([np.ones(len(y)), np.asarray(X, dtype=np.float64)])
+    b = np.linalg.lstsq(X1, np.asarray(y, dtype=np.float64), rcond=None)[0]
+    r = y - X1 @ b
+    dof = len(y) - X1.shape[1]
+    cov = (r @ r) / dof * np.linalg.inv(X1.T @ X1)
+    se = np.sqrt(np.diag(cov))
+    return b[1:], se[1:], dof
+
+
+def make_random_panel(variant_df, samples, seed=3, n_anc=2):
+    """In-memory LocalAncestryPanel (hard calls) on the rows of ``variant_df``; returns (panel, admix)."""
+    from rfmix_reader import from_legacy
+    from localqtl.haplotypeio import LocalAncestryPanel
+    rng = np.random.default_rng(seed)
+    loci = pd.DataFrame({"chromosome": variant_df["chrom"].astype(str).values,
+                         "physical_position": variant_df["pos"].values})
+    g_anc = pd.DataFrame({"sample_id": list(samples), **{f"P{a}": 1.0 / n_anc for a in range(n_anc)}, "chrom": "1"})
+    codes = rng.integers(0, n_anc, size=(len(variant_df), len(samples), 2))
+    admix = np.stack([(codes == a).sum(axis=-1) for a in range(n_anc)], axis=-1).astype(np.int8)
+    return LocalAncestryPanel(from_legacy(loci, g_anc, admix)), admix
+
+
+def write_toy_pgen(prefix, genotype_df, variant_df):
+    """Write ``genotype_df`` (hard calls, -9 missing) as PLINK 2 pgen/psam/pvar at ``prefix``."""
+    import pgenlib as pg
+    m, n = genotype_df.shape
+    w = pg.PgenWriter(f"{prefix}.pgen".encode(), n, m, False)
+    for row in genotype_df.to_numpy():
+        r = np.asarray(row, dtype=np.int8)
+        r[r < 0] = -9
+        w.append_biallelic(r)
+    w.close()
+    with open(f"{prefix}.psam", "w") as f:
+        f.write("#IID\tSEX\n")
+        for s in genotype_df.columns:
+            f.write(f"{s}\tNA\n")
+    with open(f"{prefix}.pvar", "w") as f:
+        f.write("#CHROM\tPOS\tID\tREF\tALT\n")
+        ref = variant_df["ref"] if "ref" in variant_df else pd.Series("A", index=variant_df.index)
+        alt = variant_df["alt"] if "alt" in variant_df else pd.Series("G", index=variant_df.index)
+        for vid, c, p in zip(variant_df.index, variant_df["chrom"], variant_df["pos"]):
+            f.write(f"{c}\t{int(p)}\t{vid}\t{ref[vid]}\t{alt[vid]}\n")
+    return prefix
+
+
+def write_phenotype_bed(path, phenotype_df, phenotype_pos_df):
+    """Write a tensorQTL-style phenotype BED (``#chr start end id samples...``; start is 0-based)."""
+    pos = phenotype_pos_df.copy()
+    if "pos" in pos.columns:
+        pos["start"] = pos["pos"] - 1
+        pos["end"] = pos["pos"]
+    else:
+        pos["start"] = pos["start"] - 1
+    bed = pd.DataFrame({"#chr": pos["chr"].astype(str).values, "start": pos["start"].values,
+                        "end": pos["end"].values, "id": phenotype_df.index.values})
+    bed = pd.concat([bed.reset_index(drop=True), phenotype_df.reset_index(drop=True)], axis=1)
+    bed = bed.sort_values(["#chr", "start", "end"])
+    bed.to_csv(path, sep="\t", index=False)
+    return path
+
+
+def make_cohort_with_chroms(seed=5, n=60, m_per_chrom=(8, 6), n_pheno_per_chrom=(2, 1), effect=0.6):
+    """Random cohort over several chromosomes, phenotypes sorted by position, planted effects."""
+    rng = np.random.default_rng(seed)
+    samples = [f"S{i}" for i in range(n)]
+    rows, chroms, poss = [], [], []
+    for ci, m in enumerate(m_per_chrom, 1):
+        for i in range(m):
+            rows.append(f"v{ci}_{i}")
+            chroms.append(f"chr{ci}")
+            poss.append(1000 + 500 * i)
+    G = rng.integers(0, 3, size=(len(rows), n)).astype(np.float32)
+    genotype_df = pd.DataFrame(G, index=rows, columns=samples)
+    variant_df = pd.DataFrame({"chrom": chroms, "pos": poss, "ref": "A", "alt": "G"}, index=rows)
+    pids, pchr, ppos, Y = [], [], [], []
+    for ci, npheno in enumerate(n_pheno_per_chrom, 1):
+        vrows = [k for k, c in enumerate(chroms) if c == f"chr{ci}"]
+        for j in range(npheno):
+            pids.append(f"gene{ci}_{j}")
+            pchr.append(f"chr{ci}")
+            ppos.append(1200 + 700 * j)
+            Y.append(effect * G[vrows[j]] + rng.normal(size=n))
+    phenotype_df = pd.DataFrame(np.array(Y, dtype=np.float32), index=pids, columns=samples)
+    phenotype_pos_df = pd.DataFrame({"chr": pchr, "pos": ppos}, index=pids)
+    covariates_df = pd.DataFrame(rng.normal(size=(n, 2)), index=samples, columns=["PC1", "PC2"])
+    return dict(genotype_df=genotype_df, variant_df=variant_df, phenotype_df=phenotype_df,
+                phenotype_pos_df=phenotype_pos_df, covariates_df=covariates_df, samples=samples, rng=rng)
