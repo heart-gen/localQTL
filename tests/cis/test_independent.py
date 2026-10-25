@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 import pandas as pd
 
@@ -141,3 +142,69 @@ def test_interaction_permutation_chunks_shared_across_ancestries(monkeypatch, to
     for i in range(0, len(calls), pH):
         block = calls[i:i + pH]
         assert all(sig == block[0] for sig in block)
+
+
+# ---------------------------------------------------------------------------
+# phenotype-specific (paired) covariates
+# ---------------------------------------------------------------------------
+def _two_signal_cohort(seed=12, n=150, m=14):
+    """One phenotype with two independent cis signals and a strong paired confounder."""
+    rng = np.random.default_rng(seed)
+    samples = [f"S{i}" for i in range(n)]
+    G = rng.integers(0, 3, size=(m, n)).astype(np.float32)
+    gdf = pd.DataFrame(G, index=[f"v{i}" for i in range(m)], columns=samples)
+    vdf = pd.DataFrame({"chrom": "chr1", "pos": 100 + 10 * np.arange(m)}, index=gdf.index)
+    paired_vec = rng.normal(size=n)
+    y = 1.0 * G[0] + 0.9 * G[5] + 2.0 * paired_vec + rng.normal(size=n) * 0.5
+    pdf = pd.DataFrame([y], index=["geneA"], columns=samples).astype(np.float32)
+    pos = pd.DataFrame({"chr": ["chr1"], "start": [170], "end": [170]}, index=["geneA"])
+    cov = pd.DataFrame(rng.normal(size=(n, 2)), index=samples, columns=["c1", "c2"])
+    paired = pd.DataFrame([paired_vec], index=["geneA"], columns=samples)
+    return dict(genotype_df=gdf, variant_df=vdf, phenotype_df=pdf, phenotype_pos_df=pos,
+                covariates_df=cov, paired=paired, G=G, y=y, samples=samples, rng=rng)
+
+
+def test_map_independent_paired_covariate_matches_ols():
+    """The conditional (rank >= 2) fits include the phenotype-specific covariate."""
+    from tests.conftest import ols_fit
+    d = _two_signal_cohort()
+    lg = SimpleLogger(verbose=False)
+    kw = dict(window=1000, device="cpu", logger=lg, seed=1)
+    perm = map_permutations(d["genotype_df"], d["variant_df"], d["phenotype_df"],
+                            d["phenotype_pos_df"], d["covariates_df"],
+                            paired_covariate_df=d["paired"], nperm=200, **kw)
+    cis_df = perm.copy()
+    cis_df["qval"] = 0.001
+    ind = map_independent(d["genotype_df"], d["variant_df"], cis_df, d["phenotype_df"],
+                          d["phenotype_pos_df"], d["covariates_df"],
+                          paired_covariate_df=d["paired"], nperm=200, **kw)
+    assert len(ind) >= 2 and list(ind["rank"]) == list(range(1, len(ind) + 1))
+    seed_v, second = ind["variant_id"].iloc[0], ind.iloc[1]
+    ids = list(d["genotype_df"].index)
+    X = np.column_stack([d["G"][ids.index(second["variant_id"])], d["G"][ids.index(seed_v)],
+                         d["covariates_df"].values, d["paired"].values[0]])
+    b, se, _ = ols_fit(d["y"], X)
+    np.testing.assert_allclose(second["slope"], b[0], rtol=1e-3)
+    np.testing.assert_allclose(second["slope_se"], se[0], rtol=1e-3)
+    # dropping the paired covariate changes the conditional estimate materially
+    b_no, _, _ = ols_fit(d["y"], np.column_stack([
+        d["G"][ids.index(second["variant_id"])], d["G"][ids.index(seed_v)],
+        d["covariates_df"].values]))
+    assert abs(b_no[0] - b[0]) > 0.1
+
+
+def test_map_independent_paired_covariate_validation():
+    d = _two_signal_cohort()
+    lg = SimpleLogger(verbose=False)
+    cis_df = pd.DataFrame({"phenotype_id": ["geneA"], "variant_id": ["v0"],
+                           "pval_beta": [1e-12], "qval": [1e-12]})
+    base = dict(genotype_df=d["genotype_df"], variant_df=d["variant_df"], cis_df=cis_df,
+                phenotype_df=d["phenotype_df"], phenotype_pos_df=d["phenotype_pos_df"],
+                covariates_df=d["covariates_df"], nperm=20, window=1000, device="cpu", logger=lg)
+    with pytest.raises(ValueError, match="not in\n?.*phenotype_df|phenotypes not in"):
+        map_independent(paired_covariate_df=d["paired"].rename(index={"geneA": "ghost"}), **base)
+    with pytest.raises(ValueError, match="groups"):
+        map_independent(paired_covariate_df=d["paired"],
+                        group_s=pd.Series({"geneA": "grp"}), **base)
+    with pytest.raises(ValueError, match="samples"):
+        map_independent(paired_covariate_df=d["paired"].iloc[:, :5], **base)

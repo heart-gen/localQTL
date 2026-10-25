@@ -77,8 +77,15 @@ def _run_independent_core(
         mixed_precision: str | None = None, nperm_stage1: int | None = 2000,
         ancestry_model: str | None = None, n_ancestries: int | None = None,
         interaction_covariate_t: torch.Tensor | None = None,
+        paired_rows: dict | None = None,
 ) -> pd.DataFrame:
-    """Forward–backward independent mapping for ungrouped phenotypes."""
+    """
+    Forward–backward independent mapping for ungrouped phenotypes.
+
+    ``paired_rows`` maps a phenotype ID to its phenotype-specific covariate
+    column (a ``(n,)`` tensor), appended to the shared covariates for that
+    phenotype only (tensorQTL's ``paired_covariate_df``).
+    """
     expected_columns = [
         "phenotype_id", "variant_id", "start_distance", "end_distance",
         "num_var", "slope", "slope_se", "tstat", "r2_nominal", "pval_nominal",
@@ -206,7 +213,11 @@ def _run_independent_core(
             if perm_chunk is not None and perm_chunk > 0:
                 perm_chunk_local = min(perm_chunk_local, int(perm_chunk))
 
-            rez_cov = Residualizer(covariates_base_t, tensorqtl_flavor=tensorqtl_flavor) if covariates_base_t is not None else None
+            cov_t = covariates_base_t
+            if paired_rows is not None and pid in paired_rows:
+                extra = paired_rows[pid].reshape(-1, 1)
+                cov_t = extra if cov_t is None else torch.cat([cov_t, extra], dim=1)
+            rez_cov = Residualizer(cov_t, tensorqtl_flavor=tensorqtl_flavor) if cov_t is not None else None
             y0, G0, H0 = residualize_batch(y_t, G_t, H_t, rez_cov, center=True, group=False)
             k_base = rez_cov.k_eff if rez_cov is not None else 1
 
@@ -1658,6 +1669,7 @@ def map_independent(
         mixed_precision: str | None = None, nperm_stage1: int | None = 2000,
         ancestry_model: str = "main",
         interaction_covariate: Optional[object] = None,
+        paired_covariate_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Entry point: build IG; derive seed/threshold from cis_df; dispatch to grouped/ungrouped core.
 
@@ -1666,6 +1678,10 @@ def map_independent(
     preload_haplotypes : bool, default True
         When haplotypes are provided, pre-load them into a contiguous torch.Tensor
         on the requested device to avoid per-batch host<->device transfers.
+    paired_covariate_df : DataFrame (phenotypes x samples), optional
+        One phenotype-specific covariate, appended to the shared covariates for
+        the phenotypes it lists (tensorQTL ``paired_covariate_df``); the others
+        use ``covariates_df`` alone.  Ungrouped mapping only.
     """
     device = ("cuda" if (device in ("auto", None) and torch.cuda.is_available())
               else (device if device in ("cuda", "cpu") else "cpu"))
@@ -1745,6 +1761,27 @@ def map_independent(
     if interaction_vec is not None:
         interaction_cov_t = torch.as_tensor(interaction_vec, dtype=torch.float32, device=device)
 
+    paired_rows = None
+    if paired_covariate_df is not None:
+        if group_s is not None:
+            raise ValueError("paired_covariate_df is not supported with phenotype groups.")
+        if not paired_covariate_df.columns.equals(phenotype_df.columns):
+            missing_s = [s_ for s_ in phenotype_df.columns if s_ not in paired_covariate_df.columns]
+            if missing_s:
+                raise ValueError("paired_covariate_df must be phenotypes x samples with the "
+                                 f"phenotype samples (missing {len(missing_s)}, first: {missing_s[:5]})")
+            paired_covariate_df = paired_covariate_df[phenotype_df.columns]
+        unknown = paired_covariate_df.index.difference(phenotype_df.index)
+        if len(unknown):
+            raise ValueError(f"paired_covariate_df has {len(unknown)} phenotypes not in "
+                             f"phenotype_df (first: {list(unknown[:5])})")
+        logger.write("  * including phenotype-specific covariate")
+        paired_rows = {
+            pid: to_device_tensor(paired_covariate_df.loc[pid].to_numpy(np.float32), device,
+                                  dtype=torch.float32)
+            for pid in paired_covariate_df.index
+        }
+
     if group_s is None:
         if "phenotype_id" not in signif_df.columns:
             raise ValueError("cis_df must contain 'phenotype_id' for ungrouped mapping.")
@@ -1771,6 +1808,7 @@ def map_independent(
                 ancestry_model=ancestry_model,
                 n_ancestries=n_anc,
                 interaction_covariate_t=interaction_cov_t,
+                paired_rows=paired_rows,
             )
     else:
         if "group_id" not in signif_df.columns:

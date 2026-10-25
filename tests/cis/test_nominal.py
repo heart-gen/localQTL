@@ -273,11 +273,16 @@ def test_dosage_model_argument_validation(toy_panel_2anc, covariates_df):
                     interaction_covariate=covariates_df.columns[0], **_dosage_common(d))
     with pytest.raises(ValueError, match="Unknown ancestry_model"):
         map_nominal(haplotypes=d["panel"], ancestry_model="bogus", **_dosage_common(d))
+    # map_permutations supports the dosage model (it calibrates the joint F);
+    # map_independent does not.
+    from src.localqtl.cis.independent import map_independent
     with pytest.raises(ValueError, match="only implemented for map_nominal"):
-        map_permutations(genotype_df=d["genotype_df"], variant_df=d["variant_df"],
-                         phenotype_df=d["phenotype_df"], phenotype_pos_df=d["phenotype_pos_df"],
-                         haplotypes=d["panel"], ancestry_model="dosage", device="cpu", nperm=4,
-                         logger=SimpleLogger(verbose=False))
+        map_independent(genotype_df=d["genotype_df"], variant_df=d["variant_df"],
+                        cis_df=pd.DataFrame({"phenotype_id": ["geneA"], "variant_id": ["v0"],
+                                             "pval_beta": [1e-6], "qval": [1e-6]}),
+                        phenotype_df=d["phenotype_df"], phenotype_pos_df=d["phenotype_pos_df"],
+                        haplotypes=d["panel"], ancestry_model="dosage", device="cpu", nperm=4,
+                        logger=SimpleLogger(verbose=False))
 
 
 # ---------------------------------------------------------------------------

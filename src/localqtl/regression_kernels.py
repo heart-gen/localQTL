@@ -15,6 +15,7 @@ __all__ = [
     "run_batch_interaction_regression",
     "run_batch_regression_with_permutations",
     "perm_chunk_r2", "prep_ctx_for_perm",
+    "prep_ctx_for_dosage_perm", "dosage_fstat", "dosage_perm_chunk_fmax",
 ]
 
 _DEFAULT_MIXED_PRECISION = os.environ.get("LOCALQTL_MIXED_PRECISION", "fp16").lower()
@@ -435,6 +436,81 @@ def run_batch_dosage_regression(
         "fstat": fstat,
         "dof": dof,
     }
+
+
+@torch.no_grad()
+def prep_ctx_for_dosage_perm(D: torch.Tensor, L: torch.Tensor | None, k_eff: int = 0):
+    """
+    Precompute the phenotype-independent parts of the ancestry-specific dosage
+    model, so that permutations cost a few batched matmuls per chunk.
+
+    The design of variant ``v`` is ``X_v = [D_v, L_v]`` as in
+    :func:`run_batch_dosage_regression`; ``(X'X)^-1`` and the inverse of its
+    leading ``K x K`` block do not depend on ``y`` and are built once here.
+
+    Parameters
+    ----------
+    D : torch.Tensor
+        (m, n, K) ancestry-specific dosages, residualized and centred.
+    L : torch.Tensor, optional
+        (m, n, q) local-ancestry main-effect columns.
+    k_eff : int
+        Degrees of freedom consumed by centring and the projected-out
+        covariates; ``dof = n - k_eff - p``.
+
+    Returns
+    -------
+    dict
+        ``X`` (m, n, p), ``A`` = ``(X'X)^-1`` (m, p, p), ``M`` =
+        ``inv(A[:, :K, :K])`` (m, K, K), ``dof``, ``K``, ``p``.
+    """
+    X = D if L is None or L.shape[2] == 0 else torch.cat([D, L], dim=2)
+    m, n, p = X.shape
+    K = int(D.shape[2])
+    XtX = X.transpose(1, 2) @ X
+    diag_scale = torch.diagonal(XtX, dim1=1, dim2=2).abs().mean(dim=1, keepdim=True)
+    eps = 1e-6 * diag_scale.unsqueeze(-1)
+    I_p = torch.eye(p, device=X.device, dtype=XtX.dtype).unsqueeze(0)
+    A = torch.linalg.inv(XtX + eps * I_p)
+    A_kk = A[:, :K, :K]
+    I_k = torch.eye(K, device=X.device, dtype=A.dtype).unsqueeze(0)
+    ridge_k = 1e-12 * torch.diagonal(A_kk, dim1=1, dim2=2).mean(dim=1).view(-1, 1, 1)
+    M = torch.linalg.inv(A_kk + ridge_k * I_k)
+    return {"X": X, "A": A, "M": M, "dof": max(n - int(k_eff) - p, 1), "K": K, "p": p}
+
+
+@torch.no_grad()
+def _dosage_fstat_block(ctx: dict, Y: torch.Tensor) -> torch.Tensor:
+    """Joint-Wald F of every variant against every column of ``Y`` (n, C) -> (m, C)."""
+    X, A, M, K, dof = ctx["X"], ctx["A"], ctx["M"], ctx["K"], ctx["dof"]
+    XtY = torch.einsum("mnp,nc->mpc", X, Y)            # (m, p, C)
+    B = A @ XtY                                        # (m, p, C)
+    yty = (Y * Y).sum(dim=0).unsqueeze(0)              # (1, C)
+    rss = (yty - (XtY * B).sum(dim=1)).clamp_min(1e-12)  # (m, C)
+    sigma2 = rss / dof
+    bK = B[:, :K, :]                                   # (m, K, C)
+    quad = torch.einsum("mkc,mkl,mlc->mc", bK, M, bK)  # b' A_KK^-1 b
+    return quad / (K * sigma2).clamp_min(1e-30)
+
+
+@torch.no_grad()
+def dosage_fstat(ctx: dict, y: torch.Tensor) -> torch.Tensor:
+    """Per-variant joint F statistic (m,) of the dosage model for one phenotype."""
+    return _dosage_fstat_block(ctx, y.reshape(-1, 1)).squeeze(-1)
+
+
+@torch.no_grad()
+def dosage_perm_chunk_fmax(ctx: dict, y_perm: torch.Tensor) -> torch.Tensor:
+    """
+    Maximum joint F across variants for each permuted phenotype (``y_perm``
+    ``(n, chunk)``) -> ``(chunk,)``.
+
+    The maximum F is the permutation statistic: for fixed ``(K, dof)`` the
+    joint p-value is monotone in F, so the largest F is the smallest p-value
+    of the window.
+    """
+    F = _dosage_fstat_block(ctx, y_perm)
+    return torch.nan_to_num(F, nan=0.0, posinf=0.0, neginf=0.0).amax(dim=0).to(torch.float32)
 
 
 def _is_cuda(*tensors):

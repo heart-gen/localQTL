@@ -21,6 +21,7 @@ cis-QTL mapping
 .. automodule:: localqtl.cis.nominal
 .. automodule:: localqtl.cis.permutations
 .. automodule:: localqtl.cis.independent
+.. automodule:: localqtl.cis.conditional
 .. automodule:: localqtl.cis.mapper
 .. automodule:: localqtl.cis.postproc
 .. automodule:: localqtl.cis.common

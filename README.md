@@ -169,8 +169,78 @@ With a hard-call panel (`.msp.tsv`) the same model reduces to the classic
 ancestry-specific genotype regression. Note that substituting posterior
 expectations for the unknown haplotype ancestries does not propagate that
 uncertainty into the standard errors; joint-likelihood or multiple-imputation
-estimation is future work. `ancestry_model="dosage"` is currently available
-for `map_nominal` only (no permutations, no `interaction_covariate`).
+estimation is future work.
+
+`map_permutations(ancestry_model="dosage")` calibrates the scan: the
+per-variant statistic is the joint Wald F over the K ancestry effects and the
+permutation statistic is its maximum over the cis-window, so `pval_perm` and
+`pval_beta` apply to the *joint* signal while the per-ancestry columns are
+reported for the lead variant. Because the joint test is an F test rather
+than a correlation, the Beta approximation is fitted to the permuted minimum
+p-values directly; `true_dof` is therefore the residual degrees of freedom and
+`pval_true_dof` is `NaN`. The dosage model is available in `map_nominal` and
+`map_permutations` (and in the `cis` / `cis_nominal` CLI modes), but not with
+`interaction_covariate`, `paired_covariate_df` or `map_independent`.
+
+```python
+perm_df = mapper.map_permutations(nperm=10_000, ancestry_model="dosage", min_ancestry_ac=10)
+```
+
+With `group_s` the maximum is taken over the phenotypes of a group as well as
+over the window, which gives one calibrated row per group — the natural layout
+for isoform- or splicing-event phenotypes grouped by gene. This is valid
+because every phenotype of a group shares samples, covariates, window and K,
+so the residual degrees of freedom are identical and the largest F is the
+smallest joint p-value. Permutations are drawn once per group and applied to
+all of its phenotypes, which preserves the within-group correlation.
+
+```python
+perm_df = map_permutations(..., ancestry_model="dosage", group_s=isoform_to_gene)
+```
+
+Like the correlation-based grouped scan it mirrors (and like FastQTL and
+tensorQTL), the grouped permutation null is built by permuting
+covariate-residualized phenotypes, which is an approximation; taking a maximum
+over the group amplifies it slightly. In a null study (50 designs x 60 groups,
+80 samples, 12 variants, 500 permutations) the fraction of `pval_perm` below
+0.05 rose from 0.059 at group size 1 to 0.070 at size 3 and 0.073 at size 5;
+the same study on `ancestry_model="main"` gave 0.056, 0.062 and 0.064. Treat
+grouped p-values from large groups as mildly anti-conservative in both models.
+
+### Ancestry-specific effects at known signals
+
+`map_conditional_dosage` re-fits signals that have already been selected --
+typically the output of `map_independent`, or the lead rows of
+`map_permutations` -- with the ancestry-specific dosage model, conditioning on
+the other signals of the same phenotype. It reads only the listed variants, so
+it is cheap enough for a prioritised locus list, and it needs no permutations
+because selection has already happened.
+
+```python
+from localqtl.cis import map_conditional_dosage
+
+cond_df = map_conditional_dosage(
+    genotype_df, variant_df, phenotype_df, phenotype_pos_df,
+    signals_df=indep_df[["phenotype_id", "variant_id", "rank"]],
+    haplotypes=panel, covariates_df=covariates_df,
+    condition_on="genotype",      # or "dosage" / "none"
+)
+```
+
+`condition_on` chooses what to project out for the *other* signals of a
+phenotype: `"genotype"` (default) their pooled dosage, which matches how
+`map_independent` defined them and costs one degree of freedom each;
+`"dosage"` their K ancestry-specific dosages, so an ancestry-differential
+secondary signal cannot leak into the variant being tested, at K degrees of
+freedom each; `"none"` fits every signal marginally. The output carries the
+per-ancestry columns of the dosage model (`slope_anc{k}`, `pval_joint`,
+`pval_diff_anc{i}_anc{j}`, the allele statistics) plus `n_conditioned` and
+`dof`. The p-values are conditional nominal p-values at variants chosen on the
+same data, so they answer "how different are the ancestry-specific effects of
+this established signal", not "does the signal exist".
+
+The CLI exposes this as `--mode cis_conditional`, taking the signals through
+`--cis_output` and writing `<prefix>.cis_conditional_qtl.txt.gz`.
 
 ### Covariate interaction scans
 
@@ -213,8 +283,10 @@ enter as main effects.
 
 Phenotype-specific covariates (one extra covariate per phenotype, e.g. a local
 PEER factor) are passed as `paired_covariate_df` (phenotypes x samples) to
-`map_nominal` and `map_permutations`; phenotypes absent from it use the shared
-covariates only.
+`map_nominal`, `map_permutations`, `map_independent` and `susie.map`, and on
+the command line with `--paired_covariate`. Phenotypes absent from the table
+use the shared covariates only, so one call can mix both. Grouped phenotypes
+are not supported.
 
 For analyses that combine nominal scans, permutations, and independent signal
 calling, the `CisMapper` class offers a thin object-oriented façade:

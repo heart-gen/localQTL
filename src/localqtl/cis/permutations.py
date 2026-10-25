@@ -10,12 +10,16 @@ except Exception:
 
 from ..utils import SimpleLogger, subseed
 from .._torch_utils import to_device_tensor
-from ..stats import beta_approx_pval, get_t_pval
+from ..stats import beta_approx_pval, get_f_pval, get_t_pval, _beta_mle_on_p
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
-from ..preproc import impute_mean_and_filter, allele_stats, filter_by_maf
+from ..preproc import (impute_mean_and_filter, allele_stats, filter_by_maf,
+                       ancestry_allele_stats)
 from ..regression_kernels import (
     run_batch_regression,
-    run_batch_regression_with_permutations
+    run_batch_dosage_regression,
+    prep_ctx_for_dosage_perm,
+    dosage_fstat,
+    dosage_perm_chunk_fmax,
 )
 from ._permute import PermutationStream, compute_perm_r2_max
 from ._buffer import (
@@ -29,9 +33,11 @@ from .common import (
     validate_ancestry_model,
     project_interaction,
     residualize_batch,
+    residualize_batch_dosage,
     residualize_batch_interaction,
     prepare_interaction_covariate,
 )
+from .nominal import _dosage_columns, _n_ancestries
 
 __all__ = [
     "map_permutations",
@@ -55,6 +61,58 @@ def _nanmax(x: torch.Tensor, dim: int):
     replace = torch.full_like(x, float("-inf"))
     return torch.max(torch.where(torch.isnan(x), replace, x), dim=dim)
 
+def _dosage_lead_values(res: dict, ix: int, anc_stats: dict | None, dof: int,
+                        K: int, min_ancestry_ac: float) -> dict[str, float]:
+    """Per-ancestry dosage columns of the lead variant ``ix`` (see ``_dosage_columns``)."""
+    b = res["betas"][ix].detach().cpu().numpy().astype(np.float64)
+    se = res["ses"][ix].detach().cpu().numpy().astype(np.float64)
+    t = res["tstats"][ix].detach().cpu().numpy().astype(np.float64)
+    cov = res["cov"][ix].detach().cpu().numpy().astype(np.float64)
+    masked = None
+    if min_ancestry_ac and min_ancestry_ac > 0 and anc_stats is not None:
+        masked = anc_stats["ma_count"][ix] < float(min_ancestry_ac)
+        b = np.where(masked, np.nan, b)
+        se = np.where(masked, np.nan, se)
+        t = np.where(masked, np.nan, t)
+    out: dict[str, float] = {}
+    for k in range(K):
+        out[f"slope_anc{k}"] = float(b[k])
+        out[f"slope_se_anc{k}"] = float(se[k])
+        out[f"tstat_anc{k}"] = float(t[k])
+        out[f"pval_anc{k}"] = float(get_t_pval(t[k], dof))
+    fstat = float(res["fstat"][ix].item())
+    out["fstat_joint"] = fstat
+    out["pval_joint"] = float(get_f_pval(fstat, K, dof))
+    for i in range(K):
+        for j in range(i + 1, K):
+            var = cov[i, i] + cov[j, j] - 2.0 * cov[i, j]
+            z = (b[i] - b[j]) / np.sqrt(max(var, 1e-30))
+            if masked is not None and (masked[i] or masked[j]):
+                z = np.nan
+            out[f"z_diff_anc{i}_anc{j}"] = float(z)
+            out[f"pval_diff_anc{i}_anc{j}"] = float(get_t_pval(z, dof))
+    if anc_stats is not None:
+        for k in range(K):
+            out[f"an_anc{k}"] = float(anc_stats["an"][ix, k])
+            out[f"ac_anc{k}"] = float(anc_stats["ac"][ix, k])
+            out[f"af_anc{k}"] = float(anc_stats["af"][ix, k])
+            out[f"ma_count_anc{k}"] = float(anc_stats["ma_count"][ix, k])
+    return out
+
+
+def _beta_fit_on_minp(minp_null: np.ndarray, p_obs: float) -> tuple[float, float, float]:
+    """
+    Beta approximation of the per-phenotype minimum p-value (FastQTL's
+    argument applied directly to p-values, as the joint dosage test is an
+    F test rather than a correlation).  Returns ``(pval_beta, shape1, shape2)``.
+    """
+    from scipy import stats as _st
+    a, b = _beta_mle_on_p(np.asarray(minp_null, dtype=np.float64))
+    if not (np.isfinite(a) and np.isfinite(b)):
+        return float("nan"), float("nan"), float("nan")
+    return float(_st.beta.cdf(p_obs, a, b)), float(a), float(b)
+
+
 def _estimate_rows(ig, chrom: str | None, grouped: bool = False) -> int:
     if chrom is None:
         if grouped and getattr(ig, "group_s", None) is not None:
@@ -77,6 +135,7 @@ def _run_permutation_core(
         n_ancestries: int | None = None,
         interaction_covariate_t: torch.Tensor | None = None,
         paired_ctx: dict | None = None,
+        min_ancestry_ac: float = 0.0,
 ) -> pd.DataFrame:
     """
     One top association per phenotype with empirical permutation p-value (no grouping).
@@ -94,6 +153,10 @@ def _run_permutation_core(
     if ancestry_model == "interaction" and n_ancestries is not None and n_ancestries > 0:
         interaction_columns = _interaction_columns(int(n_ancestries))
         expected_columns.extend(interaction_columns)
+    dosage_columns: list[str] = []
+    if ancestry_model == "dosage" and n_ancestries is not None and n_ancestries > 0:
+        dosage_columns = _dosage_columns(int(n_ancestries))
+        expected_columns.extend(dosage_columns)
     dtype_map = {
         "phenotype_id": object,
         "variant_id": object,
@@ -115,9 +178,8 @@ def _run_permutation_core(
         "true_dof": np.int32,
         "pval_true_dof": np.float32,
     }
-    if interaction_columns:
-        for col in interaction_columns:
-            dtype_map[col] = np.float32
+    for col in interaction_columns + dosage_columns:
+        dtype_map[col] = np.float32
     buffers = allocate_result_buffers(expected_columns, dtype_map, _estimate_rows(ig, chrom))
     cursor = 0
     processed = 0
@@ -171,7 +233,9 @@ def _run_permutation_core(
         v_idx = v_idx[keep_mono.detach().cpu().numpy()]
         if H_t is not None:
             H_t = H_t[keep_mono]
-            if H_t.shape[2] > 1:
+            # The dosage model needs every ancestry channel (sum_k D_k = G);
+            # the other models drop the last one for identifiability.
+            if H_t.shape[2] > 1 and ancestry_model != "dosage":
                 H_t = H_t[:, :, :-1]
 
         # Optional MAF filter on the *current* (already-imputed/trimmed) G_t
@@ -195,8 +259,18 @@ def _run_permutation_core(
 
         # Residualize y/G/H against covariates
         interaction_mode = ancestry_model == "interaction" and H_t is not None
+        dosage_mode = ancestry_model == "dosage" and H_t is not None
         covar_interaction = interaction_covariate_t is not None
-        if interaction_mode:
+        anc_stats_np: dict[str, np.ndarray] | None = None
+        if dosage_mode:
+            # per-ancestry allele statistics from the raw (imputed) block
+            anc_stats_np = {k: v.detach().cpu().numpy().astype(np.float32)
+                            for k, v in ancestry_allele_stats(G_t, H_t).items()}
+            y_resid_t, D_resid, L_resid = residualize_batch_dosage(
+                y_t, G_t, H_t, rez_b, center=True, group=False
+            )
+            G_resid, H_resid = G_t, None
+        elif interaction_mode:
             y_resid_t, G_resid, H_resid, I_resid = residualize_batch_interaction(
                 y_t, G_t, H_t, rez_b, center=True, group=False
             )
@@ -206,7 +280,57 @@ def _run_permutation_core(
         # Compute effective covariate rank for DoF
         k_eff = rez_b.k_eff if rez_b is not None else 1
 
-        if interaction_mode:
+        dosage_vals: dict[str, float] | None = None
+        if dosage_mode:
+            # Joint Wald F over the K ancestry effects is the per-variant
+            # statistic; the permutation statistic is its maximum over the
+            # window (equivalently the smallest joint p-value).
+            K = int(D_resid.shape[2])
+            ctx = prep_ctx_for_dosage_perm(D_resid, L_resid, k_eff=k_eff)
+            dof = int(ctx["dof"])
+            f_obs = torch.nan_to_num(dosage_fstat(ctx, y_resid_t), nan=-1.0)
+            ix = int(f_obs.argmax().item())
+            f_lead = float(f_obs[ix].item())
+            pval_nominal = float(get_f_pval(f_lead, K, dof))
+            r2_nominal = float(K * f_lead / (K * f_lead + dof)) if f_lead > 0 else 0.0
+
+            res_full = run_batch_dosage_regression(
+                y=y_resid_t, D=D_resid, L=L_resid, k_eff=k_eff, device=device
+            )
+            dosage_vals = _dosage_lead_values(res_full, ix, anc_stats_np, dof, K, min_ancestry_ac)
+            t_arr = np.array([dosage_vals[f"tstat_anc{k}"] for k in range(K)], dtype=np.float64)
+            best_k = 0 if np.all(np.isnan(t_arr)) else int(np.nanargmax(np.abs(t_arr)))
+            beta = dosage_vals[f"slope_anc{best_k}"]
+            se = dosage_vals[f"slope_se_anc{best_k}"]
+            tval = dosage_vals[f"tstat_anc{best_k}"]
+
+            n_samples = int(y_resid_t.shape[0])
+            stream = PermutationStream(
+                n_samples=n_samples,
+                nperm=nperm,
+                device=y_resid_t.device,
+                chunk_size=max(1, int(perm_chunk)),
+                seed=subseed(seed, pid) if seed is not None else None,
+                mode=perm_indices_mode,
+            )
+            fmax_parts = []
+            for sel in stream.iter_chunks(nperm):
+                flat = sel.reshape(-1)
+                y_perm = y_resid_t.index_select(0, flat).view(sel.shape[0], n_samples).transpose(0, 1)
+                fmax_parts.append(dosage_perm_chunk_fmax(ctx, y_perm))
+            fmax_np = (torch.cat(fmax_parts).detach().cpu().numpy() if fmax_parts
+                       else np.empty(0, dtype=np.float64))
+            pval_perm = float((np.sum(fmax_np >= f_lead) + 1) / (fmax_np.size + 1))
+            if beta_approx and fmax_np.size:
+                minp_null = get_f_pval(fmax_np, K, dof)
+                pval_beta, a_hat, b_hat = _beta_fit_on_minp(minp_null, pval_nominal)
+            else:
+                pval_beta = a_hat = b_hat = np.nan
+            # The joint test is an F test, so there is no t-style effective
+            # dof to re-estimate: report the residual dof and leave p_true NaN.
+            true_dof = dof
+            p_true = np.nan
+        elif interaction_mode:
             if H_resid is None:
                 raise ValueError("interaction model requires haplotypes.")
             pH = int(H_resid.shape[2])
@@ -439,6 +563,9 @@ def _run_permutation_core(
                 row[interaction_columns[base + 1]] = slope_se_gxh[anc_idx]
                 row[interaction_columns[base + 2]] = tstat_gxh[anc_idx]
                 row[interaction_columns[base + 3]] = pval_gxh[anc_idx]
+        if dosage_mode and dosage_vals is not None:
+            for col in dosage_columns:
+                row[col] = dosage_vals.get(col, np.nan)
         write_row(buffers, cursor, row)
         cursor += 1
         processed += 1
@@ -464,6 +591,7 @@ def _run_permutation_core_group(
         ancestry_model: str | None = None,
         n_ancestries: int | None = None,
         interaction_covariate_t: torch.Tensor | None = None,
+        min_ancestry_ac: float = 0.0,
 ) -> pd.DataFrame:
     """
     Group-aware permutation mapping: returns one top association per group with empirical p-values.
@@ -485,6 +613,10 @@ def _run_permutation_core_group(
     if ancestry_model == "interaction" and n_ancestries is not None and n_ancestries > 0:
         interaction_columns = _interaction_columns(int(n_ancestries))
         expected_columns.extend(interaction_columns)
+    dosage_columns: list[str] = []
+    if ancestry_model == "dosage" and n_ancestries is not None and n_ancestries > 0:
+        dosage_columns = _dosage_columns(int(n_ancestries))
+        expected_columns.extend(dosage_columns)
     dtype_map = {
         "group_id": object,
         "group_size": np.int32,
@@ -508,9 +640,8 @@ def _run_permutation_core_group(
         "true_dof": np.int32,
         "pval_true_dof": np.float32,
     }
-    if interaction_columns:
-        for col in interaction_columns:
-            dtype_map[col] = np.float32
+    for col in interaction_columns + dosage_columns:
+        dtype_map[col] = np.float32
     buffers = allocate_result_buffers(expected_columns, dtype_map,
                                       _estimate_rows(ig, chrom, grouped=True))
     cursor = 0
@@ -543,7 +674,9 @@ def _run_permutation_core_group(
         v_idx = v_idx[keep_mono.detach().cpu().numpy()]
         if H_t is not None:
             H_t = H_t[keep_mono]
-            if H_t.shape[2] > 1:
+            # The dosage model needs every ancestry channel (sum_k D_k = G);
+            # the other models drop the last one for identifiability.
+            if H_t.shape[2] > 1 and ancestry_model != "dosage":
                 H_t = H_t[:, :, :-1]
 
         if maf_threshold and maf_threshold > 0:
@@ -571,8 +704,19 @@ def _run_permutation_core_group(
             Y_stack = Y_stack.unsqueeze(0)
 
         interaction_mode = ancestry_model == "interaction" and H_t is not None
+        dosage_mode = ancestry_model == "dosage" and H_t is not None
         covar_interaction = interaction_covariate_t is not None
-        if interaction_mode:
+        anc_stats_np: dict[str, np.ndarray] | None = None
+        D_resid = L_resid = None
+        if dosage_mode:
+            # per-ancestry allele statistics from the raw (imputed) block
+            anc_stats_np = {k: v.detach().cpu().numpy().astype(np.float32)
+                            for k, v in ancestry_allele_stats(G_t, H_t).items()}
+            Y_resid, D_resid, L_resid = residualize_batch_dosage(
+                Y_stack, G_t, H_t, rez, center=True, group=True
+            )
+            G_resid, H_resid = G_t, None
+        elif interaction_mode:
             Y_resid, G_resid, H_resid, I_resid = residualize_batch_interaction(
                 Y_stack, G_t, H_t, rez, center=True, group=True
             )
@@ -595,29 +739,179 @@ def _run_permutation_core_group(
         a_hat = float("nan")
         b_hat = float("nan")
         p_true = float("nan")
+        true_dof = float("nan")
         pval_nominal = float("nan")
+        dosage_vals: dict[str, float] | None = None
         num_var = int(G_resid.shape[0])
 
         r2_perm_global = torch.full((nperm,), -float("inf"), device=G_resid.device, dtype=torch.float32)
 
-        for j, (pid_inner, y_resid) in enumerate(zip(ids_list, Y_resid)):
-            if interaction_mode:
-                if H_resid is None:
-                    raise ValueError("interaction model requires haplotypes.")
-                pH = int(H_resid.shape[2])
-                n_anc = int(n_ancestries) if n_ancestries is not None else pH
-                H_cov = torch.cat([G_resid.unsqueeze(-1), H_resid], dim=2)
-                k_eff = rez.k_eff if rez is not None else 1
-                p_pred = 1 + int(H_cov.shape[2])
-                dof = max(int(y_resid.shape[0]) - int(k_eff) - int(p_pred), 1)
+        if dosage_mode:
+            # The joint Wald F over the K ancestry effects is the per-variant
+            # statistic; the permutation statistic is its maximum over the
+            # window *and* over the phenotypes of the group.  Every phenotype
+            # of a group shares samples, covariates, window and K, so the
+            # residual dof is identical and the largest F is the smallest
+            # joint p-value.  ``ctx`` depends only on the (shared) residualized
+            # design, so it is built once and reused for every phenotype and
+            # every permutation chunk.
+            K = int(D_resid.shape[2])
+            k_eff_g = rez.k_eff if rez is not None else 1
+            ctx = prep_ctx_for_dosage_perm(D_resid, L_resid, k_eff=k_eff_g)
+            dof = int(ctx["dof"])
+            n_samples_g = int(D_resid.shape[1])
+            best_f_val = -float("inf")
+            f_perm_global = None
 
-                anc_results = []
-                r2_perm_pheno = None
-                best_r2_pheno = -float("inf")
-                best_ix_var_pheno = -1
-                best_anc_pheno = -1
+            for j, y_resid in enumerate(Y_resid):
+                f_obs = torch.nan_to_num(dosage_fstat(ctx, y_resid), nan=-1.0)
+                f_max_t, ix_t = torch.max(f_obs, dim=0)
+                f_max = float(f_max_t.item())
+                if f_max > best_f_val:
+                    best_f_val = f_max
+                    best_ix_var = int(ix_t.item())
+                    best_ix_pheno = int(j)
+                # Every phenotype of the group is permuted with the same seed,
+                # so the maximum across the group preserves the within-group
+                # correlation structure (as in the correlation-based path).
+                stream = PermutationStream(
+                    n_samples=n_samples_g,
+                    nperm=nperm,
+                    device=y_resid.device,
+                    chunk_size=max(1, int(perm_chunk)),
+                    seed=perm_seed_base,
+                    mode=perm_indices_mode,
+                )
+                fmax_parts = []
+                for sel in stream.iter_chunks(nperm):
+                    flat = sel.reshape(-1)
+                    y_perm = y_resid.index_select(0, flat).view(
+                        sel.shape[0], n_samples_g).transpose(0, 1)
+                    fmax_parts.append(dosage_perm_chunk_fmax(ctx, y_perm))
+                if fmax_parts:
+                    f_perm_pheno = torch.cat(fmax_parts)
+                    f_perm_global = (f_perm_pheno if f_perm_global is None
+                                     else torch.maximum(f_perm_global, f_perm_pheno))
 
-                for k in range(pH):
+            if best_ix_var >= 0:
+                best_dof = dof
+                best_r2_val = (float(K * best_f_val / (K * best_f_val + dof))
+                               if best_f_val > 0 else 0.0)
+                pval_nominal = float(get_f_pval(best_f_val, K, dof))
+                fmax_np = (f_perm_global.detach().cpu().numpy()
+                           if f_perm_global is not None else np.empty(0, dtype=np.float64))
+                pval_perm = float((np.sum(fmax_np >= best_f_val) + 1) / (fmax_np.size + 1))
+                if beta_approx and fmax_np.size:
+                    pval_beta, a_hat, b_hat = _beta_fit_on_minp(
+                        get_f_pval(fmax_np, K, dof), pval_nominal
+                    )
+                else:
+                    pval_beta = a_hat = b_hat = np.nan
+                # The joint test is an F test, so there is no t-style effective
+                # dof to re-estimate: report the residual dof and leave p_true NaN.
+                true_dof = dof
+                p_true = np.nan
+
+                res_full = run_batch_dosage_regression(
+                    y=Y_resid[best_ix_pheno], D=D_resid, L=L_resid,
+                    k_eff=k_eff_g, device=device,
+                )
+                dosage_vals = _dosage_lead_values(
+                    res_full, best_ix_var, anc_stats_np, dof, K, min_ancestry_ac
+                )
+                t_arr = np.array([dosage_vals[f"tstat_anc{k}"] for k in range(K)],
+                                 dtype=np.float64)
+                best_k = 0 if np.all(np.isnan(t_arr)) else int(np.nanargmax(np.abs(t_arr)))
+                best_beta = dosage_vals[f"slope_anc{best_k}"]
+                best_se = dosage_vals[f"slope_se_anc{best_k}"]
+                best_t = dosage_vals[f"tstat_anc{best_k}"]
+        else:
+            for j, (pid_inner, y_resid) in enumerate(zip(ids_list, Y_resid)):
+                if interaction_mode:
+                    if H_resid is None:
+                        raise ValueError("interaction model requires haplotypes.")
+                    pH = int(H_resid.shape[2])
+                    n_anc = int(n_ancestries) if n_ancestries is not None else pH
+                    H_cov = torch.cat([G_resid.unsqueeze(-1), H_resid], dim=2)
+                    k_eff = rez.k_eff if rez is not None else 1
+                    p_pred = 1 + int(H_cov.shape[2])
+                    dof = max(int(y_resid.shape[0]) - int(k_eff) - int(p_pred), 1)
+
+                    anc_results = []
+                    r2_perm_pheno = None
+                    best_r2_pheno = -float("inf")
+                    best_ix_var_pheno = -1
+                    best_anc_pheno = -1
+
+                    for k in range(pH):
+                        stream = PermutationStream(
+                            n_samples=int(y_resid.shape[0]),
+                            nperm=nperm,
+                            device=y_resid.device,
+                            chunk_size=max(1, int(perm_chunk)),
+                            seed=perm_seed_base,
+                            mode=perm_indices_mode,
+                        )
+                        betas, ses, tstats, r2_nominal_vec, r2_perm_vec = compute_perm_r2_max(
+                            y_resid=y_resid,
+                            G_resid=I_resid[:, :, k],
+                            H_resid=H_cov,
+                            k_eff=k_eff,
+                            perm_stream=stream,
+                            max_permutations=nperm,
+                            return_nominal=True,
+                            mixed_precision=mixed_precision,
+                        )
+                        if r2_nominal_vec is None:
+                            r2_nominal_vec = torch.zeros(G_resid.shape[0], device=y_resid.device, dtype=torch.float32)
+                        r2_nominal_vec = torch.nan_to_num(r2_nominal_vec, nan=-1.0)
+                        r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
+                        ix = int(ix_t.item())
+                        anc_results.append((betas, ses, tstats))
+
+                        if r2_max_t > best_r2_pheno:
+                            best_r2_pheno = float(r2_max_t.item())
+                            best_ix_var_pheno = ix
+                            best_anc_pheno = k
+
+                        r2_perm_pheno = r2_perm_vec if r2_perm_pheno is None else torch.maximum(r2_perm_pheno, r2_perm_vec)
+
+                    if best_ix_var_pheno >= 0 and best_r2_pheno > best_r2_val:
+                        best_r2_val = float(best_r2_pheno)
+                        best_ix_var = int(best_ix_var_pheno)
+                        best_ix_pheno = int(j)
+                        best_dof = int(dof)
+                        # Store per-ancestry stats for this phenotype
+                        slope_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
+                        slope_se_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
+                        tstat_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
+                        pval_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
+                        for k in range(pH):
+                            betas, ses, tstats = anc_results[k]
+                            slope_gxh[k] = float(betas[best_ix_var, 0].item())
+                            slope_se_gxh[k] = float(ses[best_ix_var, 0].item())
+                            tstat_gxh[k] = float(tstats[best_ix_var, 0].item())
+                            pval_gxh[k] = float(get_t_pval(tstat_gxh[k], dof))
+                        best_beta = float(slope_gxh[best_anc_pheno])
+                        best_se = float(slope_se_gxh[best_anc_pheno])
+                        best_t = float(tstat_gxh[best_anc_pheno])
+
+                    r2_perm_global = torch.maximum(r2_perm_global, r2_perm_pheno)
+                elif covar_interaction:
+                    c_t = interaction_covariate_t
+                    if c_t.device != G_resid.device:
+                        c_t = c_t.to(G_resid.device)
+                    I_t = project_interaction(G_t * c_t, rez)
+                    c_res = project_interaction(c_t.unsqueeze(0), rez)[0]
+                    c_rep = c_res.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
+                    if H_resid is None:
+                        H_cov = torch.cat([G_resid.unsqueeze(-1), c_rep], dim=2)
+                    else:
+                        H_cov = torch.cat([G_resid.unsqueeze(-1), H_resid, c_rep], dim=2)
+                    k_eff = rez.k_eff if rez is not None else 1
+                    p_pred = 1 + int(H_cov.shape[2])
+                    dof = max(int(y_resid.shape[0]) - int(k_eff) - int(p_pred), 1)
+
                     stream = PermutationStream(
                         n_samples=int(y_resid.shape[0]),
                         nperm=nperm,
@@ -628,7 +922,7 @@ def _run_permutation_core_group(
                     )
                     betas, ses, tstats, r2_nominal_vec, r2_perm_vec = compute_perm_r2_max(
                         y_resid=y_resid,
-                        G_resid=I_resid[:, :, k],
+                        G_resid=I_t,
                         H_resid=H_cov,
                         k_eff=k_eff,
                         perm_stream=stream,
@@ -641,131 +935,64 @@ def _run_permutation_core_group(
                     r2_nominal_vec = torch.nan_to_num(r2_nominal_vec, nan=-1.0)
                     r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
                     ix = int(ix_t.item())
-                    anc_results.append((betas, ses, tstats))
-
-                    if r2_max_t > best_r2_pheno:
-                        best_r2_pheno = float(r2_max_t.item())
-                        best_ix_var_pheno = ix
-                        best_anc_pheno = k
-
-                    r2_perm_pheno = r2_perm_vec if r2_perm_pheno is None else torch.maximum(r2_perm_pheno, r2_perm_vec)
-
-                if best_ix_var_pheno >= 0 and best_r2_pheno > best_r2_val:
-                    best_r2_val = float(best_r2_pheno)
-                    best_ix_var = int(best_ix_var_pheno)
-                    best_ix_pheno = int(j)
-                    best_dof = int(dof)
-                    # Store per-ancestry stats for this phenotype
-                    slope_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
-                    slope_se_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
-                    tstat_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
-                    pval_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
-                    for k in range(pH):
-                        betas, ses, tstats = anc_results[k]
-                        slope_gxh[k] = float(betas[best_ix_var, 0].item())
-                        slope_se_gxh[k] = float(ses[best_ix_var, 0].item())
-                        tstat_gxh[k] = float(tstats[best_ix_var, 0].item())
-                        pval_gxh[k] = float(get_t_pval(tstat_gxh[k], dof))
-                    best_beta = float(slope_gxh[best_anc_pheno])
-                    best_se = float(slope_se_gxh[best_anc_pheno])
-                    best_t = float(tstat_gxh[best_anc_pheno])
-
-                r2_perm_global = torch.maximum(r2_perm_global, r2_perm_pheno)
-            elif covar_interaction:
-                c_t = interaction_covariate_t
-                if c_t.device != G_resid.device:
-                    c_t = c_t.to(G_resid.device)
-                I_t = project_interaction(G_t * c_t, rez)
-                c_res = project_interaction(c_t.unsqueeze(0), rez)[0]
-                c_rep = c_res.unsqueeze(0).expand(G_resid.shape[0], -1).unsqueeze(-1)
-                if H_resid is None:
-                    H_cov = torch.cat([G_resid.unsqueeze(-1), c_rep], dim=2)
+                    t_g = tstats[:, 0].double()
+                    if r2_max_t > best_r2_val:
+                        best_r2_val = float(r2_max_t.item())
+                        best_ix_var = ix
+                        best_ix_pheno = j
+                        best_beta = float(betas[ix, 0].item())
+                        best_se = float(ses[ix, 0].item())
+                        best_t = float(t_g[ix].item())
+                        best_dof = int(dof)
+                    r2_perm_global = torch.maximum(r2_perm_global, r2_perm_vec)
                 else:
-                    H_cov = torch.cat([G_resid.unsqueeze(-1), H_resid, c_rep], dim=2)
-                k_eff = rez.k_eff if rez is not None else 1
-                p_pred = 1 + int(H_cov.shape[2])
-                dof = max(int(y_resid.shape[0]) - int(k_eff) - int(p_pred), 1)
-
-                stream = PermutationStream(
-                    n_samples=int(y_resid.shape[0]),
-                    nperm=nperm,
-                    device=y_resid.device,
-                    chunk_size=max(1, int(perm_chunk)),
-                    seed=perm_seed_base,
-                    mode=perm_indices_mode,
-                )
-                betas, ses, tstats, r2_nominal_vec, r2_perm_vec = compute_perm_r2_max(
-                    y_resid=y_resid,
-                    G_resid=I_t,
-                    H_resid=H_cov,
-                    k_eff=k_eff,
-                    perm_stream=stream,
-                    max_permutations=nperm,
-                    return_nominal=True,
-                    mixed_precision=mixed_precision,
-                )
-                if r2_nominal_vec is None:
-                    r2_nominal_vec = torch.zeros(G_resid.shape[0], device=y_resid.device, dtype=torch.float32)
-                r2_nominal_vec = torch.nan_to_num(r2_nominal_vec, nan=-1.0)
-                r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
-                ix = int(ix_t.item())
-                t_g = tstats[:, 0].double()
-                if r2_max_t > best_r2_val:
-                    best_r2_val = float(r2_max_t.item())
-                    best_ix_var = ix
-                    best_ix_pheno = j
-                    best_beta = float(betas[ix, 0].item())
-                    best_se = float(ses[ix, 0].item())
-                    best_t = float(t_g[ix].item())
-                    best_dof = int(dof)
-                r2_perm_global = torch.maximum(r2_perm_global, r2_perm_vec)
-            else:
-                stream = PermutationStream(
-                    n_samples=int(y_resid.shape[0]),
-                    nperm=nperm,
-                    device=y_resid.device,
-                    chunk_size=max(1, int(perm_chunk)),
-                    seed=perm_seed_base,
-                    mode=perm_indices_mode,
-                )
-                betas, ses, tstats, r2_nominal_vec, r2_perm_vec = compute_perm_r2_max(
-                    y_resid=y_resid,
-                    G_resid=G_resid,
-                    H_resid=H_resid,
-                    k_eff=rez.k_eff if rez is not None else 1,
-                    perm_stream=stream,
-                    max_permutations=nperm,
-                    return_nominal=True,
-                    mixed_precision=mixed_precision,
-                )
-                p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
-                dof = max(int(y_resid.shape[0]) - int(p_pred) - (rez.k_eff if rez is not None else 1), 1)
-                r2_nominal_vec = torch.nan_to_num(r2_nominal_vec, nan=-1.0)
-                r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
-                ix = int(ix_t.item())
-                t_g = tstats[:, 0].double()
-                if r2_max_t > best_r2_val:
-                    best_r2_val = float(r2_max_t.item())
-                    best_ix_var = ix
-                    best_ix_pheno = j
-                    best_beta = float(betas[ix, 0].item())
-                    best_se = float(ses[ix, 0].item())
-                    best_t = float(t_g[ix].item())
-                    best_dof = int(dof)
-                r2_perm_global = torch.maximum(r2_perm_global, r2_perm_vec)
+                    stream = PermutationStream(
+                        n_samples=int(y_resid.shape[0]),
+                        nperm=nperm,
+                        device=y_resid.device,
+                        chunk_size=max(1, int(perm_chunk)),
+                        seed=perm_seed_base,
+                        mode=perm_indices_mode,
+                    )
+                    betas, ses, tstats, r2_nominal_vec, r2_perm_vec = compute_perm_r2_max(
+                        y_resid=y_resid,
+                        G_resid=G_resid,
+                        H_resid=H_resid,
+                        k_eff=rez.k_eff if rez is not None else 1,
+                        perm_stream=stream,
+                        max_permutations=nperm,
+                        return_nominal=True,
+                        mixed_precision=mixed_precision,
+                    )
+                    p_pred = 1 + (H_resid.shape[2] if H_resid is not None else 0)
+                    dof = max(int(y_resid.shape[0]) - int(p_pred) - (rez.k_eff if rez is not None else 1), 1)
+                    r2_nominal_vec = torch.nan_to_num(r2_nominal_vec, nan=-1.0)
+                    r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
+                    ix = int(ix_t.item())
+                    t_g = tstats[:, 0].double()
+                    if r2_max_t > best_r2_val:
+                        best_r2_val = float(r2_max_t.item())
+                        best_ix_var = ix
+                        best_ix_pheno = j
+                        best_beta = float(betas[ix, 0].item())
+                        best_se = float(ses[ix, 0].item())
+                        best_t = float(t_g[ix].item())
+                        best_dof = int(dof)
+                    r2_perm_global = torch.maximum(r2_perm_global, r2_perm_vec)
 
         if best_ix_var >= 0:
-            pval_perm = (
-                (r2_perm_global >= torch.tensor(best_r2_val, device=r2_perm_global.device)).sum().add_(1).float() / (r2_perm_global.numel() + 1)
-            ).item()
-            r2_perm_np = r2_perm_global.detach().cpu().numpy()
-            if beta_approx:
-                pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
-                    r2_perm_np, best_r2_val, dof_init=best_dof
-                )
-            else:
-                pval_beta = a_hat = b_hat = true_dof = p_true = np.nan
-            pval_nominal = float(get_t_pval(best_t, best_dof))
+            if not dosage_mode:
+                pval_perm = (
+                    (r2_perm_global >= torch.tensor(best_r2_val, device=r2_perm_global.device)).sum().add_(1).float() / (r2_perm_global.numel() + 1)
+                ).item()
+                r2_perm_np = r2_perm_global.detach().cpu().numpy()
+                if beta_approx:
+                    pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
+                        r2_perm_np, best_r2_val, dof_init=best_dof
+                    )
+                else:
+                    pval_beta = a_hat = b_hat = true_dof = p_true = np.nan
+                pval_nominal = float(get_t_pval(best_t, best_dof))
         else:
             processed += 1
             continue
@@ -807,6 +1034,9 @@ def _run_permutation_core_group(
                 row[interaction_columns[base + 1]] = slope_se_gxh[anc_idx]
                 row[interaction_columns[base + 2]] = tstat_gxh[anc_idx]
                 row[interaction_columns[base + 3]] = pval_gxh[anc_idx]
+        if dosage_mode and dosage_vals is not None:
+            for col in dosage_columns:
+                row[col] = dosage_vals.get(col, np.nan)
         write_row(buffers, cursor, row)
         cursor += 1
         processed += 1
@@ -836,6 +1066,7 @@ def map_permutations(
         ancestry_model: str = "main",
         interaction_covariate: Optional[object] = None,
         paired_covariate_df: Optional[pd.DataFrame] = None,
+        min_ancestry_ac: float = 0.0,
 ) -> pd.DataFrame:
     """
     Empirical cis-QTL mapping (one top variant per phenotype) with permutations.
@@ -849,6 +1080,21 @@ def map_permutations(
     paired_covariate_df : DataFrame (phenotypes x samples), optional
         One phenotype-specific covariate added to the shared covariates for the
         phenotypes it lists (tensorQTL ``paired_covariate_df``); ungrouped only.
+    ancestry_model : {"main", "interaction", "dosage"}
+        ``"dosage"`` runs the ancestry-specific dosage scan: the per-variant
+        statistic is the joint Wald F over the K ancestry effects and the
+        permutation statistic is its maximum over the window, so ``pval_perm``
+        and ``pval_beta`` calibrate the *joint* signal.  ``pval_nominal`` is
+        then the joint p-value of the lead variant and the per-ancestry
+        columns of :func:`localqtl.cis.map_nominal` are reported for it.
+        With ``group_s`` the maximum is taken over the phenotypes of the
+        group as well, which is valid because they share the residual
+        degrees of freedom.
+    min_ancestry_ac : float, default 0
+        Dosage model: ancestries whose in-sample minor-allele count is below
+        this value get NaN effect estimates and pairwise differences in the
+        reported lead row (the joint test and the variant ranking are
+        unchanged).
     """
     device = device if device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
     torch_device = torch.device(device)
@@ -876,6 +1122,11 @@ def map_permutations(
         )
     if ancestry_model == "interaction":
         logger.write("  * ancestry model: interaction (GxH)")
+    elif ancestry_model == "dosage":
+        logger.write("  * ancestry model: ancestry-specific dosage "
+                     "(permutations calibrate the joint F over ancestries)")
+        if min_ancestry_ac and min_ancestry_ac > 0:
+            logger.write(f"  * masking ancestry effects with in-sample minor-allele count < {min_ancestry_ac:g}")
     if interaction_covariate is not None:
         logger.write("  * covariate interaction: GxC")
 
@@ -887,8 +1138,12 @@ def map_permutations(
         logger.write("  * including phenotype-specific covariate")
     validate_ancestry_model(
         ancestry_model, haplotypes=haplotypes, interaction_covariate=interaction_covariate,
-        allow_dosage=False, caller="map_permutations",
+        allow_dosage=True, caller="map_permutations",
     )
+    if ancestry_model == "dosage" and paired_covariate_df is not None:
+        raise ValueError("ancestry_model='dosage' cannot be combined with paired_covariate_df.")
+    if min_ancestry_ac and min_ancestry_ac > 0 and ancestry_model != "dosage":
+        raise ValueError("min_ancestry_ac is only meaningful with ancestry_model='dosage'.")
 
     covariates_use = covariates_df
     if isinstance(interaction_covariate, str) and covariates_df is not None:
@@ -934,7 +1189,7 @@ def map_permutations(
 
     group_mode = getattr(ig, "group_s", None) is not None
     core = _run_permutation_core_group if group_mode else _run_permutation_core
-    n_anc = int(haplotypes.shape[2]) if haplotypes is not None else None
+    n_anc = _n_ancestries(haplotypes, ancestry_model)
 
     overall_start = time.time()
     results: list[pd.DataFrame] = []
@@ -958,6 +1213,7 @@ def map_permutations(
                         ancestry_model=ancestry_model,
                         n_ancestries=n_anc,
                         interaction_covariate_t=interaction_cov_t,
+                        min_ancestry_ac=min_ancestry_ac,
                     )
                 else:
                     chrom_df = core(
@@ -972,6 +1228,7 @@ def map_permutations(
                         n_ancestries=n_anc,
                         interaction_covariate_t=interaction_cov_t,
                         paired_ctx=paired_ctx,
+                        min_ancestry_ac=min_ancestry_ac,
                     )
             results.append(chrom_df)
             if logger.verbose:

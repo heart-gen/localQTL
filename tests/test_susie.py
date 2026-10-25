@@ -168,3 +168,64 @@ class TestGetXAttributes:
         attr = get_x_attributes(X, center=False, scale=False)
         assert (attr['scaled_center'] == 0).all()
         assert (attr['scaled_scale'] == 1).all()
+
+
+# ---------------------------------------------------------------------------
+# phenotype-specific (paired) covariates
+# ---------------------------------------------------------------------------
+class TestPairedCovariate:
+    @staticmethod
+    def _cohort(seed=21, n=140, m=12):
+        import pandas as pd
+        rng = np.random.default_rng(seed)
+        samples = [f"S{i}" for i in range(n)]
+        G = rng.integers(0, 3, size=(m, n)).astype(np.float32)
+        gdf = pd.DataFrame(G, index=[f"v{i}" for i in range(m)], columns=samples)
+        vdf = pd.DataFrame({"chrom": "chr1", "pos": 100 + 10 * np.arange(m)}, index=gdf.index)
+        paired_vec = rng.normal(size=n)
+        y1 = 1.1 * G[3] + 2.5 * paired_vec + rng.normal(size=n) * 0.4
+        y2 = 1.1 * G[7] + rng.normal(size=n) * 0.4
+        pdf = pd.DataFrame([y1, y2], index=["geneA", "geneB"], columns=samples).astype(np.float32)
+        pos = pd.DataFrame({"chr": "chr1", "start": [150, 150], "end": [150, 150]}, index=pdf.index)
+        cov = pd.DataFrame(rng.normal(size=(n, 2)), index=samples, columns=["c1", "c2"])
+        paired = pd.DataFrame([paired_vec], index=["geneA"], columns=samples)
+        return dict(gdf=gdf, vdf=vdf, pdf=pdf, pos=pos, cov=cov, paired=paired)
+
+    def test_matches_adding_the_column_to_the_covariates(self):
+        """A paired covariate equals putting that column in covariates_df for that phenotype."""
+        import pandas as pd
+        from localqtl import susie
+        from localqtl.utils import SimpleLogger
+        d = self._cohort()
+        lg = SimpleLogger(verbose=False)
+        kw = dict(L=3, window=1000, device="cpu", max_iter=300, logger=lg)
+        paired_run = susie.map(d["gdf"], d["vdf"], d["pdf"], d["pos"], d["cov"],
+                               paired_covariate_df=d["paired"], **kw)
+        cov_aug = pd.concat(
+            [d["cov"], pd.Series(d["paired"].loc["geneA"], name="paired")], axis=1)
+        manual = susie.map(d["gdf"], d["vdf"], d["pdf"].loc[["geneA"]], d["pos"].loc[["geneA"]],
+                           cov_aug, **kw)
+        a = paired_run[paired_run["phenotype_id"] == "geneA"].reset_index(drop=True)
+        b = manual.reset_index(drop=True)
+        assert len(a) and a["variant_id"].tolist() == b["variant_id"].tolist()
+        np.testing.assert_allclose(a["pip"].to_numpy(), b["pip"].to_numpy(), rtol=1e-4, atol=1e-6)
+        # the phenotype that is not listed is unaffected
+        plain = susie.map(d["gdf"], d["vdf"], d["pdf"].loc[["geneB"]], d["pos"].loc[["geneB"]],
+                          d["cov"], **kw).reset_index(drop=True)
+        gb = paired_run[paired_run["phenotype_id"] == "geneB"].reset_index(drop=True)
+        assert gb["variant_id"].tolist() == plain["variant_id"].tolist()
+        np.testing.assert_allclose(gb["pip"].to_numpy(), plain["pip"].to_numpy(), rtol=1e-4, atol=1e-6)
+
+    def test_validation(self):
+        import pandas as pd
+        import pytest
+        from localqtl import susie
+        from localqtl.utils import SimpleLogger
+        d = self._cohort()
+        kw = dict(L=2, window=1000, device="cpu", logger=SimpleLogger(verbose=False))
+        with pytest.raises(ValueError, match="phenotypes not in"):
+            susie.map(d["gdf"], d["vdf"], d["pdf"], d["pos"], d["cov"],
+                      paired_covariate_df=d["paired"].rename(index={"geneA": "ghost"}), **kw)
+        with pytest.raises(ValueError, match="samples"):
+            susie.map(d["gdf"], d["vdf"], d["pdf"], d["pos"], d["cov"],
+                      paired_covariate_df=d["paired"].iloc[:, :5], **kw)

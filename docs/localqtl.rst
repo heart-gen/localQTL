@@ -206,8 +206,93 @@ skips the pair-level output.  ``interaction_df`` is mutually exclusive with
 ``ancestry_model="interaction"``.
 
 ``paired_covariate_df`` (phenotypes x samples) adds one phenotype-specific
-covariate to the shared covariates in :func:`localqtl.cis.map_nominal` and
-:func:`localqtl.cis.map_permutations`.
+covariate to the shared covariates in :func:`localqtl.cis.map_nominal`,
+:func:`localqtl.cis.map_permutations`, :func:`localqtl.cis.map_independent`
+and :func:`localqtl.susie.map` (``--paired_covariate`` on the command line).
+Phenotypes absent from the table use the shared covariates alone; phenotype
+groups are not supported.
+
+Permutations for the ancestry-specific dosage model
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:func:`localqtl.cis.map_permutations` accepts ``ancestry_model="dosage"``.
+The per-variant statistic is the joint Wald F over the K ancestry effects and
+the permutation statistic is its maximum over the cis-window, so ``pval_perm``
+and ``pval_beta`` calibrate the *joint* ancestry signal; ``pval_nominal`` is
+the joint p-value of the lead variant and the per-ancestry columns of
+:func:`localqtl.cis.map_nominal` are reported for it.  Because the joint test
+is an F test rather than a correlation, the Beta approximation is fitted to
+the permuted minimum p-values directly: ``true_dof`` is the residual degrees
+of freedom and ``pval_true_dof`` is ``NaN``.  ``interaction_covariate`` and
+``paired_covariate_df`` are not supported in this mode, and
+:func:`localqtl.cis.map_independent` does not implement it.
+
+.. code-block:: python
+
+   perm_df = map_permutations(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
+                              covariates_df, haplotypes=panel, ancestry_model="dosage",
+                              nperm=10_000, min_ancestry_ac=10, seed=1)
+
+With ``group_s`` the maximum runs over the phenotypes of a group as well as
+over the window, giving one calibrated row per group -- the layout wanted for
+isoform or splicing-event phenotypes grouped by gene.  This is valid because
+the phenotypes of a group share samples, covariates, window and K, so their
+residual degrees of freedom are identical and the largest F is the smallest
+joint p-value.  The per-variant inverse cross-products are built once per
+group and reused for every phenotype and permutation chunk, so a grouped scan
+costs less per phenotype than an ungrouped one.  Permutations are drawn once
+per group and applied to all of its phenotypes, preserving the within-group
+correlation.
+
+.. code-block:: python
+
+   perm_df = map_permutations(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
+                              covariates_df, haplotypes=panel, ancestry_model="dosage",
+                              group_s=isoform_to_gene, nperm=10_000, seed=1)
+
+.. note::
+
+   As in the correlation-based grouped scan it mirrors (and in FastQTL and
+   tensorQTL), the null is built by permuting covariate-residualized
+   phenotypes, which is an approximation that a maximum over the group
+   amplifies.  In a null study (50 designs x 60 groups, 80 samples, 12
+   variants, 500 permutations) the fraction of ``pval_perm`` below 0.05 rose
+   from 0.059 at group size 1 to 0.070 at size 3 and 0.073 at size 5; the same
+   study with ``ancestry_model="main"`` gave 0.056, 0.062 and 0.064.  Grouped
+   p-values from large groups are mildly anti-conservative in both models.
+
+Ancestry-specific effects at known signals
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:func:`localqtl.cis.map_conditional_dosage` does not search a window: it takes
+signals that were already selected -- typically the output of
+:func:`localqtl.cis.map_independent`, or the lead rows of
+:func:`localqtl.cis.map_permutations` -- and re-fits each with the
+ancestry-specific dosage model, conditioning on the other signals of the same
+phenotype.  Only the listed variants are read, and no permutations are needed
+because selection has already happened.
+
+``condition_on`` chooses what to project out for the other signals:
+``"genotype"`` (default) their pooled dosage, which matches how
+:func:`localqtl.cis.map_independent` defined them and costs one degree of
+freedom each; ``"dosage"`` their K ancestry-specific dosages, so that an
+ancestry-differential secondary signal cannot leak into the variant under
+test, at K degrees of freedom each; ``"none"`` fits every signal marginally.
+
+.. code-block:: python
+
+   cond_df = map_conditional_dosage(
+       genotype_df, variant_df, phenotype_df, phenotype_pos_df,
+       signals_df=indep_df[["phenotype_id", "variant_id", "rank"]],
+       haplotypes=panel, covariates_df=covariates_df, condition_on="genotype",
+   )
+
+The output carries the per-ancestry columns of the dosage model plus
+``n_conditioned`` and ``dof``.  Its p-values are conditional nominal p-values
+at variants chosen on the same data, so they measure how different the
+ancestry-specific effects of an established signal are, not whether the signal
+exists.  The CLI exposes this as ``--mode cis_conditional``, taking the
+signals through ``--cis_output``.
 
 trans-QTL mapping and tensorQTL post-processing
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -248,6 +333,9 @@ Command line
 ``--haplotypes`` (RFMix / FLARE output or an rfmix_reader cache),
 ``--ancestry_model`` and ``--min_ancestry_ac``; ``--device``,
 ``--perm_chunk`` and ``--localqtl_names`` are the other localQTL additions.
+The extra mode ``cis_conditional`` re-fits already-selected signals with the
+ancestry-specific dosage model (``--condition_on``, writing
+``<prefix>.cis_conditional_qtl.txt.gz``).
 
 .. code-block:: bash
 
@@ -255,6 +343,8 @@ Command line
    localqtl geno pheno.bed.gz prefix --mode cis_nominal --covariates covariates.txt \
            --interaction age.txt --cis_output prefix.cis_qtl.txt.gz
    localqtl geno pheno.bed.gz prefix --mode trans --haplotypes rfmix/out
+   localqtl geno pheno.bed.gz prefix --mode cis_conditional --haplotypes rfmix/out \
+           --covariates covariates.txt --cis_output prefix.cis_independent_qtl.txt.gz
 
 CisMapper orchestration
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -787,6 +877,7 @@ Core mapping API
 * :func:`localqtl.cis.map_nominal`
 * :func:`localqtl.cis.map_permutations`
 * :func:`localqtl.cis.map_independent`
+* :func:`localqtl.cis.map_conditional_dosage`
 * :func:`localqtl.cis.map_nominal_loci`
 * :class:`localqtl.cis.CisMapper`
 * :mod:`localqtl.cis`

@@ -9,6 +9,7 @@ Output files (``<output_dir>/<prefix>...``), as in tensorQTL::
                       <prefix>.cis_qtl_top_assoc.txt.gz        (interaction scans)
                       <prefix>.cis_qtl.signif_pairs.parquet    (with --cis_output)
     cis_independent   <prefix>.cis_independent_qtl.txt.gz
+    cis_conditional   <prefix>.cis_conditional_qtl.txt.gz
     cis_susie         <prefix>.SuSiE_summary.parquet, <prefix>.SuSiE.pickle
     trans             <prefix>.trans_qtl_pairs.parquet | .txt.gz   (sparse)
                       <prefix>.trans_qtl_{pval,beta,beta_se,af}.parquet (dense)
@@ -34,7 +35,7 @@ import pandas as pd
 import torch
 
 from . import genotypeio, pgen, susie, trans
-from .cis import map_independent, map_nominal, map_permutations
+from .cis import map_conditional_dosage, map_independent, map_nominal, map_permutations
 from .cis.postproc import get_significant_pairs
 from .compat import from_tensorqtl_columns, to_tensorqtl_columns
 from .phenotypeio import read_phenotype_bed
@@ -43,7 +44,8 @@ from .utils import SimpleLogger
 
 __all__ = ["build_parser", "main"]
 
-MODES = ['cis', 'cis_nominal', 'cis_independent', 'cis_susie', 'trans', 'trans_susie']
+MODES = ['cis', 'cis_nominal', 'cis_independent', 'cis_conditional', 'cis_susie',
+         'trans', 'trans_susie']
 
 
 def _version() -> str:
@@ -70,7 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Tab-delimited file mapping sample ID to interaction value(s) (if multiple interaction '
                              'terms are used, the file must include a header with variable names)')
     parser.add_argument('--cis_output', default=None, type=str,
-                        help="Output from 'cis' mode with q-values. Required for independent cis-QTL mapping.")
+                        help="Output from 'cis' mode with q-values. Required for independent cis-QTL "
+                             "mapping; in 'cis_conditional' mode give the signals to re-fit (the "
+                             "'cis_independent' or 'cis' output).")
     parser.add_argument('--phenotype_groups', default=None, type=str,
                         help='Phenotype groups. Header-less TSV with two columns: phenotype_id, group_id')
     parser.add_argument('--window', default=1000000, type=int, help='Cis-window size, in bases. Default: 1000000.')
@@ -119,7 +123,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help='Use posterior-expected ancestry counts (RFMix .fb input with a cache)')
     la.add_argument('--ancestry_model', default='main', choices=['main', 'interaction', 'dosage'],
                     help="Local-ancestry model for cis modes: 'main' (covariates; the only option for trans), "
-                         "'interaction' (GxH), 'dosage' (per-ancestry effects; cis_nominal only)")
+                         "'interaction' (GxH), 'dosage' (per-ancestry effects; 'cis' and 'cis_nominal')")
+    la.add_argument('--condition_on', default='genotype', choices=['genotype', 'dosage', 'none'],
+                    help="'cis_conditional' mode: project out the other signals of a phenotype as "
+                         "their pooled dosage (genotype), their per-ancestry dosages (dosage), or "
+                         "not at all (none)")
     la.add_argument('--min_ancestry_ac', default=0.0, type=float,
                     help='Dosage model: mask ancestries with fewer in-sample minor alleles than this')
     misc = parser.add_argument_group('localQTL options')
@@ -232,8 +240,13 @@ def main(argv=None) -> int:
         raise ValueError("Output from 'cis' mode must be provided (--cis_output).")
     if args.interaction is not None and args.mode not in ['cis_nominal', 'trans']:
         raise ValueError("Interactions are only supported in 'cis_nominal' or 'trans' mode.")
-    if args.ancestry_model == 'dosage' and args.mode != 'cis_nominal':
-        raise ValueError("--ancestry_model dosage is only available in 'cis_nominal' mode.")
+    if args.ancestry_model == 'dosage' and args.mode not in ('cis', 'cis_nominal'):
+        raise ValueError("--ancestry_model dosage is only available in 'cis' and 'cis_nominal' modes.")
+    if args.mode == 'cis_conditional':
+        if args.cis_output is None or not os.path.exists(args.cis_output):
+            raise ValueError("Signals to re-fit must be provided for 'cis_conditional' (--cis_output).")
+        if args.haplotypes is None:
+            raise ValueError("'cis_conditional' fits the ancestry-specific dosage model and requires --haplotypes.")
     if args.ancestry_model == 'interaction' and args.mode not in ('cis', 'cis_nominal', 'cis_independent'):
         raise ValueError("--ancestry_model interaction is only available in cis modes.")
     if args.haplotypes is not None and args.mode in ('cis_susie', 'trans_susie'):
@@ -331,7 +344,7 @@ def main(argv=None) -> int:
         kw = dict(covariates_df=covariates_df, group_s=group_s, paired_covariate_df=paired_covariate_df,
                   nperm=args.permutations, window=args.window, beta_approx=not args.disable_beta_approx,
                   maf_threshold=maf_threshold, logger=logger, seed=args.seed, device=device,
-                  perm_chunk=args.perm_chunk, **la_kwargs)
+                  perm_chunk=args.perm_chunk, min_ancestry_ac=args.min_ancestry_ac, **la_kwargs)
         if pgr is None:
             res_df = map_permutations(genotype_df, variant_df, phenotype_df, phenotype_pos_df, **kw)
         else:
@@ -406,7 +419,8 @@ def main(argv=None) -> int:
             summary_df = from_tensorqtl_columns(summary_df.reset_index())
         kw = dict(covariates_df=covariates_df, group_s=group_s, fdr=args.fdr, nperm=args.permutations,
                   window=args.window, maf_threshold=maf_threshold, logger=logger, seed=args.seed,
-                  device=device, beta_approx=not args.disable_beta_approx, perm_chunk=args.perm_chunk, **la_kwargs)
+                  device=device, beta_approx=not args.disable_beta_approx, perm_chunk=args.perm_chunk,
+                  paired_covariate_df=paired_covariate_df, **la_kwargs)
         if pgr is None:
             res_df = map_independent(genotype_df, variant_df, summary_df, phenotype_df, phenotype_pos_df, **kw)
         else:
@@ -414,6 +428,24 @@ def main(argv=None) -> int:
                                 for gt, var, p, ppos, _ in _chunks()], ignore_index=True)
         logger.write('  * writing output')
         _write_tsv(_names(res_df, args), os.path.join(args.output_dir, f'{args.prefix}.cis_independent_qtl.txt.gz'),
+                   index=False)
+
+    elif args.mode == 'cis_conditional':
+        signals_df = _read_table(args.cis_output)
+        if 'phenotype_id' not in signals_df.columns:
+            signals_df = _read_table(args.cis_output, index_col=0)
+            signals_df.index.name = 'phenotype_id'
+            signals_df = signals_df.reset_index()
+        signals_df = signals_df[[c for c in ('phenotype_id', 'variant_id', 'rank')
+                                 if c in signals_df.columns]]
+        res_df = map_conditional_dosage(
+            genotype_df, variant_df, phenotype_df, phenotype_pos_df, signals_df, haplotypes,
+            covariates_df=covariates_df, condition_on=args.condition_on,
+            min_ancestry_ac=args.min_ancestry_ac, device=device, logger=logger,
+        )
+        logger.write('  * writing output')
+        _write_tsv(_names(res_df, args),
+                   os.path.join(args.output_dir, f'{args.prefix}.cis_conditional_qtl.txt.gz'),
                    index=False)
 
     elif args.mode == 'cis_susie':
@@ -429,7 +461,8 @@ def main(argv=None) -> int:
         phenotype_ids = phenotype_df.index[phenotype_df.index.isin(signif_df['phenotype_id'].unique())]
         phenotype_df = phenotype_df.loc[phenotype_ids]
         phenotype_pos_df = phenotype_pos_df.loc[phenotype_ids]
-        kw = dict(covariates_df=covariates_df, L=args.max_effects, maf_threshold=maf_threshold, max_iter=500,
+        kw = dict(covariates_df=covariates_df, paired_covariate_df=paired_covariate_df,
+                  L=args.max_effects, maf_threshold=maf_threshold, max_iter=500,
                   window=args.window, summary_only=False, logger=logger, device=device)
         if pgr is None:
             summary_df, res = susie.map(genotype_df, variant_df, phenotype_df, phenotype_pos_df, **kw)
