@@ -485,11 +485,11 @@ def susie(X_t, y_t, L=10, scaled_prior_variance=0.2,
 # ---------------------------------------------------------------------------
 
 def map(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
-        covariates_df=None, paired_covariate_df=None, L=10, scaled_prior_variance=0.2,
+        covariates_df=None, L=10, scaled_prior_variance=0.2,
         estimate_residual_variance=True, estimate_prior_variance=True,
         tol=1e-3, coverage=0.95, min_abs_corr=0.5,
         summary_only=True, maf_threshold=0, max_iter=200, window=1000000,
-        logger=None, verbose=True, device="cuda"):
+        logger=None, verbose=True, device="cuda", *, paired_covariate_df=None):
     """
     Run SuSiE fine-mapping for all phenotypes across cis-windows.
 
@@ -543,7 +543,7 @@ def map(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
         covariates_t = torch.tensor(covariates_df.values, dtype=torch.float32, device=device)
         residualizer = Residualizer(covariates_t)
 
-    paired_residualizers: dict = {}
+    paired_cov_df = None
     if paired_covariate_df is not None:
         if not paired_covariate_df.columns.equals(phenotype_df.columns):
             missing = [s_ for s_ in phenotype_df.columns if s_ not in paired_covariate_df.columns]
@@ -556,11 +556,7 @@ def map(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
             raise ValueError(f"paired_covariate_df has {len(unknown)} phenotypes not in "
                              f"phenotype_df (first: {list(unknown[:5])})")
         logger.write('  * including phenotype-specific covariate')
-        for pid in paired_covariate_df.index:
-            extra = torch.tensor(paired_covariate_df.loc[pid].to_numpy(np.float32),
-                                 dtype=torch.float32, device=device).reshape(-1, 1)
-            cov_i = extra if covariates_t is None else torch.cat([covariates_t, extra], dim=1)
-            paired_residualizers[pid] = Residualizer(cov_i)
+        paired_cov_df = paired_covariate_df
 
     igc = InputGeneratorCis(
         genotype_df=genotype_df, variant_df=variant_df,
@@ -600,7 +596,15 @@ def map(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
         if phenotype_t.dim() == 1:
             phenotype_t = phenotype_t.unsqueeze(0)
 
-        rez = paired_residualizers.get(phenotype_id, residualizer)
+        # Built per phenotype rather than cached for all of them: only one is
+        # ever in use, and a genome-wide paired covariate would otherwise hold
+        # one QR factor per phenotype on the device for the whole run.
+        rez = residualizer
+        if paired_cov_df is not None and phenotype_id in paired_cov_df.index:
+            extra = torch.tensor(paired_cov_df.loc[phenotype_id].to_numpy(np.float32),
+                                 dtype=torch.float32, device=device).reshape(-1, 1)
+            cov_i = extra if covariates_t is None else torch.cat([covariates_t, extra], dim=1)
+            rez = Residualizer(cov_i)
         if rez is not None:
             (genotypes_res_t,) = rez.transform(genotypes_t, center=True)
             (phenotype_res_t,) = rez.transform(phenotype_t, center=True)

@@ -364,3 +364,50 @@ def test_dosage_permutations_grouped_are_calibrated_under_the_null():
         assert p.size >= n_groups - 2
         assert 0.35 < p.mean() < 0.65, f"{col} mean {p.mean()}"
         assert np.mean(p < 0.05) < 0.20, f"{col} tail {np.mean(p < 0.05)}"
+
+
+def test_dosage_perm_chunk_fmax_sanitises_like_the_observed_statistic():
+    """An overflowing null F must win the maximum, a NaN must never win it."""
+    from src.localqtl import regression_kernels as rk
+
+    F = torch.tensor([[1.0, 2.0],
+                      [float("inf"), float("nan")],
+                      [3.0, float("-inf")]])
+    saved = rk._dosage_fstat_block
+    rk._dosage_fstat_block = lambda ctx, Y: F
+    try:
+        out = rk.dosage_perm_chunk_fmax({}, torch.zeros(1, 2))
+    finally:
+        rk._dosage_fstat_block = saved
+    # column 0 overflowed: it must stay the largest value, not collapse to 0
+    assert out[0].item() > 3.0
+    # column 1 is NaN at the variant that would otherwise win: the finite 2.0 does
+    assert out[1].item() == pytest.approx(2.0)
+
+
+def test_dosage_permutation_row_reports_a_single_joint_f():
+    """``pval_nominal`` is the lead's joint p-value, so it must equal ``pval_joint``."""
+    d = _dosage_cohort()
+    perm = map_permutations(
+        d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+        d["covariates_df"], nperm=100, seed=3, haplotypes=d["panel"],
+        ancestry_model="dosage", device="cpu", window=1000,
+        logger=SimpleLogger(verbose=False),
+    )
+    r = perm.iloc[0]
+    assert r["pval_nominal"] == pytest.approx(r["pval_joint"], rel=1e-12)
+    dof = int(r["true_dof"])
+    f_from_r2 = r["r2_nominal"] * dof / (2 * (1 - r["r2_nominal"]))
+    assert f_from_r2 == pytest.approx(r["fstat_joint"], rel=1e-6)
+
+
+def test_dosage_permutation_grouped_row_reports_a_single_joint_f():
+    d = _dosage_group_cohort()
+    perm = map_permutations(
+        d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+        d["covariates_df"], group_s=d["group_s"], nperm=100, seed=3,
+        haplotypes=d["panel"], ancestry_model="dosage", device="cpu", window=1000,
+        logger=SimpleLogger(verbose=False),
+    )
+    r = perm.iloc[0]
+    assert r["pval_nominal"] == pytest.approx(r["pval_joint"], rel=1e-12)

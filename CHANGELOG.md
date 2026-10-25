@@ -75,8 +75,57 @@ the GitHub release body from that section and stops if the tag has none.
 ### Changed
 
 - The vectorised dosage column computation moved out of `_run_nominal_core` into
-  `localqtl.cis.nominal.dosage_result_arrays`, which `map_nominal` and
+  `localqtl.cis.nominal.dosage_result_arrays`, which `map_nominal`, `map_permutations` and
   `map_conditional_dosage` now share. No change to any reported value.
+- `susie.map` takes `paired_covariate_df` as a keyword-only argument at the end of the
+  signature instead of the sixth positional one, so that `L` keeps its position. Callers that
+  passed `L` positionally bound it to `paired_covariate_df` and crashed; the parameter was
+  only ever added in this unreleased section, so no released call is affected.
+- `auto_perm_chunk` moved from `localqtl.cis.independent` to `localqtl.cis.common`, shared
+  with the dosage permutation paths.
+
+### Fixed
+
+- **`map_conditional_dosage` silently dropped signals and under-conditioned the rest.** The
+  variant sub-frames were ordered by variant ID, so the position column the cis-window
+  generator bisects was not monotonic whenever lexicographic order disagreed with position
+  order (`chr1:1000000:A:G` before `chr1:999999:A:G`, `v10` before `v2`, most rsID sets). The
+  affected signals were reported as "monomorphic or unmapped" and dropped, and the signals
+  that survived were then fitted with fewer conditioning variants than requested --
+  `n_conditioned=0`, i.e. marginally, in the two-signal case. The sub-frames are now ordered
+  by `(chrom, pos)`.
+- **`map_conditional_dosage` measured `start_distance`/`end_distance` from the wrong origin.**
+  `phenotype_pos_df` was accepted and never used; the distances were measured from the span
+  of a phenotype's signals rather than from the phenotype itself, so they did not agree with
+  the identically named columns of `cis`, `cis_nominal` and `cis_independent` output. They
+  now come from `phenotype_pos_df`.
+- `map_conditional_dosage` returns the full column schema when no signal survives filtering,
+  including `rank` and the per-ancestry dosage columns, instead of 13 fixed columns that made
+  `out["pval_joint"]` raise `KeyError` on an empty result.
+- **The dosage permutation null discarded its most extreme draws.** `dosage_perm_chunk_fmax`
+  mapped an overflowing (`+inf`) F to `0.0` while the observed statistic kept it, so a null
+  permutation more extreme than the observation was counted as the least extreme one and
+  `pval_perm` came out anti-conservative. Null and observed statistics now use the same
+  sanitisation (NaN never wins the maximum; an overflow does).
+- **`pval_nominal` and `pval_joint` of a dosage permutation row no longer disagree.** The
+  first came from the batched normal-equations F, which forms `y'y - y'XB` in float32 and
+  cancels catastrophically once the fit is near-perfect, while the second came from the
+  explicit-residual fit. Both now come from the stable fit; the permutation p-value is still
+  compared against the null on the null's own estimator, as it must be.
+- The `cis_conditional` CLI mode rejects `--chunk_size` (it previously crashed with
+  `AttributeError: 'NoneType' object has no attribute 'index'`) and `--phenotype_groups`
+  (previously read and then silently ignored).
+- `susie.map` builds a phenotype's `Residualizer` when it reaches that phenotype instead of
+  building one per row of `paired_covariate_df` up front, which held a QR factor per
+  phenotype on the device for the whole run (~1.2 GB for 20,000 phenotypes x 500 samples x 30
+  covariates).
+- The dosage permutation paths refit only the lead variant rather than the whole cis-window,
+  and size their permutation chunks with `auto_perm_chunk` as the correlation-based paths do;
+  the per-chunk `(m, p, C)` buffers previously scaled with the raw `perm_chunk`.
+- `map_conditional_dosage` reuses one `Residualizer` for every signal whose design is just
+  the covariate matrix (`condition_on="none"`, or a phenotype with a single signal).
+- `validate_ancestry_model` no longer reports that `ancestry_model='dosage'` is "only
+  implemented for map_nominal"; it names the caller and the mappers that do support it.
 
 ## [0.3.0] - 2026-10-24
 

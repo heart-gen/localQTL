@@ -291,8 +291,11 @@ The output carries the per-ancestry columns of the dosage model plus
 ``n_conditioned`` and ``dof``.  Its p-values are conditional nominal p-values
 at variants chosen on the same data, so they measure how different the
 ancestry-specific effects of an established signal are, not whether the signal
-exists.  The CLI exposes this as ``--mode cis_conditional``, taking the
-signals through ``--cis_output``.
+exists.  ``start_distance`` and ``end_distance`` are measured from the
+phenotype's own start and end, as in the other cis outputs.  The CLI exposes
+this as ``--mode cis_conditional``, taking the signals through
+``--cis_output``; the mode reads only the listed variants and fits one signal
+at a time, so it rejects ``--chunk_size`` and ``--phenotype_groups``.
 
 trans-QTL mapping and tensorQTL post-processing
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

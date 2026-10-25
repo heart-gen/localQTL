@@ -252,3 +252,11 @@ def test_cli_cis_conditional_and_grouped_dosage(cli_inputs, tmp_path, monkeypatc
     with pytest.raises(ValueError, match="must be provided"):
         main([c["geno"], c["bed"], "x", "-o", c["out"], "--device", "cpu",
               "--mode", "cis_conditional", "--haplotypes", "x"])
+    # the mode reads only the listed signals, so neither chunking nor grouping applies;
+    # both used to be accepted and then silently ignored (chunking crashed on None)
+    with pytest.raises(ValueError, match="does not support --chunk_size"):
+        main(base + ["--mode", "cis_conditional", "--cis_output", signals,
+                     "--chunk_size", "1000"])
+    with pytest.raises(ValueError, match="does not support --phenotype_groups"):
+        main(base + ["--mode", "cis_conditional", "--cis_output", signals,
+                     "--phenotype_groups", groups])

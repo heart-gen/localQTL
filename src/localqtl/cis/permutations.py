@@ -29,6 +29,7 @@ from ._buffer import (
 )
 from .nominal import _paired_covariate_context
 from .common import (
+    auto_perm_chunk,
     residualize_matrix_with_covariates,
     validate_ancestry_model,
     project_interaction,
@@ -37,7 +38,7 @@ from .common import (
     residualize_batch_interaction,
     prepare_interaction_covariate,
 )
-from .nominal import _dosage_columns, _n_ancestries
+from .nominal import _dosage_columns, _n_ancestries, dosage_result_arrays
 
 __all__ = [
     "map_permutations",
@@ -61,43 +62,37 @@ def _nanmax(x: torch.Tensor, dim: int):
     replace = torch.full_like(x, float("-inf"))
     return torch.max(torch.where(torch.isnan(x), replace, x), dim=dim)
 
-def _dosage_lead_values(res: dict, ix: int, anc_stats: dict | None, dof: int,
-                        K: int, min_ancestry_ac: float) -> dict[str, float]:
-    """Per-ancestry dosage columns of the lead variant ``ix`` (see ``_dosage_columns``)."""
-    b = res["betas"][ix].detach().cpu().numpy().astype(np.float64)
-    se = res["ses"][ix].detach().cpu().numpy().astype(np.float64)
-    t = res["tstats"][ix].detach().cpu().numpy().astype(np.float64)
-    cov = res["cov"][ix].detach().cpu().numpy().astype(np.float64)
-    masked = None
-    if min_ancestry_ac and min_ancestry_ac > 0 and anc_stats is not None:
-        masked = anc_stats["ma_count"][ix] < float(min_ancestry_ac)
-        b = np.where(masked, np.nan, b)
-        se = np.where(masked, np.nan, se)
-        t = np.where(masked, np.nan, t)
-    out: dict[str, float] = {}
-    for k in range(K):
-        out[f"slope_anc{k}"] = float(b[k])
-        out[f"slope_se_anc{k}"] = float(se[k])
-        out[f"tstat_anc{k}"] = float(t[k])
-        out[f"pval_anc{k}"] = float(get_t_pval(t[k], dof))
-    fstat = float(res["fstat"][ix].item())
-    out["fstat_joint"] = fstat
-    out["pval_joint"] = float(get_f_pval(fstat, K, dof))
-    for i in range(K):
-        for j in range(i + 1, K):
-            var = cov[i, i] + cov[j, j] - 2.0 * cov[i, j]
-            z = (b[i] - b[j]) / np.sqrt(max(var, 1e-30))
-            if masked is not None and (masked[i] or masked[j]):
-                z = np.nan
-            out[f"z_diff_anc{i}_anc{j}"] = float(z)
-            out[f"pval_diff_anc{i}_anc{j}"] = float(get_t_pval(z, dof))
-    if anc_stats is not None:
-        for k in range(K):
-            out[f"an_anc{k}"] = float(anc_stats["an"][ix, k])
-            out[f"ac_anc{k}"] = float(anc_stats["ac"][ix, k])
-            out[f"af_anc{k}"] = float(anc_stats["af"][ix, k])
-            out[f"ma_count_anc{k}"] = float(anc_stats["ma_count"][ix, k])
-    return out
+def _dosage_lead_row(y_resid, D_resid, L_resid, G_t, H_t, ix: int, k_eff: int,
+                     min_ancestry_ac: float, device: str):
+    """
+    Dosage columns of the lead variant ``ix``, refitted on its own.
+
+    Only the lead is refitted: running ``run_batch_dosage_regression`` over
+    the whole window would solve one ``p x p`` system per variant and build
+    ``(m, K)`` and ``(m, K, K)`` tensors just so that a single row can be read
+    out of them.  Its ``fstat`` is also the numerically stable estimate of the
+    joint F -- ``_dosage_fstat_block`` forms ``y'y - y'XB`` in float32, which
+    cancels catastrophically once the fit is near-perfect -- so it, and not
+    the block statistic, is what the row reports as ``fstat_joint`` and
+    ``pval_nominal``.  The per-ancestry columns come from the same
+    :func:`localqtl.cis.nominal.dosage_result_arrays` the nominal scan uses,
+    so the two outputs cannot drift apart.
+
+    Returns ``(dosage_vals, slope, slope_se, tstat, dof)``, the last four
+    summarising the lead by its strongest unmasked ancestry.
+    """
+    one = slice(ix, ix + 1)
+    anc_stats = {k: v.detach().cpu().numpy().astype(np.float32)
+                 for k, v in ancestry_allele_stats(G_t[one], H_t[one]).items()}
+    res = run_batch_dosage_regression(
+        y=y_resid, D=D_resid[one], L=None if L_resid is None else L_resid[one],
+        k_eff=k_eff, device=device,
+    )
+    vals, slope, slope_se, tstat, _, dof = dosage_result_arrays(
+        res, anc_stats=anc_stats, min_ancestry_ac=min_ancestry_ac
+    )
+    dosage_vals = {c: float(np.asarray(v).reshape(-1)[0]) for c, v in vals.items()}
+    return dosage_vals, float(slope[0]), float(slope_se[0]), float(tstat[0]), int(dof)
 
 
 def _beta_fit_on_minp(minp_null: np.ndarray, p_obs: float) -> tuple[float, float, float]:
@@ -261,11 +256,7 @@ def _run_permutation_core(
         interaction_mode = ancestry_model == "interaction" and H_t is not None
         dosage_mode = ancestry_model == "dosage" and H_t is not None
         covar_interaction = interaction_covariate_t is not None
-        anc_stats_np: dict[str, np.ndarray] | None = None
         if dosage_mode:
-            # per-ancestry allele statistics from the raw (imputed) block
-            anc_stats_np = {k: v.detach().cpu().numpy().astype(np.float32)
-                            for k, v in ancestry_allele_stats(G_t, H_t).items()}
             y_resid_t, D_resid, L_resid = residualize_batch_dosage(
                 y_t, G_t, H_t, rez_b, center=True, group=False
             )
@@ -290,26 +281,27 @@ def _run_permutation_core(
             dof = int(ctx["dof"])
             f_obs = torch.nan_to_num(dosage_fstat(ctx, y_resid_t), nan=-1.0)
             ix = int(f_obs.argmax().item())
-            f_lead = float(f_obs[ix].item())
-            pval_nominal = float(get_f_pval(f_lead, K, dof))
+            # Two estimates of the lead's F, deliberately: ``f_block`` shares
+            # the estimator (and so the float32 error) of the permutation
+            # null and is what the null is compared against, while the refit
+            # below gives the stable value the row reports.
+            f_block = float(f_obs[ix].item())
+
+            dosage_vals, beta, se, tval, _ = _dosage_lead_row(
+                y_resid_t, D_resid, L_resid, G_t, H_t, ix, k_eff, min_ancestry_ac, device
+            )
+            f_lead = float(dosage_vals["fstat_joint"])
+            pval_nominal = float(dosage_vals["pval_joint"])
             r2_nominal = float(K * f_lead / (K * f_lead + dof)) if f_lead > 0 else 0.0
 
-            res_full = run_batch_dosage_regression(
-                y=y_resid_t, D=D_resid, L=L_resid, k_eff=k_eff, device=device
-            )
-            dosage_vals = _dosage_lead_values(res_full, ix, anc_stats_np, dof, K, min_ancestry_ac)
-            t_arr = np.array([dosage_vals[f"tstat_anc{k}"] for k in range(K)], dtype=np.float64)
-            best_k = 0 if np.all(np.isnan(t_arr)) else int(np.nanargmax(np.abs(t_arr)))
-            beta = dosage_vals[f"slope_anc{best_k}"]
-            se = dosage_vals[f"slope_se_anc{best_k}"]
-            tval = dosage_vals[f"tstat_anc{best_k}"]
-
             n_samples = int(y_resid_t.shape[0])
+            perm_chunk_local = auto_perm_chunk(int(D_resid.shape[0]), nperm,
+                                               pH=int(ctx["p"]))
             stream = PermutationStream(
                 n_samples=n_samples,
                 nperm=nperm,
                 device=y_resid_t.device,
-                chunk_size=max(1, int(perm_chunk)),
+                chunk_size=max(1, min(int(perm_chunk), perm_chunk_local)),
                 seed=subseed(seed, pid) if seed is not None else None,
                 mode=perm_indices_mode,
             )
@@ -320,10 +312,11 @@ def _run_permutation_core(
                 fmax_parts.append(dosage_perm_chunk_fmax(ctx, y_perm))
             fmax_np = (torch.cat(fmax_parts).detach().cpu().numpy() if fmax_parts
                        else np.empty(0, dtype=np.float64))
-            pval_perm = float((np.sum(fmax_np >= f_lead) + 1) / (fmax_np.size + 1))
+            pval_perm = float((np.sum(fmax_np >= f_block) + 1) / (fmax_np.size + 1))
             if beta_approx and fmax_np.size:
                 minp_null = get_f_pval(fmax_np, K, dof)
-                pval_beta, a_hat, b_hat = _beta_fit_on_minp(minp_null, pval_nominal)
+                pval_beta, a_hat, b_hat = _beta_fit_on_minp(
+                    minp_null, float(get_f_pval(f_block, K, dof)))
             else:
                 pval_beta = a_hat = b_hat = np.nan
             # The joint test is an F test, so there is no t-style effective
@@ -706,12 +699,8 @@ def _run_permutation_core_group(
         interaction_mode = ancestry_model == "interaction" and H_t is not None
         dosage_mode = ancestry_model == "dosage" and H_t is not None
         covar_interaction = interaction_covariate_t is not None
-        anc_stats_np: dict[str, np.ndarray] | None = None
         D_resid = L_resid = None
         if dosage_mode:
-            # per-ancestry allele statistics from the raw (imputed) block
-            anc_stats_np = {k: v.detach().cpu().numpy().astype(np.float32)
-                            for k, v in ancestry_allele_stats(G_t, H_t).items()}
             Y_resid, D_resid, L_resid = residualize_batch_dosage(
                 Y_stack, G_t, H_t, rez, center=True, group=True
             )
@@ -762,6 +751,9 @@ def _run_permutation_core_group(
             n_samples_g = int(D_resid.shape[1])
             best_f_val = -float("inf")
             f_perm_global = None
+            perm_chunk_g = max(1, min(int(perm_chunk),
+                                      auto_perm_chunk(int(D_resid.shape[0]), nperm,
+                                                      pH=int(ctx["p"]))))
 
             for j, y_resid in enumerate(Y_resid):
                 f_obs = torch.nan_to_num(dosage_fstat(ctx, y_resid), nan=-1.0)
@@ -778,7 +770,7 @@ def _run_permutation_core_group(
                     n_samples=n_samples_g,
                     nperm=nperm,
                     device=y_resid.device,
-                    chunk_size=max(1, int(perm_chunk)),
+                    chunk_size=perm_chunk_g,
                     seed=perm_seed_base,
                     mode=perm_indices_mode,
                 )
@@ -795,15 +787,15 @@ def _run_permutation_core_group(
 
             if best_ix_var >= 0:
                 best_dof = dof
-                best_r2_val = (float(K * best_f_val / (K * best_f_val + dof))
-                               if best_f_val > 0 else 0.0)
-                pval_nominal = float(get_f_pval(best_f_val, K, dof))
                 fmax_np = (f_perm_global.detach().cpu().numpy()
                            if f_perm_global is not None else np.empty(0, dtype=np.float64))
+                # ``best_f_val`` shares the estimator of the null, so it is
+                # what the null is compared against; the refit below gives the
+                # stable F that the row reports.
                 pval_perm = float((np.sum(fmax_np >= best_f_val) + 1) / (fmax_np.size + 1))
                 if beta_approx and fmax_np.size:
                     pval_beta, a_hat, b_hat = _beta_fit_on_minp(
-                        get_f_pval(fmax_np, K, dof), pval_nominal
+                        get_f_pval(fmax_np, K, dof), float(get_f_pval(best_f_val, K, dof))
                     )
                 else:
                     pval_beta = a_hat = b_hat = np.nan
@@ -812,19 +804,14 @@ def _run_permutation_core_group(
                 true_dof = dof
                 p_true = np.nan
 
-                res_full = run_batch_dosage_regression(
-                    y=Y_resid[best_ix_pheno], D=D_resid, L=L_resid,
-                    k_eff=k_eff_g, device=device,
+                dosage_vals, best_beta, best_se, best_t, _ = _dosage_lead_row(
+                    Y_resid[best_ix_pheno], D_resid, L_resid, G_t, H_t,
+                    best_ix_var, k_eff_g, min_ancestry_ac, device,
                 )
-                dosage_vals = _dosage_lead_values(
-                    res_full, best_ix_var, anc_stats_np, dof, K, min_ancestry_ac
-                )
-                t_arr = np.array([dosage_vals[f"tstat_anc{k}"] for k in range(K)],
-                                 dtype=np.float64)
-                best_k = 0 if np.all(np.isnan(t_arr)) else int(np.nanargmax(np.abs(t_arr)))
-                best_beta = dosage_vals[f"slope_anc{best_k}"]
-                best_se = dosage_vals[f"slope_se_anc{best_k}"]
-                best_t = dosage_vals[f"tstat_anc{best_k}"]
+                f_lead_g = float(dosage_vals["fstat_joint"])
+                pval_nominal = float(dosage_vals["pval_joint"])
+                best_r2_val = (float(K * f_lead_g / (K * f_lead_g + dof))
+                               if f_lead_g > 0 else 0.0)
         else:
             for j, (pid_inner, y_resid) in enumerate(zip(ids_list, Y_resid)):
                 if interaction_mode:

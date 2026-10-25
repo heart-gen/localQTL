@@ -508,9 +508,15 @@ def dosage_perm_chunk_fmax(ctx: dict, y_perm: torch.Tensor) -> torch.Tensor:
     The maximum F is the permutation statistic: for fixed ``(K, dof)`` the
     joint p-value is monotone in F, so the largest F is the smallest p-value
     of the window.
+
+    The sanitisation must match the one the *observed* statistic gets in
+    :mod:`localqtl.cis.permutations` (``nan_to_num(..., nan=-1.0)``): a NaN
+    must never win the maximum, but an overflowing F must, or a null draw
+    more extreme than the observation would be counted as the least extreme
+    one and ``pval_perm`` would come out anti-conservative.
     """
     F = _dosage_fstat_block(ctx, y_perm)
-    return torch.nan_to_num(F, nan=0.0, posinf=0.0, neginf=0.0).amax(dim=0).to(torch.float32)
+    return torch.nan_to_num(F, nan=-1.0).amax(dim=0).to(torch.float32)
 
 
 def _is_cuda(*tensors):
