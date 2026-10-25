@@ -10,7 +10,7 @@ To release: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`, u
 compare links at the bottom, merge, and only then tag `vX.Y.Z`. The release workflow builds
 the GitHub release body from that section and stops if the tag has none.
 
-## [Unreleased]
+## [0.4.0] - 2026-10-25
 
 ### Added
 
@@ -79,8 +79,9 @@ the GitHub release body from that section and stops if the tag has none.
   `map_conditional_dosage` now share. No change to any reported value.
 - `susie.map` takes `paired_covariate_df` as a keyword-only argument at the end of the
   signature instead of the sixth positional one, so that `L` keeps its position. Callers that
-  passed `L` positionally bound it to `paired_covariate_df` and crashed; the parameter was
-  only ever added in this unreleased section, so no released call is affected.
+  passed `L` positionally would otherwise have bound it to `paired_covariate_df` and crashed.
+  The parameter is new in this release, so no code written against 0.3.0 or earlier is
+  affected.
 - `auto_perm_chunk` moved from `localqtl.cis.independent` to `localqtl.cis.common`, shared
   with the dosage permutation paths.
 
@@ -301,7 +302,8 @@ output; see *Upgrading from 0.1* in the README.
   (`InputGeneratorCisWithHaps`), PLINK 1/2 readers, streaming Parquet sinks and pure-Python
   q-values.
 
-[Unreleased]: https://github.com/heart-gen/localQTL/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/heart-gen/localQTL/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/heart-gen/localQTL/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/heart-gen/localQTL/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/heart-gen/localQTL/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/heart-gen/localQTL/compare/v0.1.3...v0.1.4
