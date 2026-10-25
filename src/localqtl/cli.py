@@ -247,6 +247,10 @@ def main(argv=None) -> int:
             raise ValueError("Signals to re-fit must be provided for 'cis_conditional' (--cis_output).")
         if args.haplotypes is None:
             raise ValueError("'cis_conditional' fits the ancestry-specific dosage model and requires --haplotypes.")
+        if args.chunk_size is not None:
+            raise ValueError("'cis_conditional' reads only the listed signals and does not support --chunk_size.")
+        if args.phenotype_groups is not None:
+            raise ValueError("'cis_conditional' fits one signal at a time and does not support --phenotype_groups.")
     if args.ancestry_model == 'interaction' and args.mode not in ('cis', 'cis_nominal', 'cis_independent'):
         raise ValueError("--ancestry_model interaction is only available in cis modes.")
     if args.haplotypes is not None and args.mode in ('cis_susie', 'trans_susie'):

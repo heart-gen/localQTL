@@ -276,7 +276,7 @@ def test_dosage_model_argument_validation(toy_panel_2anc, covariates_df):
     # map_permutations supports the dosage model (it calibrates the joint F);
     # map_independent does not.
     from src.localqtl.cis.independent import map_independent
-    with pytest.raises(ValueError, match="only implemented for map_nominal"):
+    with pytest.raises(ValueError, match="not implemented for map_independent"):
         map_independent(genotype_df=d["genotype_df"], variant_df=d["variant_df"],
                         cis_df=pd.DataFrame({"phenotype_id": ["geneA"], "variant_id": ["v0"],
                                              "pval_beta": [1e-6], "qval": [1e-6]}),

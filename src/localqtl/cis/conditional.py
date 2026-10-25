@@ -21,7 +21,7 @@ from ..preproc import allele_stats, ancestry_allele_stats, impute_mean_and_filte
 from ..regression_kernels import Residualizer, run_batch_dosage_regression
 from ..utils import SimpleLogger
 from .common import ancestry_dosage_design, residualize_batch_dosage
-from .nominal import _dosage_columns, dosage_result_arrays
+from .nominal import _dosage_columns, _n_ancestries, dosage_result_arrays
 
 __all__ = ["map_conditional_dosage"]
 
@@ -139,9 +139,16 @@ def map_conditional_dosage(
         ranks = {(str(r.phenotype_id), str(r.variant_id)): r.rank
                  for r in signals_df.itertuples()}
 
-    needed = sorted({v for vs in sets.values() for v in vs})
+    # The generator bisects variant_df['pos'] within each chromosome, so the
+    # sub-frames have to be grouped by chromosome and ascending in position.
+    # Ordering them by variant ID instead silently drops the signals of any
+    # phenotype whose IDs do not happen to sort the way its positions do.
+    vsub = variant_df.loc[sorted({v for vs in sets.values() for v in vs})]
+    order = np.lexsort((vsub["pos"].to_numpy(dtype=np.int64),
+                        vsub["chrom"].astype(str).to_numpy()))
+    needed = list(vsub.index[order])
+    vsub = vsub.iloc[order]
     gsub = genotype_df.loc[needed]
-    vsub = variant_df.loc[needed]
 
     # One "window" per phenotype, spanning exactly its own signals: window=0
     # makes the generator serve the closed interval [start, end].
@@ -160,6 +167,17 @@ def map_conditional_dosage(
     )
     phen_sub = phenotype_df.loc[list(sets)]
 
+    # ``pos_sub`` exists only to make the generator serve each phenotype's own
+    # signals; the reported distances are measured against the phenotype's
+    # real start/end so that they line up with the other cis outputs.
+    real_pos = phenotype_pos_df.loc[list(sets)]
+    if "pos" in real_pos.columns:
+        real_start = real_pos["pos"].astype(np.int64).to_dict()
+        real_end = dict(real_start)
+    else:
+        real_start = real_pos["start"].astype(np.int64).to_dict()
+        real_end = real_pos["end"].astype(np.int64).to_dict()
+
     logger.write(f"localQTL: conditional ancestry-specific effects at {len(needed)} variants "
                  f"across {len(sets)} phenotypes")
     logger.write(f"  * conditioning on other signals: {condition_on}")
@@ -177,14 +195,20 @@ def map_conditional_dosage(
         locus_method=locus_method, nearest_tolerance=nearest_tolerance,
     )
     idx_to_id = vsub.index.to_numpy()
+    n_anc_out = _n_ancestries(haplotypes, "dosage")
+
+    # The design is the covariate matrix alone whenever nothing is projected
+    # out (condition_on='none', or a phenotype with a single signal), so its
+    # QR is built once rather than once per signal.
+    n_samples = int(phenotype_df.shape[1])
+    base_design = (cov_t if cov_t is not None
+                   else torch.zeros((n_samples, 0), dtype=torch.float32, device=device))
+    base_rez: Residualizer | None = None
 
     records: list[dict] = []
-    n_anc_out: int | None = None
     for batch in ig.generate_data():
-        if len(batch) == 5 and not isinstance(batch[3], (list, tuple)):
-            p, G_block, v_idx, H_block, pid = batch
-        else:
-            raise ValueError("map_conditional_dosage does not support phenotype groups.")
+        # Built without group_s, so every batch is one phenotype.
+        p, G_block, v_idx, H_block, pid = batch
 
         y_t = torch.as_tensor(np.asarray(p, dtype=np.float32), dtype=torch.float32, device=device)
         G_t = torch.as_tensor(np.asarray(G_block, dtype=np.float32), dtype=torch.float32, device=device)
@@ -205,14 +229,14 @@ def map_conditional_dosage(
             continue
 
         af_t, ma_samples_t, ma_count_t = allele_stats(G_t, ploidy=2)
-        start_pos = ig.phenotype_start[pid]
-        end_pos = ig.phenotype_end[pid]
+        start_pos = real_start[str(pid)]
+        end_pos = real_end[str(pid)]
 
         for vid in wanted:
             t = where[vid]
-            others = [where[o] for o in wanted if o != vid]
-            extra = [] if cov_t is None else [cov_t]
-            if condition_on != "none" and others:
+            others = [where[o] for o in wanted if o != vid] if condition_on != "none" else []
+            if others:
+                extra = [] if cov_t is None else [cov_t]
                 ix = torch.as_tensor(others, dtype=torch.long, device=device)
                 if condition_on == "genotype":
                     extra.append(G_t.index_select(0, ix).T.contiguous())       # (n, S-1)
@@ -220,9 +244,11 @@ def map_conditional_dosage(
                     D_o, _ = ancestry_dosage_design(G_t.index_select(0, ix),
                                                     H_t.index_select(0, ix))   # (S-1, n, K)
                     extra.append(D_o.permute(1, 0, 2).reshape(int(G_t.shape[1]), -1))
-            design = (torch.cat(extra, dim=1) if extra
-                      else torch.zeros((int(G_t.shape[1]), 0), dtype=torch.float32, device=device))
-            rez = Residualizer(design, tensorqtl_flavor=tensorqtl_flavor)
+                rez = Residualizer(torch.cat(extra, dim=1), tensorqtl_flavor=tensorqtl_flavor)
+            else:
+                if base_rez is None:
+                    base_rez = Residualizer(base_design, tensorqtl_flavor=tensorqtl_flavor)
+                rez = base_rez
 
             G_one = G_t[t: t + 1]
             H_one = H_t[t: t + 1]
@@ -234,12 +260,11 @@ def map_conditional_dosage(
                 res, anc_stats=anc_stats, min_ancestry_ac=min_ancestry_ac
             )
             K = int(D_r.shape[2])
-            n_anc_out = K if n_anc_out is None else n_anc_out
             var_pos = int(vsub.loc[vid, "pos"])
             rec = {
                 "phenotype_id": str(pid),
                 "variant_id": vid,
-                "n_conditioned": len(others) if condition_on != "none" else 0,
+                "n_conditioned": len(others),
                 "start_distance": int(var_pos - start_pos),
                 "end_distance": int(var_pos - end_pos),
                 "af": float(af_t[t].item()),
@@ -258,8 +283,13 @@ def map_conditional_dosage(
             records.append(rec)
 
     if not records:
-        cols = ["phenotype_id", "variant_id", "n_conditioned", "start_distance", "end_distance",
-                "af", "ma_samples", "ma_count", "slope", "slope_se", "tstat", "pval_nominal", "dof"]
+        # Same columns the non-empty path produces, so that callers can index
+        # the dosage columns of a result that happens to have no rows.
+        cols = ["phenotype_id", "variant_id"] + (["rank"] if ranks else [])
+        cols += ["n_conditioned", "start_distance", "end_distance", "af", "ma_samples",
+                 "ma_count", "slope", "slope_se", "tstat", "pval_nominal", "dof"]
+        if n_anc_out:
+            cols += _dosage_columns(int(n_anc_out))
         return pd.DataFrame(columns=cols)
 
     out = pd.DataFrame.from_records(records)

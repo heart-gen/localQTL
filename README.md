@@ -240,7 +240,12 @@ same data, so they answer "how different are the ancestry-specific effects of
 this established signal", not "does the signal exist".
 
 The CLI exposes this as `--mode cis_conditional`, taking the signals through
-`--cis_output` and writing `<prefix>.cis_conditional_qtl.txt.gz`.
+`--cis_output` and writing `<prefix>.cis_conditional_qtl.txt.gz`. Because the
+mode reads only the listed variants and fits one signal at a time, it rejects
+`--chunk_size` and `--phenotype_groups`.
+
+`start_distance` and `end_distance` are measured from the phenotype's own
+start and end, as in the other cis outputs, so the two can be joined directly.
 
 ### Covariate interaction scans
 

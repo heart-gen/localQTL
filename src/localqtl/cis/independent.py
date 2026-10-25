@@ -22,6 +22,7 @@ from ._buffer import (
 )
 from .common import (
     align_like_casefold,
+    auto_perm_chunk as _auto_perm_chunk,
     validate_ancestry_model,
     project_interaction,
     residualize_batch,
@@ -45,20 +46,6 @@ def _interaction_columns(n_ancestries: int) -> list[str]:
             f"pval_gxh_{suffix}",
         ])
     return cols
-
-def _auto_perm_chunk(n_variants: int, nperm: int, pH: int = 0, safety: float = 0.8) -> int:
-    if not torch.cuda.is_available() or n_variants <= 0:
-        return min(nperm, 2048)
-    free, _ = torch.cuda.mem_get_info()
-    bytes_per_col = 4 * n_variants * (3 + 2 * max(pH, 0))
-    if bytes_per_col <= 0:
-        return min(nperm, 2048)
-    max_chunk = int((free * safety) // bytes_per_col)
-    if max_chunk <= 0:
-        return min(nperm, 1024)
-    p2 = 1 << (max_chunk.bit_length() - 1)
-    return max(1, min(nperm, p2))
-
 
 def _nanmax(x: torch.Tensor, dim: int):
     if hasattr(torch, "nanmax"):

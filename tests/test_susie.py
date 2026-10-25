@@ -229,3 +229,26 @@ class TestPairedCovariate:
         with pytest.raises(ValueError, match="samples"):
             susie.map(d["gdf"], d["vdf"], d["pdf"], d["pos"], d["cov"],
                       paired_covariate_df=d["paired"].iloc[:, :5], **kw)
+
+    def test_l_stays_the_sixth_positional_argument(self):
+        """``paired_covariate_df`` must not displace ``L`` for positional callers."""
+        import inspect
+        from localqtl import susie
+        from localqtl.utils import SimpleLogger
+        sig = inspect.signature(susie.map)
+        positional = [p.name for p in sig.parameters.values()
+                      if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD]
+        assert positional[:6] == ["genotype_df", "variant_df", "phenotype_df",
+                                  "phenotype_pos_df", "covariates_df", "L"]
+        assert (sig.parameters["paired_covariate_df"].kind
+                is inspect.Parameter.KEYWORD_ONLY)
+
+        d = self._cohort()
+        lg = SimpleLogger(verbose=False)
+        kw = dict(window=1000, device="cpu", max_iter=300, logger=lg)
+        # L given positionally, as the pre-existing signature allowed
+        positional_run = susie.map(d["gdf"], d["vdf"], d["pdf"], d["pos"], d["cov"], 3, **kw)
+        keyword_run = susie.map(d["gdf"], d["vdf"], d["pdf"], d["pos"], d["cov"], L=3, **kw)
+        assert positional_run["variant_id"].tolist() == keyword_run["variant_id"].tolist()
+        np.testing.assert_allclose(positional_run["pip"].to_numpy(),
+                                   keyword_run["pip"].to_numpy(), rtol=1e-6, atol=1e-9)

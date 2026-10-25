@@ -136,3 +136,81 @@ def test_conditional_dosage_masking_and_validation():
         map_conditional_dosage(*base, pd.DataFrame({"phenotype_id": ["nope"],
                                                     "variant_id": ["v2"]}),
                                d["panel"], device="cpu", logger=LG)
+
+
+def _lexicographic_trap_cohort(seed=23, n=100, m=12):
+    """
+    Two phenotypes whose signal IDs sort differently from their positions.
+
+    With ``v0..v11`` the lexicographic order puts ``v10``/``v11`` before
+    ``v2``, so ordering the sub-frames by variant ID leaves ``pos``
+    non-monotonic and the generator's bisect returns the wrong range.  Gene
+    starts sit away from the signals so the reported distances are checked
+    against the gene, not against the span of its signals.
+    """
+    from tests.conftest import make_random_panel
+    rng = np.random.default_rng(seed)
+    samples = [f"S{i}" for i in range(n)]
+    G = rng.integers(0, 3, size=(m, n)).astype(np.float32)
+    gdf = pd.DataFrame(G, index=[f"v{i}" for i in range(m)], columns=samples)
+    vdf = pd.DataFrame({"chrom": "chr1", "pos": 100 + 10 * np.arange(m)}, index=gdf.index)
+    panel, admix = make_random_panel(vdf, samples, seed=seed + 1)
+    H0 = admix[:, :, 0].astype(np.float64)
+    yA = (0.7 * G[2] + 0.5 * G[10] + rng.normal(size=n)).astype(np.float32)
+    yB = (0.8 * G[11] + rng.normal(size=n)).astype(np.float32)
+    pdf = pd.DataFrame([yA, yB], index=["geneA", "geneB"], columns=samples)
+    pos = pd.DataFrame({"chr": ["chr1", "chr1"], "start": [150, 400], "end": [250, 460]},
+                       index=["geneA", "geneB"])
+    signals = pd.DataFrame({"phenotype_id": ["geneA", "geneA", "geneB"],
+                            "variant_id": ["v2", "v10", "v11"], "rank": [1, 2, 1]})
+    return dict(genotype_df=gdf, variant_df=vdf, phenotype_df=pdf, phenotype_pos_df=pos,
+                panel=panel, signals=signals, G=G, H0=H0)
+
+
+def test_conditional_dosage_keeps_signals_whose_ids_sort_unlike_their_positions():
+    d = _lexicographic_trap_cohort()
+    out = map_conditional_dosage(
+        d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+        d["signals"], d["panel"], device="cpu", logger=LG,
+    )
+    # every signal is fitted; none is silently dropped as "unmapped"
+    assert set(zip(out["phenotype_id"], out["variant_id"])) == {
+        ("geneA", "v2"), ("geneA", "v10"), ("geneB", "v11")}
+    a = out[out["phenotype_id"] == "geneA"]
+    assert (a["n_conditioned"] == 1).all()          # each conditioned on the other
+    assert (out[out["phenotype_id"] == "geneB"]["n_conditioned"] == 0).all()
+
+
+def test_conditional_dosage_distances_are_measured_from_the_phenotype():
+    d = _lexicographic_trap_cohort()
+    out = map_conditional_dosage(
+        d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+        d["signals"], d["panel"], device="cpu", logger=LG,
+    ).set_index("variant_id")
+    pos = d["variant_df"]["pos"]
+    # geneA spans [150, 250]; geneB spans [400, 460]
+    assert int(out.loc["v2", "start_distance"]) == int(pos["v2"]) - 150      # 120 - 150
+    assert int(out.loc["v2", "end_distance"]) == int(pos["v2"]) - 250
+    assert int(out.loc["v10", "start_distance"]) == int(pos["v10"]) - 150    # 200 - 150
+    assert int(out.loc["v11", "start_distance"]) == int(pos["v11"]) - 400
+    assert int(out.loc["v11", "end_distance"]) == int(pos["v11"]) - 460
+
+
+def test_conditional_dosage_empty_result_keeps_the_full_column_schema():
+    d = _two_signal_cohort()
+    gdf = d["genotype_df"].copy()
+    gdf.loc[["v2", "v5"]] = 1.0                     # monomorphic: both signals drop out
+    out = map_conditional_dosage(
+        gdf, d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+        d["signals"], d["panel"], d["covariates_df"], device="cpu", logger=LG,
+    )
+    assert len(out) == 0
+    full = map_conditional_dosage(
+        d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+        d["signals"], d["panel"], d["covariates_df"], device="cpu", logger=LG,
+    )
+    assert list(out.columns) == list(full.columns)
+    # the documented dosage columns are indexable on an empty result
+    for col in ("rank", "slope_anc0", "pval_joint", "pval_diff_anc0_anc1", "af_anc1"):
+        assert col in out.columns
+        assert len(out[col]) == 0

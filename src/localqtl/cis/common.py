@@ -9,6 +9,7 @@ from ..regression_kernels import Residualizer
 __all__ = [
     "ANCESTRY_MODELS",
     "validate_ancestry_model",
+    "auto_perm_chunk",
     "dosage_vector_for_covariate",
     "residualize_matrix_with_covariates",
     "residualize_batch",
@@ -44,7 +45,10 @@ def validate_ancestry_model(
             f"Unknown ancestry_model {ancestry_model!r}; use 'main', 'interaction' or 'dosage'."
         )
     if ancestry_model == "dosage" and not allow_dosage:
-        raise ValueError("ancestry_model='dosage' is currently only implemented for map_nominal.")
+        raise ValueError(
+            f"ancestry_model='dosage' is not implemented for {caller}; it is available in "
+            "map_nominal, map_permutations and map_conditional_dosage."
+        )
     if ancestry_model in ("interaction", "dosage") and haplotypes is None:
         raise ValueError(f"ancestry_model='{ancestry_model}' requires haplotypes.")
     if ancestry_model in ("interaction", "dosage") and interaction_covariate is not None:
@@ -52,6 +56,28 @@ def validate_ancestry_model(
             f"interaction_covariate cannot be combined with ancestry_model='{ancestry_model}'."
         )
     return ancestry_model
+
+
+def auto_perm_chunk(n_variants: int, nperm: int, pH: int = 0, safety: float = 0.8) -> int:
+    """
+    Largest permutation chunk whose per-chunk buffers fit in free GPU memory.
+
+    ``pH`` is the number of extra float32 planes of shape ``(n_variants,
+    chunk)`` that the caller holds on top of the three the correlation path
+    needs; the dosage path carries ``XtY`` and ``B`` of shape ``(m, p, chunk)``
+    and so passes ``pH = p``.
+    """
+    if not torch.cuda.is_available() or n_variants <= 0:
+        return min(nperm, 2048)
+    free, _ = torch.cuda.mem_get_info()
+    bytes_per_col = 4 * n_variants * (3 + 2 * max(pH, 0))
+    if bytes_per_col <= 0:
+        return min(nperm, 2048)
+    max_chunk = int((free * safety) // bytes_per_col)
+    if max_chunk <= 0:
+        return min(nperm, 1024)
+    p2 = 1 << (max_chunk.bit_length() - 1)
+    return max(1, min(nperm, p2))
 
 
 def _coerce_tensor(value, device: torch.device) -> torch.Tensor:
