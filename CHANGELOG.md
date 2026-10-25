@@ -24,9 +24,39 @@ the GitHub release body from that section and stops if the tag has none.
   to the permuted minimum p-values directly, so `true_dof` is the residual degrees of freedom
   and `pval_true_dof` is `NaN`. Null phenotypes give uniform `pval_perm` and `pval_beta`
   (verified in the test suite). `min_ancestry_ac` masks the reported per-ancestry estimates
-  without changing the joint test or the variant ranking. Phenotype groups,
-  `interaction_covariate` and `paired_covariate_df` are rejected in this mode, and
-  `map_independent` still does not implement it.
+  without changing the joint test or the variant ranking. `interaction_covariate` and
+  `paired_covariate_df` are rejected in this mode, and `map_independent` still does not
+  implement it.
+- **Phenotype groups in the dosage permutation scan.** `map_permutations(ancestry_model="dosage",
+  group_s=...)` takes the maximum joint F over the phenotypes of a group as well as over the
+  window and returns one calibrated row per group, which is the layout wanted for isoform and
+  splicing-event phenotypes grouped by gene. The reduction is valid because the phenotypes of
+  a group share samples, covariates, window and K, so their residual degrees of freedom are
+  identical and the largest F is the smallest joint p-value. The per-variant inverse
+  cross-products are built once per group and reused across its phenotypes and every
+  permutation chunk, so a grouped scan costs less per phenotype than an ungrouped one, and
+  permutations are drawn once per group so the within-group correlation is preserved. As in
+  the correlation-based grouped scan it mirrors, the null permutes covariate-residualized
+  phenotypes, and a maximum over the group amplifies that approximation: in a null study
+  (50 designs x 60 groups, 80 samples, 12 variants, 500 permutations) the fraction of
+  `pval_perm` below 0.05 rose from 0.059 at group size 1 to 0.070 at size 3 and 0.073 at
+  size 5, against 0.056 / 0.062 / 0.064 for `ancestry_model="main"`. Grouped p-values from
+  large groups are mildly anti-conservative in both models; this is documented, not fixed.
+- **`localqtl.cis.map_conditional_dosage`: ancestry-specific effects at known signals.**
+  Takes signals that were already selected (the output of `map_independent`, or the lead rows
+  of `map_permutations`) and re-fits each with the dosage model, conditioning on the other
+  signals of the same phenotype. It reads only the listed variants and needs no permutations,
+  because selection has already happened. `condition_on` chooses what to project out for the
+  other signals: `"genotype"` (default) their pooled dosage, matching how `map_independent`
+  defined them and costing one degree of freedom each; `"dosage"` their K ancestry-specific
+  dosages, so an ancestry-differential secondary signal cannot leak into the variant under
+  test, at K degrees of freedom each; `"none"` fits every signal marginally. All three modes
+  reproduce the corresponding numpy OLS fit, degrees of freedom included. The output adds
+  `n_conditioned` and `dof` to the per-ancestry columns; its p-values are conditional nominal
+  p-values at variants chosen on the same data, so they measure how different the
+  ancestry-specific effects of an established signal are, not whether the signal exists.
+  Exposed as `CisMapper.map_conditional_dosage` and the `cis_conditional` CLI mode
+  (`--condition_on`, writing `<prefix>.cis_conditional_qtl.txt.gz`).
 - New kernels `prep_ctx_for_dosage_perm`, `dosage_fstat` and `dosage_perm_chunk_fmax`: the
   per-variant `(X'X)^-1` and the inverse of its ancestry block do not depend on the
   phenotype, so each permutation chunk costs a few batched matmuls. They reproduce
@@ -37,9 +67,16 @@ the GitHub release body from that section and stops if the tag has none.
   Phenotypes absent from the table use the shared covariates alone; phenotype groups are not
   supported. A paired covariate is exactly equivalent to adding that column to `covariates_df`
   for that phenotype.
-- `CisMapper.map_permutations` forwards `paired_covariate_df` and `min_ancestry_ac`.
+- `CisMapper.map_permutations` forwards `paired_covariate_df` and `min_ancestry_ac`, and
+  `CisMapper.map_independent` now forwards `paired_covariate_df` too.
 - The CLI accepts `--ancestry_model dosage` in `cis` mode as well as `cis_nominal`, and passes
   `--min_ancestry_ac` to the permutation scan.
+
+### Changed
+
+- The vectorised dosage column computation moved out of `_run_nominal_core` into
+  `localqtl.cis.nominal.dosage_result_arrays`, which `map_nominal` and
+  `map_conditional_dosage` now share. No change to any reported value.
 
 ## [0.3.0] - 2026-10-24
 

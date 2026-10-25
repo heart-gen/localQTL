@@ -204,3 +204,51 @@ def test_cli_cis_dosage_and_paired_covariate(cli_inputs, tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="dosage is only available"):
         main([c["geno"], c["bed"], "x", "-o", c["out"], "--device", "cpu", "--mode", "cis_independent",
               "--cis_output", cis_file, "--haplotypes", "x", "--ancestry_model", "dosage"])
+
+
+def test_cli_cis_conditional_and_grouped_dosage(cli_inputs, tmp_path, monkeypatch):
+    """`cis_conditional` re-fits given signals, and the dosage model now runs with groups."""
+    pytest.importorskip("rfmix_reader")
+    from rfmix_reader import from_legacy
+    from localqtl import cli
+    from localqtl.haplotypeio import LocalAncestryPanel
+    c = cli_inputs
+    var_df = c["variant_df"]
+    loci = pd.DataFrame({"chromosome": var_df["chrom"].astype(str).values,
+                         "physical_position": var_df["pos"].values})
+    g_anc = pd.DataFrame({"sample_id": c["samples"], "P0": 0.5, "P1": 0.5, "chrom": "1"})
+    codes = c["rng"].integers(0, 2, size=(len(var_df), len(c["samples"]), 2))
+    admix = np.stack([(codes == a).sum(axis=-1) for a in range(2)], axis=-1).astype(np.int8)
+    ds = from_legacy(loci, g_anc, admix)
+    monkeypatch.setattr(cli, "load_haplotypes",
+                        lambda args, sample_ids, logger: LocalAncestryPanel(ds, select_samples=list(sample_ids)))
+    base = [c["geno"], c["bed"], "cond", "--covariates", c["cov"], "-o", c["out"],
+            "--device", "cpu", "--window", "10000", "--haplotypes", "x"]
+
+    # grouped dosage permutations: one row per group
+    groups = os.path.join(c["out"], "groups.txt")
+    os.makedirs(c["out"], exist_ok=True)
+    pd.Series({p: ("gA" if p.startswith("gene1") else "gB")
+               for p in c["phenotype_df"].index}).to_csv(groups, sep="\t", header=False)
+    _run(base + ["--mode", "cis", "--permutations", "30", "--ancestry_model", "dosage",
+                 "--phenotype_groups", groups])
+    grouped = pd.read_csv(os.path.join(c["out"], "cond.cis_qtl.txt.gz"), sep="\t")
+    assert set(grouped["group_id"]) == {"gA", "gB"}
+    assert {"slope_anc0", "pval_joint", "pval_perm", "group_size"} <= set(grouped.columns)
+
+    # cis_conditional re-fits the lead variants of that scan
+    signals = os.path.join(c["out"], "signals.txt")
+    grouped[["phenotype_id", "variant_id"]].to_csv(signals, sep="\t", index=False)
+    for mode in ("genotype", "dosage", "none"):
+        _run(base + ["--mode", "cis_conditional", "--cis_output", signals, "--condition_on", mode])
+        out = pd.read_csv(os.path.join(c["out"], "cond.cis_conditional_qtl.txt.gz"), sep="\t")
+        assert len(out) == len(grouped)
+        assert {"slope_anc0", "slope_anc1", "pval_joint", "pval_diff_anc0_anc1"} <= set(out.columns)
+        assert (out["n_conditioned"] == 0).all()   # one signal per phenotype here
+
+    with pytest.raises(ValueError, match="requires --haplotypes"):
+        main([c["geno"], c["bed"], "x", "-o", c["out"], "--device", "cpu",
+              "--mode", "cis_conditional", "--cis_output", signals])
+    with pytest.raises(ValueError, match="must be provided"):
+        main([c["geno"], c["bed"], "x", "-o", c["out"], "--device", "cpu",
+              "--mode", "cis_conditional", "--haplotypes", "x"])

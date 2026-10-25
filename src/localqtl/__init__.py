@@ -31,7 +31,8 @@ from . import susie
 from . import trans
 from . import utils
 
-from .cis import CisMapper, map_independent, map_nominal, map_nominal_loci, map_permutations
+from .cis import (CisMapper, map_conditional_dosage, map_independent, map_nominal,
+                  map_nominal_loci, map_permutations)
 from .genotypeio import InputGeneratorCis, PlinkReader, get_vcf_region, get_vcf_variants
 from .trans import GenotypeGeneratorTrans, apply_permutations, filter_cis, map_trans, map_trans_permutations
 from .eigenmt import run_eigenmt
@@ -48,6 +49,7 @@ __all__ = [
     "map_nominal_loci",
     "map_permutations",
     "map_independent",
+    "map_conditional_dosage",
     "CisMapper",
     "map_trans",
     "map_trans_permutations",

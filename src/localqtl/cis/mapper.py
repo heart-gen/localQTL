@@ -8,6 +8,7 @@ from ..stats import calculate_qvalues as _calculate_qvalues
 from .nominal import map_nominal as _map_nominal, map_nominal_loci as _map_nominal_loci
 from .permutations import map_permutations as _map_permutations
 from .independent import map_independent as _map_independent
+from .conditional import map_conditional_dosage as _map_conditional_dosage
 from .postproc import get_significant_pairs as _get_significant_pairs
 
 __all__ = [
@@ -20,6 +21,7 @@ class CisMapper:
       - map_nominal
       - map_permutations
       - map_independent
+      - map_conditional_dosage
     """
 
     def __init__(
@@ -159,6 +161,7 @@ class CisMapper:
             maf_threshold: Optional[float] = None,
             ancestry_model: str = "main",
             interaction_covariate: Optional[object] = None,
+            paired_covariate_df: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
         return _map_independent(
@@ -187,6 +190,31 @@ class CisMapper:
             verbose=getattr(self.logger, "verbose", True),
             ancestry_model=ancestry_model,
             interaction_covariate=interaction_covariate,
+            paired_covariate_df=paired_covariate_df,
+        )
+
+    def map_conditional_dosage(
+            self, signals_df: pd.DataFrame, *,
+            condition_on: str = "genotype",
+            min_ancestry_ac: float = 0.0,
+    ) -> pd.DataFrame:
+        """Ancestry-specific effects at already-selected signals; see
+        :func:`localqtl.cis.map_conditional_dosage`."""
+        return _map_conditional_dosage(
+            genotype_df=self.genotype_df,
+            variant_df=self.variant_df,
+            phenotype_df=self.phenotype_df,
+            phenotype_pos_df=self.phenotype_pos_df,
+            signals_df=signals_df,
+            haplotypes=self.haplotypes,
+            covariates_df=self.covariates_df,
+            loci_df=self.loci_df,
+            condition_on=condition_on,
+            min_ancestry_ac=min_ancestry_ac,
+            device=self.device,
+            tensorqtl_flavor=self.tensorqtl_flavor,
+            logger=self.logger,
+            verbose=getattr(self.logger, "verbose", True),
         )
 
     def calculate_qvalues(

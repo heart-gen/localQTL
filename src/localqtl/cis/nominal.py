@@ -68,6 +68,72 @@ def _dosage_columns(n_ancestries: int) -> list[str]:
     return cols
 
 
+def dosage_result_arrays(
+        res: dict,
+        anc_stats: dict[str, np.ndarray] | None = None,
+        min_ancestry_ac: float = 0.0,
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    """
+    Turn a :func:`localqtl.regression_kernels.run_batch_dosage_regression`
+    result into the :func:`_dosage_columns` values for a batch of variants.
+
+    Ancestries whose in-sample minor-allele count is below ``min_ancestry_ac``
+    get NaN effects, t statistics and pairwise differences; the design, the
+    joint F and the allele statistics are left untouched.
+
+    Returns ``(dosage_vals, slope, slope_se, tstat, pval, dof)``, where the
+    four arrays summarise each variant by the ancestry with the strongest
+    unmasked effect.
+    """
+    dof = int(res["dof"])
+    b_np = res["betas"].detach().cpu().numpy()                      # (m, K)
+    se_np = res["ses"].detach().cpu().numpy()
+    t_np = res["tstats"].detach().cpu().numpy()
+    cov_np = res["cov"].detach().cpu().numpy().astype(np.float64)   # (m, K, K)
+    K = int(b_np.shape[1])
+
+    masked = None
+    if min_ancestry_ac and min_ancestry_ac > 0 and anc_stats is not None:
+        masked = anc_stats["ma_count"] < float(min_ancestry_ac)     # (m, K)
+        b_np = np.where(masked, np.nan, b_np)
+        se_np = np.where(masked, np.nan, se_np)
+        t_np = np.where(masked, np.nan, t_np)
+
+    dosage_vals: dict[str, np.ndarray] = {}
+    for k in range(K):
+        dosage_vals[f"slope_anc{k}"] = b_np[:, k]
+        dosage_vals[f"slope_se_anc{k}"] = se_np[:, k]
+        dosage_vals[f"tstat_anc{k}"] = t_np[:, k]
+        dosage_vals[f"pval_anc{k}"] = get_t_pval(t_np[:, k], dof)
+    f_np = res["fstat"].detach().cpu().numpy()
+    dosage_vals["fstat_joint"] = f_np
+    dosage_vals["pval_joint"] = get_f_pval(f_np, K, dof)
+    for i in range(K):
+        for j in range(i + 1, K):
+            var = cov_np[:, i, i] + cov_np[:, j, j] - 2.0 * cov_np[:, i, j]
+            z = (b_np[:, i] - b_np[:, j]) / np.sqrt(np.maximum(var, 1e-30))
+            if masked is not None:
+                z = np.where(masked[:, i] | masked[:, j], np.nan, z)
+            dosage_vals[f"z_diff_anc{i}_anc{j}"] = z
+            dosage_vals[f"pval_diff_anc{i}_anc{j}"] = get_t_pval(z, dof)
+    if anc_stats is not None:
+        for k in range(K):
+            dosage_vals[f"an_anc{k}"] = anc_stats["an"][:, k]
+            dosage_vals[f"ac_anc{k}"] = anc_stats["ac"][:, k]
+            dosage_vals[f"af_anc{k}"] = anc_stats["af"][:, k]
+            dosage_vals[f"ma_count_anc{k}"] = anc_stats["ma_count"][:, k]
+
+    # Lead signal = ancestry with the strongest (unmasked) effect
+    abs_t = np.abs(t_np)
+    all_nan = np.all(np.isnan(abs_t), axis=1)
+    best_k = np.nanargmax(np.where(all_nan[:, None], 0.0, abs_t), axis=1)
+    row_ix = np.arange(t_np.shape[0])
+    slope = b_np[row_ix, best_k]
+    slope_se = se_np[row_ix, best_k]
+    tstat = t_np[row_ix, best_k]
+    return dosage_vals, slope, slope_se, tstat, get_t_pval(tstat, dof), dof
+
+
 def _nominal_parquet_schema(
         include_perm: bool,
         ancestry_model: str | None = None,
@@ -421,55 +487,12 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
             cov_int_result = None
             dosage_vals: dict[str, np.ndarray] | None = None
             if dosage_mode:
-                K = int(D_resid.shape[2])
                 res = run_batch_dosage_regression(
                     y=y_t, D=D_resid, L=L_resid, k_eff=k_eff, device=device
                 )
-                dof = int(res["dof"])
-                b_np = res["betas"].detach().cpu().numpy()                     # (m, K)
-                se_np = res["ses"].detach().cpu().numpy()
-                t_np = res["tstats"].detach().cpu().numpy()
-                cov_np = res["cov"].detach().cpu().numpy().astype(np.float64)   # (m, K, K)
-                # Mask ancestries with too few minor alleles in-sample (report-level
-                # mask: the design and fstat_joint are unchanged).
-                masked = None
-                if min_ancestry_ac and min_ancestry_ac > 0 and anc_stats_np is not None:
-                    masked = anc_stats_np["ma_count"] < float(min_ancestry_ac)   # (m, K)
-                    b_np = np.where(masked, np.nan, b_np)
-                    se_np = np.where(masked, np.nan, se_np)
-                    t_np = np.where(masked, np.nan, t_np)
-                dosage_vals = {}
-                for k in range(K):
-                    dosage_vals[f"slope_anc{k}"] = b_np[:, k]
-                    dosage_vals[f"slope_se_anc{k}"] = se_np[:, k]
-                    dosage_vals[f"tstat_anc{k}"] = t_np[:, k]
-                    dosage_vals[f"pval_anc{k}"] = get_t_pval(t_np[:, k], dof)
-                f_np = res["fstat"].detach().cpu().numpy()
-                dosage_vals["fstat_joint"] = f_np
-                dosage_vals["pval_joint"] = get_f_pval(f_np, K, dof)
-                for i in range(K):
-                    for j in range(i + 1, K):
-                        var = cov_np[:, i, i] + cov_np[:, j, j] - 2.0 * cov_np[:, i, j]
-                        z = (b_np[:, i] - b_np[:, j]) / np.sqrt(np.maximum(var, 1e-30))
-                        if masked is not None:
-                            z = np.where(masked[:, i] | masked[:, j], np.nan, z)
-                        dosage_vals[f"z_diff_anc{i}_anc{j}"] = z
-                        dosage_vals[f"pval_diff_anc{i}_anc{j}"] = get_t_pval(z, dof)
-                if anc_stats_np is not None:
-                    for k in range(K):
-                        dosage_vals[f"an_anc{k}"] = anc_stats_np["an"][:, k]
-                        dosage_vals[f"ac_anc{k}"] = anc_stats_np["ac"][:, k]
-                        dosage_vals[f"af_anc{k}"] = anc_stats_np["af"][:, k]
-                        dosage_vals[f"ma_count_anc{k}"] = anc_stats_np["ma_count"][:, k]
-                # Lead signal = ancestry with the strongest (unmasked) effect
-                abs_t = np.abs(t_np)
-                all_nan = np.all(np.isnan(abs_t), axis=1)
-                best_k = np.nanargmax(np.where(all_nan[:, None], 0.0, abs_t), axis=1)
-                row_ix = np.arange(t_np.shape[0])
-                slope = b_np[row_ix, best_k]
-                slope_se = se_np[row_ix, best_k]
-                tstat = t_np[row_ix, best_k]
-                pvals = get_t_pval(tstat, dof)
+                dosage_vals, slope, slope_se, tstat, pvals, dof = dosage_result_arrays(
+                    res, anc_stats=anc_stats_np, min_ancestry_ac=min_ancestry_ac
+                )
                 perm_max_r2 = np.nan if include_perm else None
             elif interaction_mode:
                 pH = int(H_resid.shape[2])
