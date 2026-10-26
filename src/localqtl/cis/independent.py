@@ -14,7 +14,7 @@ from ..stats import beta_approx_pval, get_t_pval
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from ..preproc import impute_mean_and_filter, filter_by_maf
 from ..regression_kernels import Residualizer, prep_ctx_for_perm, perm_chunk_r2
-from ._permute import PermutationStream, compute_perm_r2_max
+from ._permute import PermutationStream, compute_perm_r2_max, freedman_lane, projectors_of
 from ._buffer import (
     allocate_result_buffers,
     ensure_capacity, write_row,
@@ -288,6 +288,7 @@ def _run_independent_core(
                         for sel in chunks:
                             flat = sel.reshape(-1)
                             y_perm = y_vec.index_select(0, flat).view(sel.shape[0], n_samp).transpose(0, 1)
+                            y_perm = freedman_lane(y_perm, projectors_of(rez_cov, rez_extra))
                             r2_max = None
                             for ctx_k, g_k in zip(ctx_list, g_list):
                                 r2_block = perm_chunk_r2(ctx_k, H_cov, g_k, y_perm, mixed_precision=mixed_precision)
@@ -398,6 +399,7 @@ def _run_independent_core(
                         mode=perm_indices_mode,
                     )
                     betas, ses, tstats, r2_nominal_vec, r2_perm_vals = compute_perm_r2_max(
+                        projectors=projectors_of(rez_cov, rez_extra),
                         y_resid=y_resid,
                         G_resid=I_t,
                         H_resid=H_cov,
@@ -458,6 +460,7 @@ def _run_independent_core(
                         mode=perm_indices_mode,
                     )
                     betas, ses, tstats, r2_nominal_vec, r2_perm_vals = compute_perm_r2_max(
+                        projectors=projectors_of(rez_cov, rez_extra),
                         y_resid=y_resid,
                         G_resid=G_resid,
                         H_resid=H_resid,
@@ -517,6 +520,7 @@ def _run_independent_core(
                             extra_perm = _r2_perm_from_chunks(y_resid, extra_chunks, ctx_list, g_list)
                         else:
                             _, _, _, _, extra_perm = compute_perm_r2_max(
+                                projectors=projectors_of(rez_cov, rez_extra),
                                 y_resid=y_resid,
                                 G_resid=G_resid,
                                 H_resid=H_resid,
@@ -960,6 +964,7 @@ def _run_independent_core_group(
                         for sel in chunks:
                             flat = sel.reshape(-1)
                             y_perm = y_vec.index_select(0, flat).view(sel.shape[0], n_samp).transpose(0, 1)
+                            y_perm = freedman_lane(y_perm, projectors_of(rez_cov, rez_extra))
                             r2_max = None
                             for ctx_k, g_k in zip(ctx_list, g_list):
                                 r2_block = perm_chunk_r2(ctx_k, H_cov, g_k, y_perm, mixed_precision=mixed_precision)
@@ -1171,6 +1176,7 @@ def _run_independent_core_group(
                             mode=perm_indices_mode,
                         )
                         betas, ses, tstats, r2_nom_vec, r2_perm_stage1 = compute_perm_r2_max(
+                            projectors=projectors_of(rez_cov, rez_extra),
                             y_resid=y_resid,
                             G_resid=I_t,
                             H_resid=H_cov,
@@ -1252,6 +1258,7 @@ def _run_independent_core_group(
                             updated_vectors: list[torch.Tensor] = []
                             for info in per_pheno:
                                 _, _, _, _, extra_perm = compute_perm_r2_max(
+                                    projectors=projectors_of(rez_cov, rez_extra),
                                     y_resid=y_resid_list[ids_list.index(info["pid"])],
                                     G_resid=I_t,
                                     H_resid=H_cov,
@@ -1335,6 +1342,7 @@ def _run_independent_core_group(
                         mode=perm_indices_mode,
                     )
                     betas, ses, tstats, r2_nom_vec, r2_perm_stage1 = compute_perm_r2_max(
+                        projectors=projectors_of(rez_cov, rez_extra),
                         y_resid=y_resid,
                         G_resid=G_resid,
                         H_resid=H_resid,
@@ -1416,6 +1424,7 @@ def _run_independent_core_group(
                         updated_vectors: list[torch.Tensor] = []
                         for info in per_pheno:
                             _, _, _, _, extra_perm = compute_perm_r2_max(
+                                projectors=projectors_of(rez_cov, rez_extra),
                                 y_resid=y_resid_list[ids_list.index(info["pid"])],
                                 G_resid=G_resid,
                                 H_resid=H_resid,

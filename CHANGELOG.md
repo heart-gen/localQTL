@@ -10,6 +10,26 @@ To release: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`, u
 compare links at the bottom, merge, and only then tag `vX.Y.Z`. The release workflow builds
 the GitHub release body from that section and stops if the tag has none.
 
+## [0.4.1] - 2026-10-25
+
+### Fixed
+
+- **Permutation p-values were anti-conservative in proportion to the number of covariates.**
+  Every permutation scan (`map_permutations` with and without local ancestry, the dosage
+  joint-F scan, grouped scans and `map_independent`) permuted the covariate-residualised
+  phenotype and compared it with the residualised genotypes without projecting the permuted
+  values back onto the covariate-orthogonal subspace. A permuted residual vector has `n`
+  exchangeable entries, the observed statistic lives on `n - k - 1` residual degrees of
+  freedom, so the null maximum statistic was too light (expected squared correlation
+  `1/(n-1)` instead of `1/(n-k-2)`), and `pval_perm` / `pval_beta` were too small: with
+  207 samples and 24 covariates the fraction of null phenotypes below 0.05 was 0.13-0.15
+  (0.19-0.27 for grouped real transcripts), and the scan called about twice tensorQTL's
+  eGenes on the same input. Permuted phenotypes are now re-residualised (Freedman & Lane,
+  1983: `M P M y`, `localqtl.cis._permute.freedman_lane`) with the covariate bases of every
+  residualiser in scope (shared covariates, paired covariates, the conditioning signals of
+  `map_independent`). tensorQTL permutes the raw phenotype and re-residualises, so parity
+  with it is restored up to the random streams. Nominal statistics are unchanged.
+
 ## [0.4.0] - 2026-10-25
 
 ### Added
@@ -303,6 +323,7 @@ output; see *Upgrading from 0.1* in the README.
   q-values.
 
 [Unreleased]: https://github.com/heart-gen/localQTL/compare/v0.4.0...HEAD
+[0.4.1]: https://github.com/heart-gen/localQTL/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/heart-gen/localQTL/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/heart-gen/localQTL/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/heart-gen/localQTL/compare/v0.1.4...v0.2.0

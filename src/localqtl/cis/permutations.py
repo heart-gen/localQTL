@@ -21,7 +21,7 @@ from ..regression_kernels import (
     dosage_fstat,
     dosage_perm_chunk_fmax,
 )
-from ._permute import PermutationStream, compute_perm_r2_max
+from ._permute import PermutationStream, compute_perm_r2_max, freedman_lane, projectors_of
 from ._buffer import (
     allocate_result_buffers,
     ensure_capacity, write_row,
@@ -309,6 +309,7 @@ def _run_permutation_core(
             for sel in stream.iter_chunks(nperm):
                 flat = sel.reshape(-1)
                 y_perm = y_resid_t.index_select(0, flat).view(sel.shape[0], n_samples).transpose(0, 1)
+                y_perm = freedman_lane(y_perm, projectors_of(rez_b))
                 fmax_parts.append(dosage_perm_chunk_fmax(ctx, y_perm))
             fmax_np = (torch.cat(fmax_parts).detach().cpu().numpy() if fmax_parts
                        else np.empty(0, dtype=np.float64))
@@ -351,6 +352,7 @@ def _run_permutation_core(
                     mode=perm_indices_mode,
                 )
                 betas_k, ses_k, tstats_k, r2_nominal_vec, r2_perm_vec = compute_perm_r2_max(
+                    projectors=projectors_of(rez_b),
                     y_resid=y_resid_t,
                     G_resid=I_resid[:, :, k],
                     H_resid=H_cov,
@@ -423,6 +425,7 @@ def _run_permutation_core(
             dof = max(n - int(k_eff) - int(p_pred), 1)
 
             betas, ses, tstats, r2_nominal_vec, r2_perm_max = compute_perm_r2_max(
+                projectors=projectors_of(rez_b),
                 y_resid=y_resid_t,
                 G_resid=I_t,
                 H_resid=H_cov,
@@ -492,6 +495,7 @@ def _run_permutation_core(
                 mode=perm_indices_mode,
             )
             _, _, _, _, r2_perm_max = compute_perm_r2_max(
+                projectors=projectors_of(rez_b),
                 y_resid=y_resid_t,
                 G_resid=G_resid,
                 H_resid=H_resid,
@@ -779,6 +783,7 @@ def _run_permutation_core_group(
                     flat = sel.reshape(-1)
                     y_perm = y_resid.index_select(0, flat).view(
                         sel.shape[0], n_samples_g).transpose(0, 1)
+                    y_perm = freedman_lane(y_perm, projectors_of(rez))
                     fmax_parts.append(dosage_perm_chunk_fmax(ctx, y_perm))
                 if fmax_parts:
                     f_perm_pheno = torch.cat(fmax_parts)
@@ -840,6 +845,7 @@ def _run_permutation_core_group(
                             mode=perm_indices_mode,
                         )
                         betas, ses, tstats, r2_nominal_vec, r2_perm_vec = compute_perm_r2_max(
+                            projectors=projectors_of(rez),
                             y_resid=y_resid,
                             G_resid=I_resid[:, :, k],
                             H_resid=H_cov,
@@ -908,6 +914,7 @@ def _run_permutation_core_group(
                         mode=perm_indices_mode,
                     )
                     betas, ses, tstats, r2_nominal_vec, r2_perm_vec = compute_perm_r2_max(
+                        projectors=projectors_of(rez),
                         y_resid=y_resid,
                         G_resid=I_t,
                         H_resid=H_cov,
@@ -942,6 +949,7 @@ def _run_permutation_core_group(
                         mode=perm_indices_mode,
                     )
                     betas, ses, tstats, r2_nominal_vec, r2_perm_vec = compute_perm_r2_max(
+                        projectors=projectors_of(rez),
                         y_resid=y_resid,
                         G_resid=G_resid,
                         H_resid=H_resid,

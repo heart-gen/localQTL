@@ -139,6 +139,36 @@ def perm_chunk_generator(
         yield chunk
 
 
+def projectors_of(*rezs) -> list[torch.Tensor]:
+    """The orthonormal covariate bases (``Residualizer.Q_t``) of the residualizers in scope, skipping
+    empty ones; passed to :func:`freedman_lane` so permuted phenotypes are re-residualised."""
+    out = []
+    for rez in rezs:
+        Q = getattr(rez, "Q_t", None)
+        if Q is not None and Q.numel() > 0:
+            out.append(Q)
+    return out
+
+
+@torch.no_grad()
+def freedman_lane(y_perm: torch.Tensor, projectors) -> torch.Tensor:
+    """
+    Re-residualise permuted phenotypes (Freedman & Lane 1983): ``y_perm`` holds covariate
+    residuals whose sample order was permuted, which moves them out of the covariate-orthogonal
+    subspace; projecting them back (``M P M y``) keeps the null statistic on the ``n - k - 1``
+    residual degrees of freedom the observed statistic has.  Permuting residuals without this
+    step makes the permutation p-values anti-conservative in proportion to the number of
+    covariates (localQTL <= 0.4.0).  ``y_perm`` is ``(n, chunk)``; ``projectors`` are ``(n, k)``
+    orthonormal bases, applied in order.
+    """
+    if not projectors:
+        return y_perm
+    for Q in projectors:
+        Q = Q.to(device=y_perm.device, dtype=y_perm.dtype)
+        y_perm = y_perm - Q @ (Q.transpose(0, 1) @ y_perm)
+    return y_perm
+
+
 @torch.no_grad()
 def compute_perm_r2_max(
         y_resid: torch.Tensor,
@@ -149,6 +179,7 @@ def compute_perm_r2_max(
         max_permutations: int | None = None,
         return_nominal: bool = False,
         mixed_precision: str | None = None,
+        projectors=None,
 ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -156,7 +187,10 @@ def compute_perm_r2_max(
         torch.Tensor | None,
         torch.Tensor,
     ]:
-    """Run chunked permutations from a stream, optionally returning nominal stats and r²."""
+    """Run chunked permutations from a stream, optionally returning nominal stats and r².
+
+    ``projectors`` (the covariate bases of the residualizers in scope) re-residualise every
+    permuted phenotype chunk (:func:`freedman_lane`)."""
     device = y_resid.device
     device_str = device.type if isinstance(device, torch.device) else str(device)
     y_resid = y_resid.contiguous()
@@ -195,7 +229,7 @@ def compute_perm_r2_max(
         for sel in perm_stream.iter_chunks(target):
             chunk = sel.shape[0]
             flat = sel.reshape(-1)
-            y_perm = y_resid.index_select(0, flat).view(chunk, n_samples).transpose(0, 1)
+            y_perm = freedman_lane(y_resid.index_select(0, flat).view(chunk, n_samples).transpose(0, 1), projectors)
             _, _, _, r2_block = run_batch_regression_with_permutations(
                 y=y_resid, G=G_resid, H=None, y_perm=y_perm, k_eff=k_eff,
                 device=device_str,
@@ -218,7 +252,7 @@ def compute_perm_r2_max(
         for sel in perm_stream.iter_chunks(target):
             chunk = sel.shape[0]
             flat = sel.reshape(-1)
-            y_perm = y_resid.index_select(0, flat).view(chunk, n_samples).transpose(0, 1)
+            y_perm = freedman_lane(y_resid.index_select(0, flat).view(chunk, n_samples).transpose(0, 1), projectors)
             r2_block = perm_chunk_r2(
                 ctx, H_resid, G_resid, y_perm, mixed_precision=mixed_precision
             )
