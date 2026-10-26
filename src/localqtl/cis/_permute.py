@@ -150,6 +150,24 @@ def projectors_of(*rezs) -> list[torch.Tensor]:
     return out
 
 
+def perm_source(y_raw: torch.Tensor | None, tensorqtl_flavor: bool) -> torch.Tensor | None:
+    """
+    What a permutation scan permutes.  ``None`` (the default, Freedman & Lane 1983): the caller
+    permutes the covariate residual and :func:`freedman_lane` re-residualises it, ``M P M y``.
+    With ``tensorqtl_flavor`` the centred *raw* phenotype is returned: it is permuted and
+    residualised once, ``M P y``, which is what tensorQTL's ``map_cis`` / ``map_independent`` do
+    (``calculate_cis_permutations`` permutes ``phenotype_t`` and ``calculate_corr`` residualises
+    the permuted copies).  The two schemes are both valid under exchangeability but give
+    different null maxima (about 5% more eGenes under ``M P M y`` with 24 covariates and 207
+    samples), so drop-in parity with tensorQTL needs its scheme.  ``y_raw`` is ``(n,)`` or
+    ``(m, n)``; centring commutes with permutation and the bases in ``projectors`` are
+    orthogonal to the constant vector, so centring once here is exact.
+    """
+    if not tensorqtl_flavor or y_raw is None:
+        return None
+    return y_raw - y_raw.mean(dim=-1, keepdim=True)
+
+
 @torch.no_grad()
 def freedman_lane(y_perm: torch.Tensor, projectors) -> torch.Tensor:
     """
@@ -180,6 +198,7 @@ def compute_perm_r2_max(
         return_nominal: bool = False,
         mixed_precision: str | None = None,
         projectors=None,
+        y_source: torch.Tensor | None = None,
 ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -190,10 +209,16 @@ def compute_perm_r2_max(
     """Run chunked permutations from a stream, optionally returning nominal stats and r².
 
     ``projectors`` (the covariate bases of the residualizers in scope) re-residualise every
-    permuted phenotype chunk (:func:`freedman_lane`)."""
+    permuted phenotype chunk (:func:`freedman_lane`).  ``y_source`` is the vector whose sample
+    order is permuted: ``None`` permutes ``y_resid`` (Freedman-Lane, ``M P M y``); the centred raw
+    phenotype from :func:`perm_source` gives tensorQTL's ``M P y``.  The nominal statistics
+    always come from ``y_resid``."""
     device = y_resid.device
     device_str = device.type if isinstance(device, torch.device) else str(device)
     y_resid = y_resid.contiguous()
+    src = y_resid if y_source is None else y_source.to(device=device, dtype=y_resid.dtype).contiguous()
+    if src.shape != y_resid.shape:
+        raise ValueError(f"y_source shape {tuple(src.shape)} does not match y_resid {tuple(y_resid.shape)}")
     G_resid = G_resid.contiguous()
     if H_resid is not None:
         H_resid = H_resid.contiguous()
@@ -229,7 +254,7 @@ def compute_perm_r2_max(
         for sel in perm_stream.iter_chunks(target):
             chunk = sel.shape[0]
             flat = sel.reshape(-1)
-            y_perm = freedman_lane(y_resid.index_select(0, flat).view(chunk, n_samples).transpose(0, 1), projectors)
+            y_perm = freedman_lane(src.index_select(0, flat).view(chunk, n_samples).transpose(0, 1), projectors)
             _, _, _, r2_block = run_batch_regression_with_permutations(
                 y=y_resid, G=G_resid, H=None, y_perm=y_perm, k_eff=k_eff,
                 device=device_str,
@@ -252,7 +277,7 @@ def compute_perm_r2_max(
         for sel in perm_stream.iter_chunks(target):
             chunk = sel.shape[0]
             flat = sel.reshape(-1)
-            y_perm = freedman_lane(y_resid.index_select(0, flat).view(chunk, n_samples).transpose(0, 1), projectors)
+            y_perm = freedman_lane(src.index_select(0, flat).view(chunk, n_samples).transpose(0, 1), projectors)
             r2_block = perm_chunk_r2(
                 ctx, H_resid, G_resid, y_perm, mixed_precision=mixed_precision
             )

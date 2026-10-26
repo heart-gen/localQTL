@@ -14,7 +14,7 @@ from ..stats import beta_approx_pval, get_t_pval
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from ..preproc import impute_mean_and_filter, filter_by_maf
 from ..regression_kernels import Residualizer, prep_ctx_for_perm, perm_chunk_r2
-from ._permute import PermutationStream, compute_perm_r2_max, freedman_lane, projectors_of
+from ._permute import PermutationStream, compute_perm_r2_max, freedman_lane, perm_source, projectors_of
 from ._buffer import (
     allocate_result_buffers,
     ensure_capacity, write_row,
@@ -101,7 +101,7 @@ def _run_independent_core(
         "ma_samples": np.int32,
         "ma_count": np.float32,
         "af": np.float32,
-        "true_dof": np.int32,
+        "true_dof": np.float32,
         "pval_true_dof": np.float32,
         "rank": np.int32,
     }
@@ -166,6 +166,7 @@ def _run_independent_core(
             seed_row = signif_seed_df.loc[pid]
 
             y_t = to_device_tensor(p, device, dtype=torch.float32)
+            y_src = perm_source(y_t, tensorqtl_flavor)      # tensorQTL scheme: permute the raw phenotype
             G_t = to_device_tensor(G_block, device, dtype=torch.float32)
             H_t = None if H_block is None else to_device_tensor(H_block, device, dtype=torch.float32)
 
@@ -344,7 +345,7 @@ def _run_independent_core(
                         ctx_list.append(ctx)
                         g_list.append(I_resid[:, :, k])
 
-                    r2_perm = _r2_perm_from_chunks(y_resid, stage_chunks, ctx_list, g_list)
+                    r2_perm = _r2_perm_from_chunks(y_resid if y_src is None else y_src, stage_chunks, ctx_list, g_list)
 
                     slope_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
                     slope_se_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
@@ -400,6 +401,7 @@ def _run_independent_core(
                     )
                     betas, ses, tstats, r2_nominal_vec, r2_perm_vals = compute_perm_r2_max(
                         projectors=projectors_of(rez_cov, rez_extra),
+                        y_source=y_src,
                         y_resid=y_resid,
                         G_resid=I_t,
                         H_resid=H_cov,
@@ -461,6 +463,7 @@ def _run_independent_core(
                     )
                     betas, ses, tstats, r2_nominal_vec, r2_perm_vals = compute_perm_r2_max(
                         projectors=projectors_of(rez_cov, rez_extra),
+                        y_source=y_src,
                         y_resid=y_resid,
                         G_resid=G_resid,
                         H_resid=H_resid,
@@ -517,10 +520,11 @@ def _run_independent_core(
                     if remaining > 0:
                         if interaction_mode:
                             extra_chunks = _perm_chunks(stream, remaining)
-                            extra_perm = _r2_perm_from_chunks(y_resid, extra_chunks, ctx_list, g_list)
+                            extra_perm = _r2_perm_from_chunks(y_resid if y_src is None else y_src, extra_chunks, ctx_list, g_list)
                         else:
                             _, _, _, _, extra_perm = compute_perm_r2_max(
                                 projectors=projectors_of(rez_cov, rez_extra),
+                                y_source=y_src,
                                 y_resid=y_resid,
                                 G_resid=G_resid,
                                 H_resid=H_resid,
@@ -562,7 +566,7 @@ def _run_independent_core(
                     "pval_beta": float(pval_beta),
                     "a_hat": float(a_hat),
                     "b_hat": float(b_hat),
-                    "true_dof": int(true_dof) if np.isfinite(true_dof) else int(dof),
+                    "true_dof": float(true_dof) if np.isfinite(true_dof) else float(dof),
                     "p_true": float(p_true),
                     "stop_pval": float(stop_pval),
                     "num_var": int(G_resid.shape[0]),
@@ -770,7 +774,7 @@ def _run_independent_core_group(
         "ma_samples": np.int32,
         "ma_count": np.float32,
         "af": np.float32,
-        "true_dof": np.int32,
+        "true_dof": np.float32,
         "pval_true_dof": np.float32,
         "rank": np.int32,
     }
@@ -883,6 +887,14 @@ def _run_independent_core_group(
 
             rez_cov = Residualizer(covariates_base_t, tensorqtl_flavor=tensorqtl_flavor) if covariates_base_t is not None else None
             y_base_list, G0, H0 = residualize_batch(y_stack, G_t, H_t, rez_cov, center=True, group=True)
+            y_src_list = perm_source(y_stack, tensorqtl_flavor)   # tensorQTL scheme: permute the raw phenotypes
+
+            def _src_or(y_default, pid_src):
+                """What the permutations of ``pid_src`` index: its centred raw phenotype under
+                tensorqtl_flavor, else ``y_default`` (the covariate residual, Freedman-Lane)."""
+                if y_src_list is None:
+                    return y_default
+                return y_src_list[ids_list.index(pid_src)]
             k_base = rez_cov.k_eff if rez_cov is not None else 1
 
             perm_seed_base = subseed(seed, f"group:{group_id}") if seed is not None else None
@@ -1016,7 +1028,7 @@ def _run_independent_core_group(
                             ctx_list.append(ctx)
                             g_list.append(I_resid[:, :, k])
 
-                        r2_perm_pheno = _r2_perm_from_chunks(y_resid, stage_chunks, ctx_list, g_list)
+                        r2_perm_pheno = _r2_perm_from_chunks(_src_or(y_resid, pid_inner), stage_chunks, ctx_list, g_list)
 
                         dof = max(int(y_resid.shape[0]) - int(k_eff) - int(p_pred), 1)
                         slope_gxh = np.full((n_anc,), np.nan, dtype=np.float32)
@@ -1084,7 +1096,7 @@ def _run_independent_core_group(
                             for info in per_pheno:
                                 extra_chunks = _perm_chunks(info["stream"], remaining)
                                 extra_perm = _r2_perm_from_chunks(
-                                    info["y_resid"], extra_chunks, info["ctx_list"], info["g_list"]
+                                    _src_or(info["y_resid"], info["pid"]), extra_chunks, info["ctx_list"], info["g_list"]
                                 )
                                 if extra_perm.numel():
                                     info["r2_perm"] = torch.cat([info["r2_perm"], extra_perm])
@@ -1122,7 +1134,7 @@ def _run_independent_core_group(
                     best_r2 = float(per_pheno[best_idx]["tensor"])
                     pval_nominal = float(get_t_pval(best_t, best_dof))
 
-                    true_dof_out = int(true_dof_val) if np.isfinite(true_dof_val) else int(best_dof)
+                    true_dof_out = float(true_dof_val) if np.isfinite(true_dof_val) else float(best_dof)
 
                     return {
                         "best_ix_var": int(best_ix),
@@ -1177,6 +1189,7 @@ def _run_independent_core_group(
                         )
                         betas, ses, tstats, r2_nom_vec, r2_perm_stage1 = compute_perm_r2_max(
                             projectors=projectors_of(rez_cov, rez_extra),
+                            y_source=_src_or(None, pid_inner),
                             y_resid=y_resid,
                             G_resid=I_t,
                             H_resid=H_cov,
@@ -1259,6 +1272,7 @@ def _run_independent_core_group(
                             for info in per_pheno:
                                 _, _, _, _, extra_perm = compute_perm_r2_max(
                                     projectors=projectors_of(rez_cov, rez_extra),
+                                    y_source=_src_or(None, info["pid"]),
                                     y_resid=y_resid_list[ids_list.index(info["pid"])],
                                     G_resid=I_t,
                                     H_resid=H_cov,
@@ -1303,7 +1317,7 @@ def _run_independent_core_group(
                     best_r2 = float(per_pheno[best_idx]["tensor"].item())
                     pval_nominal = float(get_t_pval(best_t, best_dof))
 
-                    true_dof_out = int(true_dof_val) if np.isfinite(true_dof_val) else int(best_dof)
+                    true_dof_out = float(true_dof_val) if np.isfinite(true_dof_val) else float(best_dof)
 
                     return {
                         "best_ix_var": int(best_ix),
@@ -1343,6 +1357,7 @@ def _run_independent_core_group(
                     )
                     betas, ses, tstats, r2_nom_vec, r2_perm_stage1 = compute_perm_r2_max(
                         projectors=projectors_of(rez_cov, rez_extra),
+                        y_source=_src_or(None, pid_inner),
                         y_resid=y_resid,
                         G_resid=G_resid,
                         H_resid=H_resid,
@@ -1425,6 +1440,7 @@ def _run_independent_core_group(
                         for info in per_pheno:
                             _, _, _, _, extra_perm = compute_perm_r2_max(
                                 projectors=projectors_of(rez_cov, rez_extra),
+                                y_source=_src_or(None, info["pid"]),
                                 y_resid=y_resid_list[ids_list.index(info["pid"])],
                                 G_resid=G_resid,
                                 H_resid=H_resid,
@@ -1469,7 +1485,7 @@ def _run_independent_core_group(
                 best_r2 = float(per_pheno[best_idx]["tensor"].item())
                 pval_nominal = float(get_t_pval(best_t, best_dof))
 
-                true_dof_out = int(true_dof_val) if np.isfinite(true_dof_val) else int(best_dof)
+                true_dof_out = float(true_dof_val) if np.isfinite(true_dof_val) else float(best_dof)
 
                 return {
                     "best_ix_var": int(best_ix),

@@ -10,6 +10,34 @@ To release: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`, u
 compare links at the bottom, merge, and only then tag `vX.Y.Z`. The release workflow builds
 the GitHub release body from that section and stops if the tag has none.
 
+## [0.4.2] - 2026-10-26
+
+### Fixed
+
+- **`tensorqtl_flavor` now uses tensorQTL's permutation scheme.** 0.4.1 re-residualised the
+  permuted covariate residual in every scan (Freedman & Lane, `M P M y`), and said that this
+  restored parity with tensorQTL. It does not: tensorQTL permutes the *raw* phenotype and
+  residualises the permuted copies once (`M P y`; `calculate_cis_permutations` permutes
+  `phenotype_t`, `calculate_corr` applies the residualizer). Both schemes are valid under
+  exchangeability but they are different nulls: on 207 caudate samples with 24 covariates and
+  10,000 permutations, `M P M y` gives 3-7% more eGenes per chromosome than tensorQTL on
+  identical input (beta shape2 about 3% higher, `pval_beta` Spearman 0.995 against tensorQTL),
+  and tensorQTL fed pre-residualised phenotypes reproduces those numbers exactly, so the gap is
+  the scheme and nothing else. Freedman-Lane stays the default for every model.
+  `tensorqtl_flavor=True` (`map_permutations`, `map_independent`, grouped and ungrouped,
+  with paired covariates and conditioning signals) now permutes the centred raw phenotype and
+  residualises it once with the bases of every residualizer in scope
+  (`localqtl.cis._permute.perm_source`, the `y_source` argument of `compute_perm_r2_max`),
+  which is tensorQTL's null up to the random streams (`tests/cis/test_permutation_scheme.py`
+  checks both schemes against a numpy reference on the same permutation indices and the flavor
+  against `tensorqtl.core.calculate_corr`). Nominal statistics are unchanged by the scheme.
+- **`true_dof` no longer overflows.** The effective-degrees-of-freedom root finder could run
+  off (1e14 on an interaction permutation scan of a null phenotype) and the value was stored in
+  an `int32` column, which raised `OverflowError` mid-scan and lost the chromosome. `true_dof`
+  is now `float32` in every result table, as tensorQTL's `true_df`, and an estimate more than a
+  factor `localqtl.stats.TRUE_DOF_MAX_RATIO` (10) away from the nominal degrees of freedom falls
+  back to the nominal value, as an optimiser failure already did.
+
 ## [0.4.1] - 2026-10-25
 
 ### Fixed
@@ -323,6 +351,7 @@ output; see *Upgrading from 0.1* in the README.
   q-values.
 
 [Unreleased]: https://github.com/heart-gen/localQTL/compare/v0.4.0...HEAD
+[0.4.2]: https://github.com/heart-gen/localQTL/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/heart-gen/localQTL/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/heart-gen/localQTL/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/heart-gen/localQTL/compare/v0.2.0...v0.3.0

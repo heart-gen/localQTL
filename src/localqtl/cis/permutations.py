@@ -21,7 +21,7 @@ from ..regression_kernels import (
     dosage_fstat,
     dosage_perm_chunk_fmax,
 )
-from ._permute import PermutationStream, compute_perm_r2_max, freedman_lane, projectors_of
+from ._permute import PermutationStream, compute_perm_r2_max, freedman_lane, perm_source, projectors_of
 from ._buffer import (
     allocate_result_buffers,
     ensure_capacity, write_row,
@@ -120,6 +120,14 @@ def _estimate_rows(ig, chrom: str | None, grouped: bool = False) -> int:
     return int(mask.sum())
 
 
+def _perm_source_row(perm_source_ctx, pid):
+    """The centred raw phenotype of ``pid`` when the scan permutes raw phenotypes, else ``None``."""
+    if perm_source_ctx is None:
+        return None
+    src, rows = perm_source_ctx
+    return src[rows[pid]]
+
+
 def _run_permutation_core(
         ig, variant_df, rez, nperm: int, device: str, beta_approx: bool = True,
         maf_threshold: float = 0.0, seed: int | None = None, chrom: str | None = None,
@@ -131,11 +139,15 @@ def _run_permutation_core(
         interaction_covariate_t: torch.Tensor | None = None,
         paired_ctx: dict | None = None,
         min_ancestry_ac: float = 0.0,
+        perm_source_ctx: tuple | None = None,
 ) -> pd.DataFrame:
     """
     One top association per phenotype with empirical permutation p-value (no grouping).
     ``paired_ctx`` maps phenotype IDs to ``(Residualizer, residualized y)`` for
-    phenotype-specific covariates (see ``map_nominal``).
+    phenotype-specific covariates (see ``map_nominal``).  ``perm_source_ctx`` is
+    ``(centred raw phenotypes, {phenotype_id: row})`` when the scan permutes the raw
+    phenotype (``tensorqtl_flavor``, see ``_permute.perm_source``); ``None`` permutes the
+    covariate residual (Freedman-Lane).
     Compatible with InputGeneratorCis and InputGeneratorCisWithHaps (ungrouped only).
     """
     expected_columns = [
@@ -170,7 +182,7 @@ def _run_permutation_core(
         "ma_samples": np.int32,
         "ma_count": np.float32,
         "af": np.float32,
-        "true_dof": np.int32,
+        "true_dof": np.float32,
         "pval_true_dof": np.float32,
     }
     for col in interaction_columns + dosage_columns:
@@ -210,6 +222,7 @@ def _run_permutation_core(
         rez_b = rez
         if paired_ctx and pid in paired_ctx:
             rez_b, p = paired_ctx[pid]
+        y_src = _perm_source_row(perm_source_ctx, pid)
 
         # Tensors
         y_t = to_device_tensor(p, device, dtype=torch.float32)
@@ -308,7 +321,7 @@ def _run_permutation_core(
             fmax_parts = []
             for sel in stream.iter_chunks(nperm):
                 flat = sel.reshape(-1)
-                y_perm = y_resid_t.index_select(0, flat).view(sel.shape[0], n_samples).transpose(0, 1)
+                y_perm = (y_resid_t if y_src is None else y_src).index_select(0, flat).view(sel.shape[0], n_samples).transpose(0, 1)
                 y_perm = freedman_lane(y_perm, projectors_of(rez_b))
                 fmax_parts.append(dosage_perm_chunk_fmax(ctx, y_perm))
             fmax_np = (torch.cat(fmax_parts).detach().cpu().numpy() if fmax_parts
@@ -353,6 +366,7 @@ def _run_permutation_core(
                 )
                 betas_k, ses_k, tstats_k, r2_nominal_vec, r2_perm_vec = compute_perm_r2_max(
                     projectors=projectors_of(rez_b),
+                    y_source=y_src,
                     y_resid=y_resid_t,
                     G_resid=I_resid[:, :, k],
                     H_resid=H_cov,
@@ -426,6 +440,7 @@ def _run_permutation_core(
 
             betas, ses, tstats, r2_nominal_vec, r2_perm_max = compute_perm_r2_max(
                 projectors=projectors_of(rez_b),
+                y_source=y_src,
                 y_resid=y_resid_t,
                 G_resid=I_t,
                 H_resid=H_cov,
@@ -496,6 +511,7 @@ def _run_permutation_core(
             )
             _, _, _, _, r2_perm_max = compute_perm_r2_max(
                 projectors=projectors_of(rez_b),
+                y_source=y_src,
                 y_resid=y_resid_t,
                 G_resid=G_resid,
                 H_resid=H_resid,
@@ -589,6 +605,7 @@ def _run_permutation_core_group(
         n_ancestries: int | None = None,
         interaction_covariate_t: torch.Tensor | None = None,
         min_ancestry_ac: float = 0.0,
+        perm_source_ctx: tuple | None = None,
 ) -> pd.DataFrame:
     """
     Group-aware permutation mapping: returns one top association per group with empirical p-values.
@@ -634,7 +651,7 @@ def _run_permutation_core_group(
         "ma_samples": np.int32,
         "ma_count": np.float32,
         "af": np.float32,
-        "true_dof": np.int32,
+        "true_dof": np.float32,
         "pval_true_dof": np.float32,
     }
     for col in interaction_columns + dosage_columns:
@@ -760,6 +777,7 @@ def _run_permutation_core_group(
                                                       pH=int(ctx["p"]))))
 
             for j, y_resid in enumerate(Y_resid):
+                y_src = _perm_source_row(perm_source_ctx, ids_list[j])
                 f_obs = torch.nan_to_num(dosage_fstat(ctx, y_resid), nan=-1.0)
                 f_max_t, ix_t = torch.max(f_obs, dim=0)
                 f_max = float(f_max_t.item())
@@ -781,7 +799,7 @@ def _run_permutation_core_group(
                 fmax_parts = []
                 for sel in stream.iter_chunks(nperm):
                     flat = sel.reshape(-1)
-                    y_perm = y_resid.index_select(0, flat).view(
+                    y_perm = (y_resid if y_src is None else y_src).index_select(0, flat).view(
                         sel.shape[0], n_samples_g).transpose(0, 1)
                     y_perm = freedman_lane(y_perm, projectors_of(rez))
                     fmax_parts.append(dosage_perm_chunk_fmax(ctx, y_perm))
@@ -819,6 +837,7 @@ def _run_permutation_core_group(
                                if f_lead_g > 0 else 0.0)
         else:
             for j, (pid_inner, y_resid) in enumerate(zip(ids_list, Y_resid)):
+                y_src = _perm_source_row(perm_source_ctx, pid_inner)
                 if interaction_mode:
                     if H_resid is None:
                         raise ValueError("interaction model requires haplotypes.")
@@ -846,6 +865,7 @@ def _run_permutation_core_group(
                         )
                         betas, ses, tstats, r2_nominal_vec, r2_perm_vec = compute_perm_r2_max(
                             projectors=projectors_of(rez),
+                            y_source=y_src,
                             y_resid=y_resid,
                             G_resid=I_resid[:, :, k],
                             H_resid=H_cov,
@@ -915,6 +935,7 @@ def _run_permutation_core_group(
                     )
                     betas, ses, tstats, r2_nominal_vec, r2_perm_vec = compute_perm_r2_max(
                         projectors=projectors_of(rez),
+                        y_source=y_src,
                         y_resid=y_resid,
                         G_resid=I_t,
                         H_resid=H_cov,
@@ -950,6 +971,7 @@ def _run_permutation_core_group(
                     )
                     betas, ses, tstats, r2_nominal_vec, r2_perm_vec = compute_perm_r2_max(
                         projectors=projectors_of(rez),
+                        y_source=y_src,
                         y_resid=y_resid,
                         G_resid=G_resid,
                         H_resid=H_resid,
@@ -1016,7 +1038,7 @@ def _run_permutation_core_group(
             "pval_beta": float(pval_beta),
             "beta_shape1": float(a_hat),
             "beta_shape2": float(b_hat),
-            "true_dof": int(true_dof) if np.isfinite(true_dof) else int(best_dof),
+            "true_dof": float(true_dof) if np.isfinite(true_dof) else float(best_dof),
             "pval_true_dof": p_true,
             "ma_samples": int(ma_samples_t[best_ix_var].item()),
             "ma_count": float(ma_count_t[best_ix_var].item()),
@@ -1167,6 +1189,13 @@ def map_permutations(
 
     # Residualize phenotypes once (after generator filters constants/missing)
     Y = to_device_tensor(ig.phenotype_df.values, device, dtype=torch.float32)
+    perm_source_ctx = None
+    src = perm_source(Y, tensorqtl_flavor)
+    if src is not None:
+        perm_source_ctx = (src, {pid: i for i, pid in enumerate(ig.phenotype_df.index)})
+    logger.write("  * permutation scheme: " + ("permute raw phenotype, residualise once (tensorQTL)"
+                                              if perm_source_ctx is not None else
+                                              "permute covariate residual, re-residualise (Freedman-Lane)"))
     with logger.time_block("Residualizing phenotypes", sync=sync):
         Y_resid, rez = residualize_matrix_with_covariates(Y, covariates_use,
                                                           device, tensorqtl_flavor)
@@ -1209,6 +1238,7 @@ def map_permutations(
                         n_ancestries=n_anc,
                         interaction_covariate_t=interaction_cov_t,
                         min_ancestry_ac=min_ancestry_ac,
+                        perm_source_ctx=perm_source_ctx,
                     )
                 else:
                     chrom_df = core(
@@ -1224,6 +1254,7 @@ def map_permutations(
                         interaction_covariate_t=interaction_cov_t,
                         paired_ctx=paired_ctx,
                         min_ancestry_ac=min_ancestry_ac,
+                        perm_source_ctx=perm_source_ctx,
                     )
             results.append(chrom_df)
             if logger.verbose:

@@ -114,6 +114,25 @@ def _approx_beta_alpha(r2_perm, dof):
     return max(m * (m * (1.0 - m) / v - 1.0), 1e-6)
 
 
+TRUE_DOF_MAX_RATIO = 10.0
+
+
+def _accept_true_dof(dof_est, dof_init) -> float:
+    """
+    The effective degrees of freedom are a modest correction of the nominal ones (tensorQTL's
+    ``true_df`` sits within a factor of about two of ``dof``).  A root more than
+    ``TRUE_DOF_MAX_RATIO`` away on either side is the optimiser running off (observed: 1e14 on an
+    interaction scan, which overflowed the int32 result column in <= 0.4.1); the nominal
+    ``dof_init`` is used instead, as on optimiser failure.
+    """
+    dof_init = float(dof_init)
+    if not np.isfinite(dof_est):
+        return dof_init
+    if dof_est < dof_init / TRUE_DOF_MAX_RATIO or dof_est > dof_init * TRUE_DOF_MAX_RATIO:
+        return dof_init
+    return float(dof_est)
+
+
 def _solve_true_dof(r2_perm, dof_init, tol=1e-4):
     """Estimate best-fitting DoF for mapping R^2 -> p-values -> Beta dist."""
     r2_perm = np.asarray(r2_perm, dtype=np.float64)
@@ -123,15 +142,14 @@ def _solve_true_dof(r2_perm, dof_init, tol=1e-4):
     try:
         f = lambda log_dof: np.log(_approx_beta_alpha(r2_perm, np.exp(log_dof)))
         log_dof = scipy.optimize.newton(f, np.log(dof_init), tol=tol, maxiter=50)
-        dof_est = float(np.exp(log_dof))
-        return dof_est if np.isfinite(dof_est) else float(dof_init)
+        return _accept_true_dof(float(np.exp(log_dof)), dof_init)
     except Exception:
         res = scipy.optimize.minimize(
             lambda x: abs(_approx_beta_alpha(r2_perm, x[0]) - 1.0),
             x0=[dof_init], method="Nelder-Mead", tol=tol,
         )
         dof_est = float(res.x[0])
-        return dof_est if res.success and np.isfinite(dof_est) else float(dof_init)
+        return _accept_true_dof(dof_est, dof_init) if res.success else float(dof_init)
 
 
 def _beta_mle_on_p(p):
