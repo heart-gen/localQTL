@@ -146,6 +146,29 @@ def test_resolve_ld_options_and_credible_sets():
     assert empty["cs"] == [] and len(empty["pip"]) == 0
 
 
+def test_lead_ld_contrast_accepts_credible_sets_as_tensors():
+    """SuSiE returns the credible-set indices (and may return the PIPs) as tensors on the compute device."""
+    d = _ld_cohort(seed=17)
+    G_t, H_t, rez, y_r, D_r, L_r, G_r = _torch_inputs(d)
+    cs_t = {"cs": [torch.tensor([TAG, CAUSAL])], "pip": torch.tensor([0.4, 0.6] + [0.0] * (G_t.shape[0] - 2), dtype=torch.float64),
+            "converged": True}
+    cs_n = {"cs": [np.array([TAG, CAUSAL])], "pip": np.array([0.4, 0.6] + [0.0] * (G_t.shape[0] - 2)), "converged": True}
+    a = LD.lead_ld_contrast(y_r, D_r, L_r, G_t, H_t, rez, TAG, k_eff=rez.k_eff, cs=cs_t, G_resid=G_r, device="cpu")
+    b = LD.lead_ld_contrast(y_r, D_r, L_r, G_t, H_t, rez, TAG, k_eff=rez.k_eff, cs=cs_n, G_resid=G_r, device="cpu")
+    assert a == b and a["n_conditioned_ld"] == 1 and a["cs_size_ld"] == 2 and a["pip_ld"] == 0.4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the device path of the LD-aware scan needs a GPU")
+def test_map_permutations_ld_aware_on_cuda_matches_cpu():
+    d = _ld_cohort(seed=23, n=200)
+    args = (d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"], d["covariates_df"])
+    cpu = map_permutations(*args, **_perm_kw(d, ld_aware=True, nperm=30))
+    gpu = map_permutations(*args, **_perm_kw(d, ld_aware=True, nperm=30, device="cuda"))
+    assert gpu.iloc[0]["variant_id"] == cpu.iloc[0]["variant_id"]
+    for c in ("pval_diff_ld_anc0_anc1", "z_diff_ld_anc0_anc1", "n_conditioned_ld", "cs_size_ld", "pip_ld", "dof_ld"):
+        np.testing.assert_allclose(gpu.iloc[0][c], cpu.iloc[0][c], rtol=1e-3, atol=1e-5)
+
+
 def _perm_kw(d, **extra):
     kw = dict(haplotypes=d["panel"], ancestry_model="dosage", device="cpu", window=1000, logger=LG, nperm=100, seed=1)
     kw.update(extra)

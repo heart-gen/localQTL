@@ -101,6 +101,19 @@ def resolve_ld_options(opts: dict | None) -> dict:
     return {"condition_on": condition_on, "susie": susie}
 
 
+def _index_array(v) -> np.ndarray:
+    """Credible-set member indices as a flat int64 numpy array (SuSiE returns device tensors)."""
+    if isinstance(v, torch.Tensor):
+        v = v.detach().cpu().numpy()
+    return np.asarray(v, dtype=np.int64).reshape(-1)
+
+
+def _float_array(v) -> np.ndarray:
+    if isinstance(v, torch.Tensor):
+        v = v.detach().cpu().numpy()
+    return np.asarray(v, dtype=np.float64).reshape(-1)
+
+
 @torch.no_grad()
 def credible_sets(y_resid: torch.Tensor, G_resid: torch.Tensor, *, L: int = 10, coverage: float = 0.95,
                   min_abs_corr: float = 0.5, max_iter: int = 200, tol: float = 1e-3,
@@ -125,9 +138,8 @@ def credible_sets(y_resid: torch.Tensor, G_resid: torch.Tensor, *, L: int = 10, 
     sets = res.get("sets") or {}
     cs: list[np.ndarray] = []
     if sets.get("cs") and bool(res.get("converged", False)):
-        cs = [np.asarray(v, dtype=np.int64).reshape(-1) for v in sets["cs"].values()]
-    return {"cs": cs, "pip": np.asarray(res["pip"], dtype=np.float64).reshape(-1),
-            "converged": bool(res.get("converged", False))}
+        cs = [_index_array(v) for v in sets["cs"].values()]
+    return {"cs": cs, "pip": _float_array(res["pip"]), "converged": bool(res.get("converged", False))}
 
 
 @torch.no_grad()
@@ -249,9 +261,10 @@ def lead_ld_contrast(y_resid: torch.Tensor, D_resid: torch.Tensor, L_resid: torc
     if cs is None:
         cs = credible_sets(y_resid, G_resid, **(susie or {}))
     ix = int(ix)
-    members = sorted({int(i) for arr in cs["cs"] for i in np.asarray(arr).reshape(-1)} - {ix})
-    cs_size = next((int(len(arr)) for arr in cs["cs"] if ix in set(int(i) for i in np.asarray(arr).reshape(-1))), 0)
-    pip = cs["pip"]
+    sets_ = [_index_array(arr) for arr in cs["cs"]]
+    members = sorted({int(i) for arr in sets_ for i in arr} - {ix})
+    cs_size = next((int(len(arr)) for arr in sets_ if ix in set(int(i) for i in arr)), 0)
+    pip = _float_array(cs["pip"])
     pip_lead = float(pip[ix]) if ix < len(pip) else float("nan")
     X = conditioning_columns(G_t, H_t, rez, members, condition_on=condition_on, G_resid=G_resid)
     one = slice(ix, ix + 1)
