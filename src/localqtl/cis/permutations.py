@@ -39,6 +39,7 @@ from .common import (
     prepare_interaction_covariate,
 )
 from .nominal import _dosage_columns, _n_ancestries, dosage_result_arrays
+from .ld_aware import ld_columns, lead_ld_contrast, resolve_ld_options
 
 __all__ = [
     "map_permutations",
@@ -55,6 +56,9 @@ def _interaction_columns(n_ancestries: int) -> list[str]:
             f"pval_gxh_{suffix}",
         ])
     return cols
+
+LD_INT_COLUMNS = frozenset({"n_conditioned_ld", "rank_ld", "dof_ld", "n_cs_ld", "cs_size_ld"})
+
 
 def _nanmax(x: torch.Tensor, dim: int):
     if hasattr(torch, "nanmax"):
@@ -140,6 +144,7 @@ def _run_permutation_core(
         paired_ctx: dict | None = None,
         min_ancestry_ac: float = 0.0,
         perm_source_ctx: tuple | None = None,
+        ld_aware: dict | None = None,
 ) -> pd.DataFrame:
     """
     One top association per phenotype with empirical permutation p-value (no grouping).
@@ -164,6 +169,10 @@ def _run_permutation_core(
     if ancestry_model == "dosage" and n_ancestries is not None and n_ancestries > 0:
         dosage_columns = _dosage_columns(int(n_ancestries))
         expected_columns.extend(dosage_columns)
+    ld_cols: list[str] = []                       # the LD-aware contrast of the lead (ld_aware)
+    if ld_aware is not None and dosage_columns:
+        ld_cols = ld_columns(int(n_ancestries))
+        expected_columns.extend(ld_cols)
     dtype_map = {
         "phenotype_id": object,
         "variant_id": object,
@@ -187,6 +196,8 @@ def _run_permutation_core(
     }
     for col in interaction_columns + dosage_columns:
         dtype_map[col] = np.float32
+    for col in ld_cols:
+        dtype_map[col] = np.int32 if col in LD_INT_COLUMNS else np.float32
     buffers = allocate_result_buffers(expected_columns, dtype_map, _estimate_rows(ig, chrom))
     cursor = 0
     processed = 0
@@ -285,6 +296,7 @@ def _run_permutation_core(
         k_eff = rez_b.k_eff if rez_b is not None else 1
 
         dosage_vals: dict[str, float] | None = None
+        ld_vals: dict | None = None
         if dosage_mode:
             # Joint Wald F over the K ancestry effects is the per-variant
             # statistic; the permutation statistic is its maximum over the
@@ -303,6 +315,12 @@ def _run_permutation_core(
             dosage_vals, beta, se, tval, _ = _dosage_lead_row(
                 y_resid_t, D_resid, L_resid, G_t, H_t, ix, k_eff, min_ancestry_ac, device
             )
+            if ld_aware is not None:
+                ld_vals = lead_ld_contrast(
+                    y_resid_t, D_resid, L_resid, G_t, H_t, rez_b, ix, k_eff=k_eff,
+                    condition_on=ld_aware["condition_on"], susie=ld_aware["susie"],
+                    min_ancestry_ac=min_ancestry_ac, device=device,
+                )
             f_lead = float(dosage_vals["fstat_joint"])
             pval_nominal = float(dosage_vals["pval_joint"])
             r2_nominal = float(K * f_lead / (K * f_lead + dof)) if f_lead > 0 else 0.0
@@ -579,6 +597,9 @@ def _run_permutation_core(
         if dosage_mode and dosage_vals is not None:
             for col in dosage_columns:
                 row[col] = dosage_vals.get(col, np.nan)
+        if ld_cols and ld_vals is not None:
+            for col in ld_cols:
+                row[col] = ld_vals.get(col, np.nan)
         write_row(buffers, cursor, row)
         cursor += 1
         processed += 1
@@ -606,6 +627,7 @@ def _run_permutation_core_group(
         interaction_covariate_t: torch.Tensor | None = None,
         min_ancestry_ac: float = 0.0,
         perm_source_ctx: tuple | None = None,
+        ld_aware: dict | None = None,
 ) -> pd.DataFrame:
     """
     Group-aware permutation mapping: returns one top association per group with empirical p-values.
@@ -631,6 +653,10 @@ def _run_permutation_core_group(
     if ancestry_model == "dosage" and n_ancestries is not None and n_ancestries > 0:
         dosage_columns = _dosage_columns(int(n_ancestries))
         expected_columns.extend(dosage_columns)
+    ld_cols: list[str] = []                       # the LD-aware contrast of the lead (ld_aware)
+    if ld_aware is not None and dosage_columns:
+        ld_cols = ld_columns(int(n_ancestries))
+        expected_columns.extend(ld_cols)
     dtype_map = {
         "group_id": object,
         "group_size": np.int32,
@@ -656,6 +682,8 @@ def _run_permutation_core_group(
     }
     for col in interaction_columns + dosage_columns:
         dtype_map[col] = np.float32
+    for col in ld_cols:
+        dtype_map[col] = np.int32 if col in LD_INT_COLUMNS else np.float32
     buffers = allocate_result_buffers(expected_columns, dtype_map,
                                       _estimate_rows(ig, chrom, grouped=True))
     cursor = 0
@@ -752,6 +780,7 @@ def _run_permutation_core_group(
         true_dof = float("nan")
         pval_nominal = float("nan")
         dosage_vals: dict[str, float] | None = None
+        ld_vals: dict | None = None
         num_var = int(G_resid.shape[0])
 
         r2_perm_global = torch.full((nperm,), -float("inf"), device=G_resid.device, dtype=torch.float32)
@@ -831,6 +860,12 @@ def _run_permutation_core_group(
                     Y_resid[best_ix_pheno], D_resid, L_resid, G_t, H_t,
                     best_ix_var, k_eff_g, min_ancestry_ac, device,
                 )
+                if ld_aware is not None:
+                    ld_vals = lead_ld_contrast(
+                        Y_resid[best_ix_pheno], D_resid, L_resid, G_t, H_t, rez, best_ix_var, k_eff=k_eff_g,
+                        condition_on=ld_aware["condition_on"], susie=ld_aware["susie"],
+                        min_ancestry_ac=min_ancestry_ac, device=device,
+                    )
                 f_lead_g = float(dosage_vals["fstat_joint"])
                 pval_nominal = float(dosage_vals["pval_joint"])
                 best_r2_val = (float(K * f_lead_g / (K * f_lead_g + dof))
@@ -1054,6 +1089,9 @@ def _run_permutation_core_group(
         if dosage_mode and dosage_vals is not None:
             for col in dosage_columns:
                 row[col] = dosage_vals.get(col, np.nan)
+        if ld_cols and ld_vals is not None:
+            for col in ld_cols:
+                row[col] = ld_vals.get(col, np.nan)
         write_row(buffers, cursor, row)
         cursor += 1
         processed += 1
@@ -1084,6 +1122,8 @@ def map_permutations(
         interaction_covariate: Optional[object] = None,
         paired_covariate_df: Optional[pd.DataFrame] = None,
         min_ancestry_ac: float = 0.0,
+        ld_aware: bool = False,
+        ld_aware_opts: dict | None = None,
 ) -> pd.DataFrame:
     """
     Empirical cis-QTL mapping (one top variant per phenotype) with permutations.
@@ -1112,11 +1152,29 @@ def map_permutations(
         this value get NaN effect estimates and pairwise differences in the
         reported lead row (the joint test and the variant ranking are
         unchanged).
+    ld_aware : bool, default False
+        Dosage model: also report the LD-aware contrast of the lead
+        (:mod:`localqtl.cis.ld_aware`): SuSiE on the pooled genotypes of the
+        window gives the phenotype's credible sets, and the lead's
+        ancestry-specific dosages are refitted conditional on the other
+        credible-set variants, so a shared causal effect tagged with
+        ancestry-specific LD cannot show up as heterogeneity at the lead.
+        Adds the ``*_ld`` columns (``pval_diff_ld_anc{i}_anc{j}``,
+        ``n_conditioned_ld``, ``cs_size_ld``, ``pip_ld``, ...).
+    ld_aware_opts : dict, optional
+        ``condition_on`` (``"genotype"``, default, or ``"dosage"``) and the
+        SuSiE settings ``L``, ``coverage``, ``min_abs_corr``, ``max_iter``,
+        ``tol``, ``scaled_prior_variance``.
     """
     device = device if device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
     torch_device = torch.device(device)
     logger = logger or SimpleLogger(verbose=verbose, timestamps=True)
     sync = (torch.cuda.synchronize if device == "cuda" else None)
+    ld_opts = None
+    if ld_aware:
+        if ancestry_model != "dosage" or haplotypes is None:
+            raise ValueError("ld_aware needs ancestry_model='dosage' with haplotypes.")
+        ld_opts = resolve_ld_options(ld_aware_opts)
 
     # Header (tensorQTL-style)
     logger.write("cis-QTL mapping: permutation scan (top per phenotype)")
@@ -1161,6 +1219,10 @@ def map_permutations(
         raise ValueError("ancestry_model='dosage' cannot be combined with paired_covariate_df.")
     if min_ancestry_ac and min_ancestry_ac > 0 and ancestry_model != "dosage":
         raise ValueError("min_ancestry_ac is only meaningful with ancestry_model='dosage'.")
+    if ld_opts is not None:
+        logger.write(f"  * LD-aware contrast of the lead: conditioning on its credible sets "
+                     f"({ld_opts['condition_on']}; SuSiE L={ld_opts['susie']['L']}, "
+                     f"coverage={ld_opts['susie']['coverage']}, min_abs_corr={ld_opts['susie']['min_abs_corr']})")
 
     covariates_use = covariates_df
     if isinstance(interaction_covariate, str) and covariates_df is not None:
@@ -1239,6 +1301,7 @@ def map_permutations(
                         interaction_covariate_t=interaction_cov_t,
                         min_ancestry_ac=min_ancestry_ac,
                         perm_source_ctx=perm_source_ctx,
+                        ld_aware=ld_opts,
                     )
                 else:
                     chrom_df = core(
@@ -1255,6 +1318,7 @@ def map_permutations(
                         paired_ctx=paired_ctx,
                         min_ancestry_ac=min_ancestry_ac,
                         perm_source_ctx=perm_source_ctx,
+                        ld_aware=ld_opts,
                     )
             results.append(chrom_df)
             if logger.verbose:

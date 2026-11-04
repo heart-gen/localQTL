@@ -130,6 +130,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "not at all (none)")
     la.add_argument('--min_ancestry_ac', default=0.0, type=float,
                     help='Dosage model: mask ancestries with fewer in-sample minor alleles than this')
+    la.add_argument('--ld_aware', action='store_true',
+                    help="'cis' mode with --ancestry_model dosage: also report the LD-aware contrast of the lead "
+                         "(SuSiE credible sets of the window, L from --max_effects; the other credible-set variants "
+                         "are conditioned on as --condition_on says, genotype or dosage)")
+    la.add_argument('--credible_sets', default=None,
+                    help="'cis_conditional' mode: credible-set table (phenotype_id, variant_id; the cis_susie output) "
+                         "that adds the LD-aware contrast next to the standard columns")
     misc = parser.add_argument_group('localQTL options')
     misc.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'], help='Compute device')
     misc.add_argument('--perm_chunk', default=4096, type=int, help='Permutations per GPU chunk (cis modes)')
@@ -349,6 +356,8 @@ def main(argv=None) -> int:
                   nperm=args.permutations, window=args.window, beta_approx=not args.disable_beta_approx,
                   maf_threshold=maf_threshold, logger=logger, seed=args.seed, device=device,
                   perm_chunk=args.perm_chunk, min_ancestry_ac=args.min_ancestry_ac, **la_kwargs)
+        if args.ld_aware:
+            kw.update(ld_aware=True, ld_aware_opts={'condition_on': args.condition_on, 'L': args.max_effects})
         if pgr is None:
             res_df = map_permutations(genotype_df, variant_df, phenotype_df, phenotype_pos_df, **kw)
         else:
@@ -442,9 +451,14 @@ def main(argv=None) -> int:
             signals_df = signals_df.reset_index()
         signals_df = signals_df[[c for c in ('phenotype_id', 'variant_id', 'rank')
                                  if c in signals_df.columns]]
+        credible_sets_df = None
+        if args.credible_sets is not None:
+            credible_sets_df = _read_table(args.credible_sets)
+            if 'phenotype_id' not in credible_sets_df.columns:
+                credible_sets_df = _read_table(args.credible_sets, index_col=0).reset_index(names='phenotype_id')
         res_df = map_conditional_dosage(
             genotype_df, variant_df, phenotype_df, phenotype_pos_df, signals_df, haplotypes,
-            covariates_df=covariates_df, condition_on=args.condition_on,
+            covariates_df=covariates_df, condition_on=args.condition_on, credible_sets_df=credible_sets_df,
             min_ancestry_ac=args.min_ancestry_ac, device=device, logger=logger,
         )
         logger.write('  * writing output')
