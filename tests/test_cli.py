@@ -260,3 +260,65 @@ def test_cli_cis_conditional_and_grouped_dosage(cli_inputs, tmp_path, monkeypatc
     with pytest.raises(ValueError, match="does not support --phenotype_groups"):
         main(base + ["--mode", "cis_conditional", "--cis_output", signals,
                      "--phenotype_groups", groups])
+
+
+def test_cli_ld_aware_and_credible_sets(cli_inputs, tmp_path, monkeypatch):
+    """`--ld_aware` adds the LD-aware contrast to a dosage `cis` scan; `--credible_sets` adds it to `cis_conditional`."""
+    pytest.importorskip("rfmix_reader")
+    from rfmix_reader import from_legacy
+    from localqtl import cli
+    from localqtl.haplotypeio import LocalAncestryPanel
+    c = cli_inputs
+    var_df = c["variant_df"]
+    loci = pd.DataFrame({"chromosome": var_df["chrom"].astype(str).values,
+                         "physical_position": var_df["pos"].values})
+    g_anc = pd.DataFrame({"sample_id": c["samples"], "P0": 0.5, "P1": 0.5, "chrom": "1"})
+    codes = c["rng"].integers(0, 2, size=(len(var_df), len(c["samples"]), 2))
+    admix = np.stack([(codes == a).sum(axis=-1) for a in range(2)], axis=-1).astype(np.int8)
+    ds = from_legacy(loci, g_anc, admix)
+    monkeypatch.setattr(cli, "load_haplotypes",
+                        lambda args, sample_ids, logger: LocalAncestryPanel(ds, select_samples=list(sample_ids)))
+    base = [c["geno"], c["bed"], "ld", "--covariates", c["cov"], "-o", c["out"], "--device", "cpu",
+            "--window", "10000", "--haplotypes", "x", "--seed", "3"]
+
+    _run(base + ["--mode", "cis", "--permutations", "30", "--ancestry_model", "dosage"])
+    plain = pd.read_csv(os.path.join(c["out"], "ld.cis_qtl.txt.gz"), sep="\t")
+    _run(base + ["--mode", "cis", "--permutations", "30", "--ancestry_model", "dosage", "--ld_aware",
+                 "--max_effects", "3", "--condition_on", "dosage"])
+    scan = pd.read_csv(os.path.join(c["out"], "ld.cis_qtl.txt.gz"), sep="\t")
+    ld_cols = {"slope_ld_anc0", "pval_joint_ld", "z_diff_ld_anc0_anc1", "pval_diff_ld_anc0_anc1",
+               "n_conditioned_ld", "rank_ld", "dof_ld", "n_cs_ld", "cs_size_ld", "pip_ld"}
+    assert ld_cols <= set(scan.columns) and not ld_cols & set(plain.columns)
+    assert len(scan) == len(plain) == 3 and (scan["variant_id"] == plain["variant_id"]).all()
+    assert scan["pval_diff_ld_anc0_anc1"].between(0, 1).all() and (scan["dof_ld"] <= scan["true_df"]).all()
+    with pytest.raises(ValueError, match="ld_aware"):
+        main(base + ["--mode", "cis", "--permutations", "30", "--ld_aware"])
+
+    # cis_conditional with the credible sets of a cis_susie run
+    signals = os.path.join(c["out"], "signals.txt")
+    scan[["phenotype_id", "variant_id"]].to_csv(signals, sep="\t", index=False)
+    cs_file = os.path.join(c["out"], "credible_sets.txt")
+    rows = []
+    for pid, vid in zip(scan["phenotype_id"], scan["variant_id"]):      # the lead plus one more window variant
+        chrom = str(c["phenotype_pos_df"].loc[pid, "chr"])
+        other = next(v for v in c["variant_df"].index[c["variant_df"]["chrom"].astype(str) == chrom] if v != vid)
+        rows += [(pid, vid, "1"), (pid, other, "1")]
+    cs = pd.DataFrame(rows, columns=["phenotype_id", "variant_id", "cs_id"])
+    cs.to_csv(cs_file, sep="\t", index=False)
+    _run(base + ["--mode", "cis_conditional", "--cis_output", signals, "--credible_sets", cs_file])
+    cond = pd.read_csv(os.path.join(c["out"], "ld.cis_conditional_qtl.txt.gz"), sep="\t")
+    assert len(cond) == 3 and {"pval_diff_ld_anc0_anc1", "n_conditioned_ld", "n_conditioned_cs", "dof_ld"} <= set(cond.columns)
+    assert (cond["n_conditioned"] == 0).all() and cond["n_conditioned_cs"].between(0, 1).all()
+    assert cond["pval_diff_ld_anc0_anc1"].between(0, 1).all()
+    no_hap = [a for a in base if a not in ("--haplotypes", "x")]        # the SuSiE modes take no local ancestry
+    _run(no_hap + ["--mode", "cis_susie", "--cis_output", os.path.join(c["out"], "ld.cis_qtl.txt.gz"), "--fdr", "1",
+                   "--max_effects", "2"])
+    summary = pd.read_parquet(os.path.join(c["out"], "ld.SuSiE_summary.parquet"))
+    assert len(summary) >= 1                           # the documented workflow: the SuSiE summary is the table
+    _run(base + ["--mode", "cis_conditional", "--cis_output", signals,
+                 "--credible_sets", os.path.join(c["out"], "ld.SuSiE_summary.parquet")])
+    cond = pd.read_csv(os.path.join(c["out"], "ld.cis_conditional_qtl.txt.gz"), sep="\t")
+    assert len(cond) == 3 and cond["pval_diff_ld_anc0_anc1"].between(0, 1).all()
+    with pytest.raises(ValueError, match="condition_on"):
+        main(base + ["--mode", "cis_conditional", "--cis_output", signals, "--credible_sets", cs_file,
+                     "--condition_on", "none"])

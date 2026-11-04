@@ -10,6 +10,34 @@ To release: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`, u
 compare links at the bottom, merge, and only then tag `vX.Y.Z`. The release workflow builds
 the GitHub release body from that section and stops if the tag has none.
 
+## [0.4.3] - 2026-11-04
+
+### Added
+
+- **LD-aware ancestry contrast** (`localqtl.cis.ld_aware`). The pairwise contrast of the dosage
+  model, `pval_diff_anc{i}_anc{j}`, compares *marginal* ancestry-specific effects; at a lead that
+  tags the causal variant it fires whenever the LD between the two differs by ancestry, even when
+  the causal effect is the same in every ancestry (on the localQTL benchmark's shared-effect
+  design, 42 % of the joint leads of the permutation scan had `pval_diff` below .05 against 5.3 %
+  at the causal variant). `map_permutations(ancestry_model="dosage", ld_aware=True,
+  ld_aware_opts=...)` fits SuSiE to the pooled genotypes of each window and reports the lead's
+  contrast conditional on the other members of the phenotype's credible sets (their pooled
+  genotypes, `condition_on="genotype"`, or their ancestry-specific dosages, `"dosage"`) as
+  `slope_ld_anc{k}`, `slope_se_ld_anc{k}`, `tstat_ld_anc{k}`, `pval_ld_anc{k}`, `fstat_joint_ld`,
+  `pval_joint_ld`, `z_diff_ld_anc{i}_anc{j}`, `pval_diff_ld_anc{i}_anc{j}`, `n_conditioned_ld`,
+  `rank_ld`, `dof_ld`, `n_cs_ld`, `cs_size_ld` and `pip_ld`, next to the unchanged marginal
+  columns; `pval_perm` and `pval_beta` are unaffected. `map_conditional_dosage(...,
+  credible_sets_df=...)` adds the same columns at known signals, conditioning on the other
+  signals and on the credible-set variants (`n_conditioned_cs`). The conditioning block is
+  orthogonalised against the lead's own genotype and reduced to its rank, so a conditioning
+  variant in perfect LD with the lead costs no degree of freedom and leaves the lead
+  identifiable; the contrast, its standard error and `dof_ld` are those of the full conditional
+  regression. CLI: `--ld_aware` (`--mode cis` with `--ancestry_model dosage`; `L` from
+  `--max_effects`, the mode from `--condition_on`) and `--credible_sets <table>` (`--mode
+  cis_conditional`; the `cis_susie` summary is accepted as is). `tests/cis/test_ld_aware.py`
+  checks the contrast against a full conditional OLS in both modes, the rank reduction, the
+  tagging leak against the window's credible sets, and both entry points.
+
 ## [0.4.2] - 2026-10-26
 
 ### Fixed
@@ -350,7 +378,8 @@ output; see *Upgrading from 0.1* in the README.
   (`InputGeneratorCisWithHaps`), PLINK 1/2 readers, streaming Parquet sinks and pure-Python
   q-values.
 
-[Unreleased]: https://github.com/heart-gen/localQTL/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/heart-gen/localQTL/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/heart-gen/localQTL/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/heart-gen/localQTL/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/heart-gen/localQTL/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/heart-gen/localQTL/compare/v0.3.0...v0.4.0

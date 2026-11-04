@@ -173,21 +173,47 @@ def test_map_permutations_ld_aware_reports_the_conditional_contrast_at_the_lead(
         assert out[c].dtype.kind == "i"
 
 
-def test_map_permutations_ld_aware_at_a_tagging_lead_is_calibrated_where_the_marginal_is_not():
-    """Across cohorts whose lead tags the causal variant, the LD-aware contrast fires far less often."""
-    marg, ld = [], []
-    for seed in range(12):
+@pytest.mark.parametrize("condition_on", ["genotype", "dosage"])
+def test_lead_ld_contrast_at_a_tagging_lead_is_calibrated_where_the_marginal_is_not(condition_on):
+    """
+    The per-lead routine of the permutation scan (credible sets fitted on the window, every other
+    member conditioned on) at a lead that tags the causal variant: across cohorts the marginal
+    contrast fires, the LD-aware contrast does not.  The index is forced because a typed causal
+    variant beats its own tag on the joint statistic in this small window, so the scan's lead
+    would be the causal variant itself (see the untyped case below for a scan-level tag lead).
+    """
+    marg, ld, conditioned = [], [], []
+    for seed in range(20):
         d = _ld_cohort(seed=300 + seed, n=400, rho=(0.98, 0.15))
-        out = map_permutations(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
-                               d["covariates_df"], **_perm_kw(d, ld_aware=True, nperm=50))
-        r = out.iloc[0]
-        if r["variant_id"] != "v0" or r["n_conditioned_ld"] == 0:
-            continue
-        marg.append(r["pval_diff_anc0_anc1"])
+        G_t, H_t, rez, y_r, D_r, L_r, G_r = _torch_inputs(d)
+        m = LD.ld_aware_contrast(y_r, D_r[TAG:TAG + 1], L_r[TAG:TAG + 1], G_r[TAG], None, k_eff=rez.k_eff, device="cpu")
+        r = LD.lead_ld_contrast(y_r, D_r, L_r, G_t, H_t, rez, TAG, k_eff=rez.k_eff, condition_on=condition_on,
+                                susie=LD.SUSIE_DEFAULTS, G_resid=G_r, device="cpu")
+        marg.append(m["pval_diff_ld_anc0_anc1"])
         ld.append(r["pval_diff_ld_anc0_anc1"])
-    assert len(ld) >= 4, "too few cohorts led by the tag with a conditioning set"
-    assert np.mean(np.asarray(marg) < 0.05) > np.mean(np.asarray(ld) < 0.05)
-    assert np.mean(np.asarray(ld) < 0.05) <= 0.5
+        conditioned.append(r["n_conditioned_ld"] >= 1 and r["n_cs_ld"] >= 1)
+        assert r["rank_ld"] <= r["n_conditioned_ld"] and r["dof_ld"] == m["dof_ld"] - r["rank_ld"]
+    assert np.mean(conditioned) >= 0.8                    # the causal variant is fine-mapped and conditioned on
+    assert np.mean(np.asarray(marg) < 0.05) >= 0.8
+    assert np.mean(np.asarray(ld) < 0.05) <= 0.25
+
+
+def test_map_permutations_ld_aware_with_an_untyped_causal_variant_reports_the_marginal_contrast():
+    """
+    When the causal variant is not typed (the benchmark's tagging design) the scan's lead is the
+    tag and nothing in its credible set carries the shared effect, so the LD-aware contrast has
+    nothing to condition on and equals the marginal one: the column cannot repair a leak whose
+    source is absent from the data, and says so through ``n_conditioned_ld == 0``.
+    """
+    d = _ld_cohort(seed=321, n=400, rho=(0.98, 0.15))
+    keep = [v for v in d["genotype_df"].index if v != "v1"]
+    out = map_permutations(d["genotype_df"].loc[keep], d["variant_df"].loc[keep], d["phenotype_df"],
+                           d["phenotype_pos_df"], d["covariates_df"], **_perm_kw(d, ld_aware=True, nperm=50))
+    r = out.iloc[0]
+    assert r["variant_id"] == "v0" and r["n_cs_ld"] >= 1 and r["cs_size_ld"] >= 1 and r["pip_ld"] > 0.5
+    assert r["n_conditioned_ld"] == 0 and r["rank_ld"] == 0 and r["dof_ld"] == r["true_dof"]
+    np.testing.assert_allclose(r["z_diff_ld_anc0_anc1"], r["z_diff_anc0_anc1"], rtol=1e-4)
+    np.testing.assert_allclose(r["pval_diff_ld_anc0_anc1"], r["pval_diff_anc0_anc1"], rtol=1e-4)
 
 
 def test_map_permutations_ld_aware_grouped_and_validation():
