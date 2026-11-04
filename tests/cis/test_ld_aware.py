@@ -158,6 +158,19 @@ def test_lead_ld_contrast_accepts_credible_sets_as_tensors():
     assert a == b and a["n_conditioned_ld"] == 1 and a["cs_size_ld"] == 2 and a["pip_ld"] == 0.4
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"))])
+def test_susie_purity_subsamples_a_large_credible_set_on_its_device(device):
+    """susie_get_cs hands _get_purity the member indices as a tensor on the compute device; sets larger than 100
+    members are subsampled (the first GPU run of the LD-aware scan failed there)."""
+    from src.localqtl.susie import _get_purity
+    torch.manual_seed(0); np.random.seed(0)
+    X = torch.randn(60, 150, device=device)
+    out = _get_purity(torch.arange(150, device=device), X, None)
+    assert len(out) == 3 and all(np.isfinite(out)) and 0 <= out[0] <= out[1] <= 1
+    small = _get_purity(torch.tensor([0, 1, 2], device=device), X, None)
+    assert len(small) == 3 and all(np.isfinite(small))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the device path of the LD-aware scan needs a GPU")
 def test_map_permutations_ld_aware_on_cuda_matches_cpu():
     d = _ld_cohort(seed=23, n=200)

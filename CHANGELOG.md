@@ -38,6 +38,15 @@ the GitHub release body from that section and stops if the tag has none.
   checks the contrast against a full conditional OLS in both modes, the rank reduction, the
   tagging leak against the window's credible sets, and both entry points.
 
+### Fixed
+
+- **SuSiE credible sets on the GPU.** `susie_get_cs` holds the member indices as tensors on the
+  compute device, subsampled a set larger than 100 members with `np.random.choice` before the
+  purity filter and returned the pure sets with `.numpy()`; both raise "can't convert cuda:0
+  device type tensor to numpy" on a GPU (`cis_susie`, and the LD-aware contrast on its first GPU
+  run). The subsample is now drawn on the host and indexed on the device, and the returned sets
+  are copied to the host; the CPU path and its random stream are unchanged.
+
 ## [0.4.2] - 2026-10-26
 
 ### Fixed
