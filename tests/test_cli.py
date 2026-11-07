@@ -322,3 +322,38 @@ def test_cli_ld_aware_and_credible_sets(cli_inputs, tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="condition_on"):
         main(base + ["--mode", "cis_conditional", "--cis_output", signals, "--credible_sets", cs_file,
                      "--condition_on", "none"])
+
+
+def test_cli_lead_selection_pooled(cli_inputs, tmp_path, monkeypatch):
+    """`--lead_selection pooled` picks the dosage scan's lead with the pooled statistic (the main model's lead)
+    and keeps the joint test; it needs `--mode cis` with `--ancestry_model dosage`."""
+    pytest.importorskip("rfmix_reader")
+    from rfmix_reader import from_legacy
+    from localqtl import cli
+    from localqtl.haplotypeio import LocalAncestryPanel
+    c = cli_inputs
+    var_df = c["variant_df"]
+    loci = pd.DataFrame({"chromosome": var_df["chrom"].astype(str).values,
+                         "physical_position": var_df["pos"].values})
+    g_anc = pd.DataFrame({"sample_id": c["samples"], "P0": 0.5, "P1": 0.5, "chrom": "1"})
+    codes = c["rng"].integers(0, 2, size=(len(var_df), len(c["samples"]), 2))
+    admix = np.stack([(codes == a).sum(axis=-1) for a in range(2)], axis=-1).astype(np.int8)
+    ds = from_legacy(loci, g_anc, admix)
+    monkeypatch.setattr(cli, "load_haplotypes",
+                        lambda args, sample_ids, logger: LocalAncestryPanel(ds, select_samples=list(sample_ids)))
+    base = [c["geno"], c["bed"], "pl", "--covariates", c["cov"], "-o", c["out"], "--device", "cpu",
+            "--window", "10000", "--haplotypes", "x", "--seed", "3", "--mode", "cis", "--permutations", "30"]
+
+    _run(base + ["--ancestry_model", "main"])
+    main_df = pd.read_csv(os.path.join(c["out"], "pl.cis_qtl.txt.gz"), sep="\t")
+    _run(base + ["--ancestry_model", "dosage", "--lead_selection", "pooled", "--ld_aware", "--max_effects", "2"])
+    scan = pd.read_csv(os.path.join(c["out"], "pl.cis_qtl.txt.gz"), sep="\t")
+    assert {"slope_pooled", "tstat_pooled", "pval_nominal_pooled", "r2_pooled", "pval_joint",
+            "pval_diff_ld_anc0_anc1"} <= set(scan.columns)
+    assert len(scan) == len(main_df) == 3 and (scan["variant_id"] == main_df["variant_id"]).all()
+    # the row's test is the dosage model's own joint test at that lead
+    np.testing.assert_allclose(scan["pval_nominal"], scan["pval_joint"], rtol=1e-6)
+    np.testing.assert_allclose(scan["tstat_pooled"], main_df["tstat"], rtol=1e-3)
+    assert scan["pval_perm"].between(0, 1).all()
+    with pytest.raises(ValueError, match="lead_selection"):
+        main(base + ["--ancestry_model", "main", "--lead_selection", "pooled"])

@@ -519,6 +519,25 @@ def dosage_perm_chunk_fmax(ctx: dict, y_perm: torch.Tensor) -> torch.Tensor:
     return torch.nan_to_num(F, nan=-1.0).amax(dim=0).to(torch.float32)
 
 
+@torch.no_grad()
+def dosage_perm_chunk_f_at(ctx: dict, y_perm: torch.Tensor, ix: torch.Tensor) -> torch.Tensor:
+    """
+    Joint F of the dosage model at one chosen variant per permuted phenotype
+    (``y_perm`` ``(n, chunk)``, ``ix`` ``(chunk,)`` variant indices) -> ``(chunk,)``.
+
+    This is the permutation statistic of the pooled-lead scan
+    (``lead_selection="pooled"`` in :mod:`localqtl.cis.permutations`): each
+    permutation selects its lead the way the observed scan does, by the pooled
+    1-df statistic (:func:`perm_chunk_r2_argmax`), and the joint F is read at
+    that variant rather than maximised over the window.  Sanitised like
+    :func:`dosage_perm_chunk_fmax`: a NaN F becomes ``-1`` (less extreme than
+    any observation), an overflowing F stays infinite (more extreme).
+    """
+    F = _dosage_fstat_block(ctx, y_perm)                                  # (m, chunk)
+    ix = ix.to(device=F.device, dtype=torch.long).view(1, -1)
+    return torch.nan_to_num(F.gather(0, ix).squeeze(0), nan=-1.0).to(torch.float32)
+
+
 def _is_cuda(*tensors):
     return all(getattr(t, "is_cuda", False) for t in tensors if t is not None)
 
@@ -707,13 +726,9 @@ def prep_ctx_for_perm(y: torch.Tensor, G: torch.Tensor, H: torch.Tensor, k_eff: 
 
 
 @torch.no_grad()
-def perm_chunk_r2(ctx: dict, H: torch.Tensor, G: torch.Tensor, y_perm: torch.Tensor,
-                  mixed_precision: str | None = None) -> torch.Tensor:
-    """
-    Compute max R^2 across variants for a permutation chunk (n x chunk),
-    using precomputed ctx from prep_ctx_for_perm.
-    Returns (chunk,) on the same device.
-    """
+def _perm_chunk_r2_block(ctx: dict, H: torch.Tensor, G: torch.Tensor, y_perm: torch.Tensor,
+                         mixed_precision: str | None = None) -> torch.Tensor:
+    """Partial R^2 of every variant against every permuted phenotype (n x chunk) -> (m, chunk), NaN as 0."""
     EPS = 1e-8
     L, Hg, G_resid2 = ctx["L"], ctx["Hg"], ctx["G_resid2"]
 
@@ -733,7 +748,32 @@ def perm_chunk_r2(ctx: dict, H: torch.Tensor, G: torch.Tensor, y_perm: torch.Ten
     Yp_resid2 = (Ypnorm2.unsqueeze(0) - (U * _alpha).sum(dim=1)) + EPS
 
     R2 = (GiYp_proj ** 2) / (G_resid2.unsqueeze(1) * Yp_resid2)
-    return torch.nan_to_num(R2, nan=0.0).amax(dim=0).to(torch.float32)
+    return torch.nan_to_num(R2, nan=0.0)
+
+
+@torch.no_grad()
+def perm_chunk_r2(ctx: dict, H: torch.Tensor, G: torch.Tensor, y_perm: torch.Tensor,
+                  mixed_precision: str | None = None) -> torch.Tensor:
+    """
+    Compute max R^2 across variants for a permutation chunk (n x chunk),
+    using precomputed ctx from prep_ctx_for_perm.
+    Returns (chunk,) on the same device.
+    """
+    return _perm_chunk_r2_block(ctx, H, G, y_perm, mixed_precision).amax(dim=0).to(torch.float32)
+
+
+@torch.no_grad()
+def perm_chunk_r2_argmax(ctx: dict, H: torch.Tensor, G: torch.Tensor, y_perm: torch.Tensor,
+                         mixed_precision: str | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    The pooled lead of every permuted phenotype: the maximum partial R^2
+    across variants and the index of the variant that attains it, ``(chunk,)``
+    each, from the ctx of :func:`prep_ctx_for_perm`.  The statistic is the one
+    :func:`perm_chunk_r2` maximises, so the selection made under the null is
+    the selection the observed pooled scan makes.
+    """
+    r2_max, ix = _perm_chunk_r2_block(ctx, H, G, y_perm, mixed_precision).max(dim=0)
+    return r2_max.to(torch.float32), ix
 
 
 if __name__ == "__main__" and os.environ.get("LOCALQTL_DEV_CHECK", "0") == "1":

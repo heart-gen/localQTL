@@ -186,6 +186,30 @@ p-values directly; `true_dof` is therefore the residual degrees of freedom and
 perm_df = mapper.map_permutations(nperm=10_000, ancestry_model="dosage", min_ancestry_ac=10)
 ```
 
+`lead_selection="pooled"` (0.4.4) picks each phenotype's lead with the pooled
+1-df statistic of `y ~ G + L` on the same residualised design, which is the
+lead of `ancestry_model="main"`, instead of the joint F, and reports the
+dosage model's own joint test at that variant. `pval_nominal` is still
+`pval_joint`, and `pval_perm` / `pval_beta` still calibrate the joint F, but
+the null they are compared with selects its lead the same way: in every
+permutation the pooled scan picks a variant and the joint F is read there, so
+the p-value is calibrated for the selection procedure (the maximum F over the
+window, the joint-lead null, would be conservative at a variant the joint F
+did not pick). The pooled model's own p-value is never substituted for the
+dosage model's; it is reported as information in `pval_nominal_pooled`, with
+`slope_pooled`, `slope_se_pooled`, `tstat_pooled` and `r2_pooled`. `ld_aware`
+evaluates the LD-aware contrast at the pooled lead, and with `group_s` the
+group's lead is the (phenotype, variant) with the largest pooled R². The pooled
+lead is where the ancestry contrast is usually wanted: on the localQTL
+benchmark's shared-effect design the contrast at the joint lead was
+anti-conservative (42 % below .05) and at the pooled lead calibrated (4.3 %),
+because the joint F prefers variants whose marginal ancestry effects differ.
+
+```python
+perm_df = mapper.map_permutations(nperm=10_000, ancestry_model="dosage", lead_selection="pooled",
+                                  ld_aware=True)
+```
+
 With `group_s` the maximum is taken over the phenotypes of a group as well as
 over the window, which gives one calibrated row per group — the natural layout
 for isoform- or splicing-event phenotypes grouped by gene. This is valid
@@ -559,8 +583,8 @@ for interaction scans, `<prefix>.cis_qtl.signif_pairs.parquet` with
 genotypes in chunks. Output columns use tensorQTL's spelling unless
 `--localqtl_names` is given; `--device`, `--perm_chunk`, `--haplotypes`,
 `--la_format`, `--la_source`, `--la_cache_dir`, `--use_posterior`,
-`--ancestry_model`, `--min_ancestry_ac`, `--condition_on`, `--ld_aware` and
-`--credible_sets` are localQTL additions.
+`--ancestry_model`, `--min_ancestry_ac`, `--condition_on`, `--ld_aware`,
+`--lead_selection` and `--credible_sets` are localQTL additions.
 
 ### External validation: AlphaGenome Atlas and IGVF Catalog
 

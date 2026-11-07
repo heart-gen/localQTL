@@ -3,7 +3,7 @@ import pandas as pd
 import torch
 import pytest
 
-from src.localqtl.cis.permutations import map_permutations
+from src.localqtl.cis.permutations import POOLED_LEAD_COLUMNS, map_permutations
 from src.localqtl.cis.nominal import map_nominal
 from src.localqtl.utils import SimpleLogger
 
@@ -411,3 +411,205 @@ def test_dosage_permutation_grouped_row_reports_a_single_joint_f():
     )
     r = perm.iloc[0]
     assert r["pval_nominal"] == pytest.approx(r["pval_joint"], rel=1e-12)
+
+
+# pooled-lead selection (0.4.4): the lead is the main model's, the test stays the dosage joint F,
+# and the permutation null selects the lead the same way
+# ---------------------------------------------------------------------------
+def _perm(d, **kw):
+    base = dict(haplotypes=d["panel"], device="cpu", window=1000, logger=SimpleLogger(verbose=False),
+                nperm=200, seed=1)
+    base.update(kw)
+    return map_permutations(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+                            d["covariates_df"], **base)
+
+
+def test_pooled_lead_is_the_main_models_lead_and_the_row_keeps_the_joint_test():
+    """``lead_selection="pooled"``: the lead is the variant the main model picks, the row's test is the
+    dosage model's joint F at that variant, and the pooled statistics are reported as information."""
+    d = _dosage_cohort()
+    pooled = _perm(d, ancestry_model="dosage", lead_selection="pooled")
+    joint = _perm(d, ancestry_model="dosage")
+    main = _perm(d, ancestry_model="main")
+    nom = map_nominal(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+                      d["covariates_df"], out_dir=None, haplotypes=d["panel"], ancestry_model="dosage",
+                      device="cpu", window=1000, logger=SimpleLogger(verbose=False))
+    r, m = pooled.iloc[0], main.iloc[0]
+    assert r["variant_id"] == m["variant_id"]
+    at = nom.set_index("variant_id").loc[r["variant_id"]]
+    # the dosage model's own joint test at the pooled lead, never the pooled p-value
+    assert r["pval_nominal"] == pytest.approx(r["pval_joint"], rel=1e-12)
+    np.testing.assert_allclose(r["pval_nominal"], at["pval_joint"], rtol=1e-4)
+    np.testing.assert_allclose(r["fstat_joint"], at["fstat_joint"], rtol=1e-4)
+    for k in (0, 1):
+        np.testing.assert_allclose(r[f"slope_anc{k}"], at[f"slope_anc{k}"], rtol=1e-4)
+    # the pooled statistics of the lead are the main model's row
+    np.testing.assert_allclose(r["slope_pooled"], m["slope"], rtol=1e-3)
+    np.testing.assert_allclose(r["tstat_pooled"], m["tstat"], rtol=1e-3)
+    np.testing.assert_allclose(r["pval_nominal_pooled"], m["pval_nominal"], rtol=1e-3)
+    np.testing.assert_allclose(r["r2_pooled"], m["r2_nominal"], rtol=1e-3)
+    assert set(POOLED_LEAD_COLUMNS) <= set(pooled.columns)
+    assert not set(POOLED_LEAD_COLUMNS) & set(joint.columns)
+    assert r["pval_perm"] < 0.05 and r["pval_beta"] < 0.05
+    assert np.isnan(r["pval_true_dof"]) and int(r["true_dof"]) == int(joint.iloc[0]["true_dof"])
+    # the default is the joint-lead scan, unchanged
+    pd.testing.assert_frame_equal(_perm(d, ancestry_model="dosage", lead_selection="joint"), joint)
+
+
+def _null_cohort(seed, n=70, m=12, P=60, panel_seed=3):
+    from tests.conftest import make_random_panel
+    rng = np.random.default_rng(seed)
+    samples = [f"S{i}" for i in range(n)]
+    G = rng.integers(0, 3, size=(m, n)).astype(np.float32)
+    gdf = pd.DataFrame(G, index=[f"v{i}" for i in range(m)], columns=samples)
+    vdf = pd.DataFrame({"chrom": "chr1", "pos": 100 + 10 * np.arange(m)}, index=gdf.index)
+    panel, _ = make_random_panel(vdf, samples, seed=panel_seed)
+    Y = rng.normal(size=(P, n)).astype(np.float32)
+    pdf = pd.DataFrame(Y, index=[f"g{i}" for i in range(P)], columns=samples)
+    pos = pd.DataFrame({"chr": "chr1", "start": 150, "end": 150}, index=pdf.index)
+    return gdf, vdf, pdf, pos, panel
+
+
+def test_pooled_lead_permutations_are_calibrated_under_the_null():
+    gdf, vdf, pdf, pos, panel = _null_cohort(99)
+    out = map_permutations(gdf, vdf, pdf, pos, None, haplotypes=panel, ancestry_model="dosage",
+                           lead_selection="pooled", nperm=200, device="cpu", seed=2, window=1000,
+                           logger=SimpleLogger(verbose=False))
+    assert len(out) == len(pdf)
+    for col in ("pval_perm", "pval_beta"):
+        p = out[col].to_numpy(float)
+        p = p[np.isfinite(p)]
+        assert p.size >= len(pdf) - 2
+        assert 0.35 < p.mean() < 0.65, f"{col} mean {p.mean()}"
+        assert np.mean(p < 0.05) < 0.20, f"{col} tail {np.mean(p < 0.05)}"
+    assert np.corrcoef(out["pval_perm"], out["pval_beta"])[0, 1] > 0.9
+
+
+def test_pooled_lead_null_is_selection_aware_where_the_joint_lead_null_is_conservative():
+    """At a lead the pooled statistic picked, the joint F compared with the maximum F over the window (the
+    joint-lead null) is conservative; compared with the F at each permutation's own pooled lead it is uniform."""
+    from src.localqtl import regression_kernels as rk
+    from src.localqtl.cis.common import ancestry_dosage_design
+    torch.manual_seed(0)
+    rng = np.random.default_rng(0)
+    n, m, P, nperm = 60, 10, 150, 400
+    G = torch.tensor(rng.integers(0, 3, size=(m, n)), dtype=torch.float32)
+    H = torch.tensor(rng.integers(0, 3, size=(m, n, 1)), dtype=torch.float32)
+    D, L = ancestry_dosage_design(G, H)
+    D = D - D.mean(1, keepdim=True)
+    L = L - L.mean(1, keepdim=True)
+    Gc = D.sum(2)
+    ctx_d = rk.prep_ctx_for_dosage_perm(D, L, k_eff=1)
+    naive, aware = [], []
+    for _ in range(P):
+        y = torch.randn(n)
+        y = y - y.mean()
+        f_obs = torch.nan_to_num(rk.dosage_fstat(ctx_d, y), nan=-1.0)
+        ctx_p, _, _, tt = rk.prep_ctx_for_perm(y, Gc, L, 1)
+        ix = int(tt[:, 0].abs().argmax())
+        f_at = float(f_obs[ix])
+        perm = y[torch.argsort(torch.rand(n, nperm), dim=0)]          # (n, nperm) independent permutations
+        f_max = rk.dosage_perm_chunk_fmax(ctx_d, perm)
+        _, ix_p = rk.perm_chunk_r2_argmax(ctx_p, L, Gc, perm)
+        f_sel = rk.dosage_perm_chunk_f_at(ctx_d, perm, ix_p)
+        naive.append((float((f_max >= f_at).sum()) + 1) / (nperm + 1))
+        aware.append((float((f_sel >= f_at).sum()) + 1) / (nperm + 1))
+    naive, aware = np.array(naive), np.array(aware)
+    assert naive.mean() > 0.58, naive.mean()
+    assert 0.44 < aware.mean() < 0.56, aware.mean()
+    assert np.mean(aware < 0.05) < 0.10
+    assert np.mean(naive < 0.05) <= np.mean(aware < 0.05)
+
+
+def test_pooled_lead_grouped_picks_the_main_models_group_lead():
+    d = _dosage_group_cohort()
+    kw = dict(group_s=d["group_s"], nperm=100, seed=3)
+    pooled = _perm(d, ancestry_model="dosage", lead_selection="pooled", **kw)
+    main = _perm(d, ancestry_model="main", **kw)
+    assert len(pooled) == len(main) == 1
+    r, m = pooled.iloc[0], main.iloc[0]
+    assert (r["phenotype_id"], r["variant_id"]) == (m["phenotype_id"], m["variant_id"]) == ("geneB", "v3")
+    assert r["pval_nominal"] == pytest.approx(r["pval_joint"], rel=1e-12)
+    np.testing.assert_allclose(r["tstat_pooled"], m["tstat"], rtol=1e-3)
+    assert r["group_size"] == 3 and r["pval_perm"] < 0.05
+    assert set(POOLED_LEAD_COLUMNS) <= set(pooled.columns)
+
+
+def test_pooled_lead_grouped_permutations_are_calibrated_under_the_null():
+    from tests.conftest import make_random_panel
+    rng = np.random.default_rng(7)
+    n, m, n_groups, per_group = 70, 12, 40, 3
+    samples = [f"S{i}" for i in range(n)]
+    G = rng.integers(0, 3, size=(m, n)).astype(np.float32)
+    gdf = pd.DataFrame(G, index=[f"v{i}" for i in range(m)], columns=samples)
+    vdf = pd.DataFrame({"chrom": "chr1", "pos": 100 + 10 * np.arange(m)}, index=gdf.index)
+    panel, _ = make_random_panel(vdf, samples, seed=8)
+    ids, groups = [], {}
+    for g in range(n_groups):
+        for j in range(per_group):
+            pid = f"g{g}_{j}"
+            ids.append(pid)
+            groups[pid] = f"grp{g}"
+    Y = rng.normal(size=(len(ids), n)).astype(np.float32)
+    pdf = pd.DataFrame(Y, index=ids, columns=samples)
+    pos = pd.DataFrame({"chr": "chr1", "start": 150, "end": 150}, index=ids)
+    out = map_permutations(gdf, vdf, pdf, pos, None, haplotypes=panel,
+                           ancestry_model="dosage", lead_selection="pooled", group_s=pd.Series(groups),
+                           nperm=200, device="cpu", seed=5, window=1000,
+                           logger=SimpleLogger(verbose=False))
+    assert len(out) == n_groups
+    for col in ("pval_perm", "pval_beta"):
+        p = out[col].to_numpy(float)
+        p = p[np.isfinite(p)]
+        assert p.size >= n_groups - 2
+        assert 0.35 < p.mean() < 0.65, f"{col} mean {p.mean()}"
+        assert np.mean(p < 0.05) < 0.20, f"{col} tail {np.mean(p < 0.05)}"
+
+
+def test_pooled_lead_with_ld_aware_reports_the_contrast_at_the_pooled_lead():
+    d = _dosage_cohort()
+    plain = _perm(d, ancestry_model="dosage", lead_selection="pooled")
+    ld = _perm(d, ancestry_model="dosage", lead_selection="pooled", ld_aware=True, ld_aware_opts={"L": 3})
+    assert ld.iloc[0]["variant_id"] == plain.iloc[0]["variant_id"]
+    assert {"pval_diff_ld_anc0_anc1", "n_conditioned_ld", "cs_size_ld", "pip_ld"} <= set(ld.columns)
+    assert 0 <= ld.iloc[0]["pval_diff_ld_anc0_anc1"] <= 1
+    # the LD-aware pass runs after the selection and does not touch the test columns
+    for col in ("pval_perm", "pval_beta", "pval_nominal", "tstat_pooled", "pval_nominal_pooled"):
+        assert ld.iloc[0][col] == pytest.approx(plain.iloc[0][col])
+
+
+def test_pooled_lead_validation():
+    d = _dosage_cohort()
+    with pytest.raises(ValueError, match="lead_selection"):
+        _perm(d, ancestry_model="main", lead_selection="pooled")
+    with pytest.raises(ValueError, match="lead_selection"):
+        _perm(d, ancestry_model="dosage", lead_selection="best")
+
+
+def test_dosage_perm_chunk_f_at_gathers_and_sanitises_like_the_observed_statistic():
+    from src.localqtl import regression_kernels as rk
+
+    F = torch.tensor([[1.0, 2.0],
+                      [float("inf"), float("nan")],
+                      [3.0, float("-inf")]])
+    saved = rk._dosage_fstat_block
+    rk._dosage_fstat_block = lambda ctx, Y: F
+    try:
+        at_1 = rk.dosage_perm_chunk_f_at({}, torch.zeros(1, 2), torch.tensor([1, 1]))
+        at_20 = rk.dosage_perm_chunk_f_at({}, torch.zeros(1, 2), torch.tensor([2, 0]))
+    finally:
+        rk._dosage_fstat_block = saved
+    # an overflowing null F stays more extreme than any observation; a NaN never counts
+    assert at_1[0].item() > 3.0 and at_1[1].item() == -1.0
+    assert at_20.tolist() == [3.0, 2.0]
+
+
+def test_perm_chunk_r2_argmax_matches_perm_chunk_r2():
+    from src.localqtl import regression_kernels as rk
+    torch.manual_seed(1)
+    m, n, q, c = 7, 40, 1, 5
+    G, H, y, yp = torch.randn(m, n), torch.randn(m, n, q), torch.randn(n), torch.randn(n, c)
+    ctx, *_ = rk.prep_ctx_for_perm(y, G, H, k_eff=1)
+    r2_max, ix = rk.perm_chunk_r2_argmax(ctx, H, G, yp)
+    torch.testing.assert_close(r2_max, rk.perm_chunk_r2(ctx, H, G, yp))
+    assert ix.tolist() == rk._perm_chunk_r2_block(ctx, H, G, yp).argmax(dim=0).tolist()

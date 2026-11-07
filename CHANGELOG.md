@@ -10,6 +10,37 @@ To release: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`, u
 compare links at the bottom, merge, and only then tag `vX.Y.Z`. The release workflow builds
 the GitHub release body from that section and stops if the tag has none.
 
+## [Unreleased]
+
+### Added
+
+- **Pooled-lead selection for the dosage scan** (`map_permutations(ancestry_model="dosage",
+  lead_selection="pooled")`, CLI `--lead_selection pooled`). The lead of each phenotype is the
+  variant the pooled 1-df statistic of `y ~ G + L` picks on the dosage model's own residualised
+  design, i.e. the lead of `ancestry_model="main"`, and the row reports the dosage model's own
+  joint test at that variant: `pval_nominal` is still `pval_joint`, and `pval_perm` / `pval_beta`
+  still calibrate the joint F, but against a null in which every permutation selects its lead by
+  the pooled statistic too and the joint F is read at that variant
+  (`regression_kernels.perm_chunk_r2_argmax`, `dosage_perm_chunk_f_at`), so the p-value is
+  calibrated for the selection procedure; the maximum F over the window (the joint-lead null)
+  would be conservative at a variant the joint F did not pick. The pooled model's p-value is never
+  substituted for the dosage model's; it is reported as information in `pval_nominal_pooled`
+  with `slope_pooled`, `slope_se_pooled`, `tstat_pooled` and `r2_pooled`. `ld_aware` evaluates
+  the LD-aware contrast at the pooled lead; with `group_s` the group's lead is the (phenotype,
+  variant) with the largest pooled R^2 and the null selects the same way. The default,
+  `lead_selection="joint"`, is the 0.4.3 scan, unchanged. Motivation (localQTL benchmark,
+  2026-11-06): on the shared-effect null the ancestry contrast at the joint lead read 42 % below
+  .05 against 4.3 % at the pooled lead, because the joint F prefers variants whose marginal
+  ancestry effects differ. Tests: the pooled lead is the main model's lead and the row's test the
+  nominal dosage scan's joint test there; the kernel-level null is uniform where the joint-lead
+  null is conservative; calibration under the null, ungrouped and grouped; the CLI and the
+  mapper.
+
+### Fixed
+
+- `CisMapper.map_permutations` now accepts `ld_aware`, `ld_aware_opts` (documented for 0.4.3 but
+  only reachable through the function API) and `lead_selection`.
+
 ## [0.4.3] - 2026-11-04
 
 ### Added

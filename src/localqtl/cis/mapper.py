@@ -126,6 +126,9 @@ class CisMapper:
             interaction_covariate: Optional[object] = None,
             paired_covariate_df: Optional[pd.DataFrame] = None,
             min_ancestry_ac: float = 0.0,
+            ld_aware: bool = False,
+            ld_aware_opts: Optional[dict] = None,
+            lead_selection: str = "joint",
     ) -> pd.DataFrame:
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
         return _map_permutations(
@@ -151,6 +154,9 @@ class CisMapper:
             interaction_covariate=interaction_covariate,
             paired_covariate_df=paired_covariate_df,
             min_ancestry_ac=min_ancestry_ac,
+            ld_aware=ld_aware,
+            ld_aware_opts=ld_aware_opts,
+            lead_selection=lead_selection,
         )
 
     def map_independent(

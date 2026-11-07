@@ -134,6 +134,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="'cis' mode with --ancestry_model dosage: also report the LD-aware contrast of the lead "
                          "(SuSiE credible sets of the window, L from --max_effects; the other credible-set variants "
                          "are conditioned on as --condition_on says, genotype or dosage)")
+    la.add_argument('--lead_selection', default='joint', choices=['joint', 'pooled'],
+                    help="'cis' mode with --ancestry_model dosage: 'joint' (default) picks each phenotype's lead by "
+                         "the joint F; 'pooled' picks it by the pooled 1-df statistic (the main model's lead) and "
+                         "tests the dosage model's joint F there against a null that selects the same way, so "
+                         "pval_perm / pval_beta are calibrated for the selection (the pooled statistics are reported "
+                         "as slope_pooled, tstat_pooled, pval_nominal_pooled, r2_pooled)")
     la.add_argument('--credible_sets', default=None,
                     help="'cis_conditional' mode: credible-set table (phenotype_id, variant_id; the cis_susie output) "
                          "that adds the LD-aware contrast next to the standard columns")
@@ -249,6 +255,8 @@ def main(argv=None) -> int:
         raise ValueError("Interactions are only supported in 'cis_nominal' or 'trans' mode.")
     if args.ancestry_model == 'dosage' and args.mode not in ('cis', 'cis_nominal'):
         raise ValueError("--ancestry_model dosage is only available in 'cis' and 'cis_nominal' modes.")
+    if args.lead_selection != 'joint' and (args.ancestry_model != 'dosage' or args.mode != 'cis'):
+        raise ValueError("--lead_selection pooled needs --mode cis with --ancestry_model dosage.")
     if args.mode == 'cis_conditional':
         if args.cis_output is None or not os.path.exists(args.cis_output):
             raise ValueError("Signals to re-fit must be provided for 'cis_conditional' (--cis_output).")
@@ -358,6 +366,8 @@ def main(argv=None) -> int:
                   perm_chunk=args.perm_chunk, min_ancestry_ac=args.min_ancestry_ac, **la_kwargs)
         if args.ld_aware:
             kw.update(ld_aware=True, ld_aware_opts={'condition_on': args.condition_on, 'L': args.max_effects})
+        if args.lead_selection != 'joint':
+            kw.update(lead_selection=args.lead_selection)
         if pgr is None:
             res_df = map_permutations(genotype_df, variant_df, phenotype_df, phenotype_pos_df, **kw)
         else:
