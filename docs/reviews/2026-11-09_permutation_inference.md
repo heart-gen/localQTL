@@ -36,6 +36,12 @@ correction, so "not significant after the prespecified multiplicity correction" 
 (section D, Multiplicity). Whether C1 passes on this evidence is a ruling for the benchmark, not a result of
 this review.
 
+**Addendum, same day: two class 1 defects this review did not find** (section G). An external review of
+the branch reported them after the outcome above was written. Both are reproducible and specific to
+localQTL, and both are fixed. Neither touches a p-value, a selection rule or a permutation null, so the
+conclusions of sections A to D stand, but the sentence "no kernel changed" holds only for the review's own
+commits: the fix changes how three kernels compute a reported standard error.
+
 ## A. `cis/permutations.py`: observed and permuted pooled-lead selection
 
 `lead_selection="pooled"` picks the lead with the pooled 1-df statistic and tests the dosage model's joint F
@@ -252,6 +258,47 @@ Deferred to a later version, each needing its own evaluation:
   different family), validated against the exact Gaussian null used here;
 - one estimator for the observed and the null statistic in the correlation scans, as the dosage scan has;
 - a rank-aware reference distribution for variants with an empty ancestry stratum.
+
+## G. Addendum: two defects found after the review
+
+Reported by an external review of `feat/pooled-lead-selection` on 2026-11-09 and confirmed here.
+
+**G1. Standard error of a negative effect (class 1).** `prep_ctx_for_perm` and both branches of
+`run_batch_regression_with_permutations` computed `se = |beta| / clamp(t, 1e-8)`. For a negative t the
+clamp returns 1e-8 and the standard error becomes `|beta| * 1e8`.
+
+- Reach, measured by running each scan with a negative effect on the 76ba640 build: `slope_se_pooled`
+  (new in 0.4.4), and in released versions the `slope_se` of grouped `map_permutations` scans, of the
+  g x local-ancestry and g x covariate interaction scans, and of the signals `map_independent` adds. In
+  the benchmark's stored null runs the `interaction` model's lead `slope_se` has a median of 9e7 where
+  the slope is negative and 0.29 where it is positive.
+- Not affected: slopes, t, R^2, every p-value, the choice of lead; the ungrouped `main` scan, the nominal
+  scans and the dosage model (other kernels). No benchmark ledger reads the affected columns.
+- Why the review missed it: section A checked the selection statistic (R^2 from t^2) and the p-values of
+  `_pooled_lead_observed`, not the standard error it passes through, and the existing tests compared
+  `slope_pooled` and `tstat_pooled` with the main model on a positive effect only.
+- Fix: one helper, `_slope_se`, computes `sqrt(RSS / dof / SS_g)` from the residual sums of squares in all
+  three places. Tests cover both signs at the kernel level and through the pooled, interaction, grouped
+  and independent scans.
+
+**G2. LD-aware refit with no residual degrees of freedom (class 1).** `ld_aware_contrast` projects a
+conditioning block of unrestricted rank out of the lead's design and calls
+`run_batch_dosage_regression` with `k_eff + rank`. The kernel floors `n - k_eff - p` at 1, so a block
+that exhausts the sample still returned statistics. Reproduced on a null phenotype (n 24, 18 residual
+dimensions): F 1.5e8, joint p 6e-5, contrast p 8e-5 at `dof_ld` 1.
+
+- Fix: when `n - k_eff - rank - p < 1` the function returns every inferential column as NaN with
+  `dof_ld = 0`, and keeps `n_conditioned_ld` and `rank_ld`. With one residual degree of freedom left it
+  still reports, and matches numpy's count.
+- Not changed: the kernels' own floor of 1, which the unconditioned scans share. There it can only
+  engage when the covariates alone exhaust the sample.
+
+Checked after both fixes: the full suite passes (247 passed, 5 skipped). Eight permutation scans (`main`
+with and without a panel, both interaction models, the pooled-lead dosage scan with and without
+`ld_aware`, grouped `main` and grouped interaction; 12 phenotypes with effects of both signs) were run on
+the 76ba640 build and on the fixed source: every column other than the standard errors named above is
+identical bit for bit, the standard errors of negative effects go from about 1e7 to their OLS values, and
+those of positive effects differ by at most 1.2e-7 relative.
 
 ## Reproduce
 

@@ -221,3 +221,43 @@ def test_dosage_joint_f_block_refit_and_nested_ols_agree_on_a_residualised_desig
         f_ref = ((rss0 - rss1) / K) / (rss1 / dof)
         np.testing.assert_allclose(res["fstat"][v].item(), f_ref, rtol=5e-3, atol=1e-4)
         np.testing.assert_allclose(f_block[v].item(), f_ref, rtol=5e-3, atol=1e-4)
+
+
+@pytest.mark.parametrize("with_h", [False, True])
+def test_single_predictor_kernels_report_the_ols_standard_error_whatever_the_sign(with_h):
+    """The correlation kernels behind the interaction scans, the pooled lead and the permutation
+    context (``run_batch_regression_with_permutations``, ``prep_ctx_for_perm``) return the OLS
+    standard error for negative effects as for positive ones: ``slope / se == t``, and all three
+    agree with ``run_batch_regression``.  (``se = |beta| / clamp(t, 1e-8)`` gave ``|beta| * 1e8``
+    wherever the effect was negative.)"""
+    from src.localqtl import regression_kernels as rk
+    torch.manual_seed(7)
+    n, m = 120, 8
+    G = torch.randn(m, n); G = G - G.mean(dim=1, keepdim=True)
+    H = None
+    if with_h:
+        H = torch.randn(m, n, 2); H = H - H.mean(dim=1, keepdim=True)
+    y = torch.randn(n); y = y - y.mean()
+    y = y - 0.6 * G[0] + 0.6 * G[1]                               # variant 0 negative, variant 1 positive
+    b_ref, se_ref, t_ref = run_batch_regression(y=y, G=G, H=H, k_eff=1, device="cpu")
+    kernels = [rk.run_batch_regression_with_permutations(y=y, G=G, H=H, y_perm=None, k_eff=1, device="cpu")[:3]]
+    if with_h:
+        kernels.append(rk.prep_ctx_for_perm(y, G, H, k_eff=1)[1:])
+    for b, se, t in kernels:
+        assert b[0, 0] < 0 < b[1, 0] and t[0, 0] < -3 and t[1, 0] > 3
+        assert (se > 0).all() and torch.isfinite(se).all()
+        torch.testing.assert_close(b[:, 0] / se[:, 0], t[:, 0], rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(se[:, 0], se_ref[:, 0].to(se.dtype), rtol=1e-3, atol=1e-6)
+        torch.testing.assert_close(b[:, 0], b_ref[:, 0].to(b.dtype), rtol=1e-3, atol=1e-5)
+
+
+def test_single_predictor_kernel_standard_error_is_positive_at_a_zero_effect():
+    """A predictor orthogonal to the phenotype has slope 0 and a positive standard error."""
+    from src.localqtl import regression_kernels as rk
+    n = 40
+    g = torch.tensor([1.0, -1.0] * (n // 2))
+    y = torch.tensor([1.0, 1.0, -1.0, -1.0] * (n // 4))            # g'y == 0 exactly
+    b, se, t, _ = rk.run_batch_regression_with_permutations(y=y, G=g.unsqueeze(0), H=None, y_perm=None, k_eff=1,
+                                                            device="cpu")
+    assert b.item() == 0.0 and t.item() == 0.0
+    assert se.item() == pytest.approx(float(np.sqrt(n / (n - 2) / n)), rel=1e-5)

@@ -542,6 +542,19 @@ def _is_cuda(*tensors):
     return all(getattr(t, "is_cuda", False) for t in tensors if t is not None)
 
 
+def _slope_se(y_ss: torch.Tensor, g_ss: torch.Tensor, r: torch.Tensor, dof: int, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Standard error of a single-predictor slope from its (partial) correlation:
+    ``sqrt(RSS / dof / g_ss)`` with ``RSS = y_ss * (1 - r^2)``, where ``y_ss`` and
+    ``g_ss`` are the sums of squares of the phenotype and the predictor after
+    everything else is projected out.  Algebraically ``|beta| / |t|``, but
+    computed from the sums of squares so that it does not depend on the sign of
+    the effect and stays positive at ``beta == 0``.
+    """
+    one_minus_r2 = torch.clamp(1.0 - r.float() * r.float(), min=eps)
+    return torch.sqrt(y_ss.float() * one_minus_r2 / (float(dof) * g_ss.float()))
+
+
 @torch.no_grad()
 def run_batch_regression_with_permutations(
         y: torch.Tensor, G: torch.Tensor, H: torch.Tensor | None = None,
@@ -574,7 +587,7 @@ def run_batch_regression_with_permutations(
         one_minus_r2 = 1.0 - r * r
         t      = r * torch.sqrt(dof / torch.clamp(one_minus_r2, min=EPS))
         beta   = Gy / Gnorm2                         # (m,)
-        se     = torch.abs(beta) / torch.clamp(t.float(), min=1e-8)
+        se     = _slope_se(ynorm2, Gnorm2, r, dof, EPS)
 
         betas  = beta.unsqueeze(1)                   # (m,1)
         ses    = se.unsqueeze(1)                     # (m,1)
@@ -640,7 +653,7 @@ def run_batch_regression_with_permutations(
         t = r * torch.sqrt(torch.tensor(dof, device=device, dtype=torch.float32) /
                            torch.clamp(1.0 - r * r, min=EPS))
         beta = Gy_resid / G_resid2
-        se   = torch.abs(beta) / torch.clamp(t, min=1e-8)
+        se   = _slope_se(y_resid2, G_resid2, r, dof, EPS)
 
         betas  = beta.view(m, 1)
         ses    = se.view(m, 1)
@@ -714,7 +727,7 @@ def prep_ctx_for_perm(y: torch.Tensor, G: torch.Tensor, H: torch.Tensor, k_eff: 
     t = r * torch.sqrt(torch.tensor(dof, device=device, dtype=torch.float32) /
                        torch.clamp(1.0 - r * r, min=EPS))
     beta = Gy_resid / G_resid2
-    se = torch.abs(beta) / torch.clamp(t, min=1e-8)
+    se = _slope_se(y_resid2, G_resid2, r, dof, EPS)
 
     ctx = {
         "L": L, "Hg": Hg, "G_resid2": G_resid2, "dof": dof,

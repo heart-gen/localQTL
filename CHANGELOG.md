@@ -38,6 +38,29 @@ the GitHub release body from that section and stops if the tag has none.
 
 ### Fixed
 
+- **Standard errors of negative effects from the permutation kernels.**
+  `prep_ctx_for_perm` and `run_batch_regression_with_permutations` derived the slope's standard
+  error as `|beta| / clamp(t, 1e-8)`, which is `|beta| * 1e8` whenever the effect is negative. The
+  reported slope, standard error and t statistic were then inconsistent in every table that takes
+  its lead statistics from these kernels: `slope_se_pooled` of the pooled-lead dosage scan (new in
+  this release) and, in earlier releases too, `slope_se` of grouped `map_permutations` scans, of
+  the g x local-ancestry and g x covariate interaction scans (with `slope_se_gxh_anc{k}`), and of
+  the signals `map_independent` adds. Slopes, t statistics, R^2, every p-value and the choice of
+  lead were not affected, nor were the ungrouped `main` scan, the nominal scans and the dosage
+  model's own statistics. The standard error is now computed from the residual sums of squares
+  (`sqrt(RSS / dof / SS_g)`), so it no longer depends on the sign of the effect and is positive at
+  a zero effect; standard errors of positive effects change only in the last float digits. Tables
+  written by an earlier version need their `slope_se` recomputed as `|slope / tstat|` wherever the
+  slope is negative.
+- **LD-aware refits with no residual degrees of freedom are not reported.** A credible set broad
+  enough for its conditioning block to exhaust the sample (`n - k_eff - rank_ld - p < 1`, with `p`
+  the lead's own design columns) left a saturated conditional model whose residual is numerical
+  noise, and the regression kernel's dof floor of 1 turned that into finite, sometimes extreme
+  statistics (joint F near 1e8 and p near 1e-5 on a null phenotype). `ld_aware_contrast` now
+  returns every `*_ld` slope, standard error, t, F, z and p-value as NaN with `dof_ld = 0` in that
+  case; `n_conditioned_ld` and `rank_ld` still describe the block. Both entry points
+  (`map_permutations(ld_aware=True)`, `map_conditional_dosage(credible_sets_df=...)`) go through
+  it; the marginal columns of the row are unchanged.
 - `CisMapper.map_permutations` now accepts `ld_aware`, `ld_aware_opts` (documented for 0.4.3 but
   only reachable through the function API) and `lead_selection`.
 - `calculate_qvalues` tests a phenotype whose beta approximation could not be fitted (`pval_beta`

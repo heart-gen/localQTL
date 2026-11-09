@@ -43,10 +43,19 @@ The columns are written next to the marginal ones by
 ``pval_ld_anc{k}``, ``fstat_joint_ld``, ``pval_joint_ld``,
 ``z_diff_ld_anc{i}_anc{j}``, ``pval_diff_ld_anc{i}_anc{j}``,
 ``n_conditioned_ld`` (conditioning variants), ``rank_ld`` (rank of the
-conditioning block after orthogonalisation), ``dof_ld``, and, from the
+conditioning block after orthogonalisation), ``dof_ld`` (residual degrees of
+freedom of the conditional model), and, from the
 permutation scan, ``n_cs_ld`` (credible sets of the phenotype), ``cs_size_ld``
 (size of the credible set holding the lead, 0 when none does) and ``pip_ld``
 (the lead's posterior inclusion probability).
+
+A conditioning block can exhaust the sample: with ``n`` samples, ``k_eff``
+projected-out covariate dimensions, a block of rank ``r`` and the lead's ``p``
+design columns, the conditional model has ``n - k_eff - r - p`` residual
+degrees of freedom.  When none remain there is nothing to estimate the residual
+variance from, so no inferential statistic is reported: every slope, standard
+error, t, F, z and p-value column is NaN and ``dof_ld`` is 0, while
+``n_conditioned_ld`` and ``rank_ld`` still describe the block that caused it.
 """
 
 from __future__ import annotations
@@ -191,6 +200,10 @@ def ld_aware_contrast(y_resid: torch.Tensor, D_lead: torch.Tensor, L_lead: torch
     projected out of ``y``,
     ``D`` and ``L``; the regression then runs with ``k_eff + rank`` degrees of freedom consumed.
     Returns the :func:`ld_columns` values without the credible-set bookkeeping.
+
+    A block that leaves no residual degrees of freedom (``n - k_eff - rank - p < 1`` for the
+    lead's ``p = K + q`` design columns) makes the conditional model saturated: the statistics
+    are returned as NaN with ``dof_ld = 0``, never computed on a clamped dof.
     """
     y = y_resid.reshape(-1)
     n = int(y.shape[0])
@@ -217,6 +230,16 @@ def ld_aware_contrast(y_resid: torch.Tensor, D_lead: torch.Tensor, L_lead: torch
                 Dk = Dk - (Dk @ U) @ U.T
                 if Lq is not None:
                     Lq = Lq - (Lq @ U) @ U.T
+    p_lead = K + (0 if Lq is None else int(Lq.shape[0]))
+    if n - int(k_eff) - rank - p_lead < 1:
+        # Saturated: the covariates, the block and the lead's own columns span the sample, so the
+        # residual carries no information about the error variance (the kernel would clamp dof to 1
+        # and divide numerical noise by it).
+        out = {col: float("nan") for col in ld_columns(K, with_cs=False)}
+        out["n_conditioned_ld"] = int(n_cond)
+        out["rank_ld"] = int(rank)
+        out["dof_ld"] = 0
+        return out
     D2 = Dk.T.unsqueeze(0).contiguous()                           # (1, n, K)
     L2 = None if Lq is None else Lq.T.unsqueeze(0).contiguous()
     res = run_batch_dosage_regression(y=y, D=D2, L=L2, k_eff=int(k_eff) + rank, device=device)

@@ -314,6 +314,9 @@ lead, 0 when none does) and `pip_ld`. The contrast, its standard error and
 `dof_ld` are those of the full conditional regression; the per-ancestry
 `slope_ld_anc{k}` are the lead's pooled effect split by that contrast, so
 read the contrast rather than the individual slopes as the LD-aware quantity.
+When the conditioning block leaves no residual degrees of freedom (a credible
+set as large as the sample allows), nothing can be tested: the `*_ld`
+statistics are NaN and `dof_ld` is 0.
 The marginal columns, `pval_perm` and `pval_beta` are unchanged: the LD-aware
 pass runs after the lead is chosen and does not enter the permutation
 statistic.

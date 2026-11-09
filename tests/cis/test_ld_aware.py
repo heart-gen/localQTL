@@ -309,3 +309,47 @@ def test_conditional_dosage_credible_sets_combine_with_other_signals():
     diff, se, dof = _numpy_conditional(d, TAG, [CAUSAL, 5])
     np.testing.assert_allclose(out.loc["v0", "z_diff_ld_anc0_anc1"], diff / se, rtol=2e-3, atol=2e-3)
     assert out.loc["v0", "dof_ld"] == dof
+
+
+def test_ld_aware_contrast_reports_nothing_when_the_block_leaves_no_residual_degrees_of_freedom():
+    """A conditioning block that exhausts the sample makes the conditional model saturated.  With one
+    residual degree of freedom left the refit still reports (and matches numpy's dof); with none, every
+    inferential column is NaN and ``dof_ld`` is 0, where a clamped dof gave F ~ 1e8 and p ~ 1e-5 on a
+    null phenotype."""
+    n = 24
+    d = _ld_cohort(seed=11, n=n, m=40, beta=0.0)
+    G_t, H_t, rez, y_r, D_r, L_r, G_r = _torch_inputs(d)
+    room = n - rez.k_eff - 3                                      # dimensions left before the lead's K + q = 3 columns fit exactly
+    stat_cols = [c for c in LD.ld_columns(2, with_cs=False) if c not in ("n_conditioned_ld", "rank_ld", "dof_ld")]
+
+    def refit(S):
+        X = LD.conditioning_columns(G_t, H_t, rez, list(range(2, 2 + S)), condition_on="genotype", G_resid=G_r)
+        return LD.ld_aware_contrast(y_r, D_r[TAG:TAG + 1], L_r[TAG:TAG + 1], G_r[TAG], X, k_eff=rez.k_eff, device="cpu")
+
+    last = refit(room - 1)                                        # one residual degree of freedom: still a fit
+    assert last["rank_ld"] == room - 1 and last["dof_ld"] == 1 == _numpy_conditional(d, TAG, range(2, 1 + room))[2]
+    assert np.isfinite([last[c] for c in stat_cols]).all()
+    for S in (room, room + 1, room + 12):                         # none left: exactly saturated, then over-specified
+        out = refit(S)
+        assert out["n_conditioned_ld"] == S and out["rank_ld"] >= room and out["dof_ld"] == 0
+        assert np.isnan([out[c] for c in stat_cols]).all(), S
+        assert set(out) == set(LD.ld_columns(2, with_cs=False))
+
+
+def test_conditional_dosage_with_a_saturating_credible_set_keeps_the_row_and_blanks_the_ld_columns():
+    """Through ``map_conditional_dosage``: the standard conditional columns of the signal are unchanged,
+    the LD-aware columns are NaN with ``dof_ld == 0``."""
+    d = _ld_cohort(seed=11, n=24, m=40, beta=0.0)
+    signals = pd.DataFrame({"phenotype_id": ["g0"], "variant_id": ["v0"], "rank": [1]})
+    members = [f"v{i}" for i in range(2, 32)]
+    cs = pd.DataFrame({"phenotype_id": "g0", "variant_id": ["v0"] + members, "cs_id": "1"})
+    args = (d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"], signals, d["panel"],
+            d["covariates_df"])
+    base = map_conditional_dosage(*args, device="cpu", logger=LG).iloc[0]
+    r = map_conditional_dosage(*args, credible_sets_df=cs, device="cpu", logger=LG).iloc[0]
+    for c in ("slope_anc0", "pval_diff_anc0_anc1", "pval_joint", "dof"):
+        assert r[c] == base[c] and np.isfinite(r[c])
+    assert r["n_conditioned_cs"] == len(members) == r["n_conditioned_ld"] and r["dof_ld"] == 0 and r["rank_ld"] >= 18
+    for c in ("slope_ld_anc0", "slope_se_ld_anc1", "tstat_ld_anc0", "fstat_joint_ld", "pval_joint_ld",
+              "z_diff_ld_anc0_anc1", "pval_diff_ld_anc0_anc1"):
+        assert np.isnan(r[c]), c

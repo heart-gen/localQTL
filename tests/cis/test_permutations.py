@@ -745,3 +745,57 @@ def test_main_model_observed_r2_is_the_null_statistic(with_local_ancestry):
         assert int(r2_null.argmax()) == int(r2_obs.argmax())
         r2_null_max = rk.perm_chunk_r2(ctx, H_res, G_res, y_col)
     assert r2_null_max.item() == pytest.approx(r2_obs.max().item(), rel=1e-3)
+
+
+@pytest.mark.parametrize("effect", [0.8, -0.8])
+def test_pooled_lead_reports_the_main_models_standard_error_for_either_sign(effect):
+    """``slope_pooled``, ``slope_se_pooled`` and ``tstat_pooled`` are one consistent triple and the main
+    model's row, for a negative pooled effect as for a positive one."""
+    d = _dosage_cohort(effect=effect)
+    r = _perm(d, ancestry_model="dosage", lead_selection="pooled").iloc[0]
+    m = _perm(d, ancestry_model="main").iloc[0]
+    assert r["variant_id"] == m["variant_id"] == "v3" and np.sign(r["slope_pooled"]) == np.sign(effect)
+    np.testing.assert_allclose(r["slope_pooled"], m["slope"], rtol=1e-3)
+    np.testing.assert_allclose(r["slope_se_pooled"], m["slope_se"], rtol=1e-3)
+    np.testing.assert_allclose(r["slope_pooled"] / r["slope_se_pooled"], r["tstat_pooled"], rtol=1e-4)
+
+
+@pytest.mark.parametrize("effect", [1.0, -1.0])
+def test_interaction_scans_report_a_consistent_standard_error_for_either_sign(effect):
+    """The g x local-ancestry and the g x covariate permutation scans report ``slope_se`` with
+    ``slope / slope_se == tstat`` whatever the sign of the interaction effect."""
+    d = _dosage_cohort(seed=9, n=120)
+    rng = np.random.default_rng(1)
+    h0 = d["admix"][3, :, 0].astype(np.float64)
+    cov = d["covariates_df"]
+    cz = (cov["c2"] - cov["c2"].mean()) / cov["c2"].std(ddof=0)
+    for kind, term in (("ancestry", d["G"][3] * h0), ("covariate", d["G"][3] * cz.to_numpy())):
+        y = effect * term + rng.normal(size=len(h0))
+        pdf = pd.DataFrame([y], index=["geneA"], columns=d["samples"]).astype(np.float32)
+        kw = dict(device="cpu", window=1000, logger=SimpleLogger(verbose=False), nperm=50, seed=1)
+        if kind == "ancestry":
+            kw.update(haplotypes=d["panel"], ancestry_model="interaction")
+        else:
+            kw.update(interaction_covariate="c2")
+        r = map_permutations(d["genotype_df"], d["variant_df"], pdf, d["phenotype_pos_df"], cov, **kw).iloc[0]
+        assert r["variant_id"] == "v3" and np.sign(r["slope"]) == np.sign(effect), kind
+        assert 0 < r["slope_se"] < 1, kind
+        np.testing.assert_allclose(r["slope"] / r["slope_se"], r["tstat"], rtol=1e-4, err_msg=kind)
+        if kind == "ancestry":
+            np.testing.assert_allclose(r["slope_gxh_anc0"] / r["slope_se_gxh_anc0"], r["tstat_gxh_anc0"], rtol=1e-4)
+
+
+@pytest.mark.parametrize("with_panel", [False, True])
+def test_grouped_scan_reports_a_consistent_standard_error_for_a_negative_effect(with_panel):
+    """The grouped scan takes its lead's slope, standard error and t from the permutation kernels:
+    ``slope / slope_se == tstat`` for a negative effect, and the row is the ungrouped scan's row."""
+    d = _dosage_group_cohort(effect=-0.9)
+    kw = dict(device="cpu", window=1000, logger=SimpleLogger(verbose=False), nperm=100, seed=1)
+    if with_panel:
+        kw.update(haplotypes=d["panel"], ancestry_model="main")
+    args = (d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"], d["covariates_df"])
+    r = map_permutations(*args, group_s=d["group_s"], **kw).iloc[0]
+    u = map_permutations(*args, **kw).set_index("phenotype_id").loc["geneB"]
+    assert r["phenotype_id"] == "geneB" and r["variant_id"] == "v3" and r["slope"] < 0
+    np.testing.assert_allclose(r["slope"] / r["slope_se"], r["tstat"], rtol=1e-4)
+    np.testing.assert_allclose(r["slope_se"], u["slope_se"], rtol=1e-3)
