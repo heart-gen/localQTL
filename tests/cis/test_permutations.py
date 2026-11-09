@@ -613,3 +613,135 @@ def test_perm_chunk_r2_argmax_matches_perm_chunk_r2():
     r2_max, ix = rk.perm_chunk_r2_argmax(ctx, H, G, yp)
     torch.testing.assert_close(r2_max, rk.perm_chunk_r2(ctx, H, G, yp))
     assert ix.tolist() == rk._perm_chunk_r2_block(ctx, H, G, yp).argmax(dim=0).tolist()
+
+
+# the observed scan and its permutation null are one procedure (review of 2026-11-09,
+# docs/reviews/2026-11-09_permutation_inference.md): selection statistic, covariate adjustment,
+# tie rule and test statistic, checked on the identity permutation and on exact proxies
+# ---------------------------------------------------------------------------
+class _FixedPermutations:
+    """Stands in for ``PermutationStream``: yields the given index rows, ``(chunk, n)``."""
+
+    def __init__(self, sel: torch.Tensor):
+        self.sel = sel
+
+    def iter_chunks(self, limit=None):
+        yield self.sel if limit is None else self.sel[:limit]
+
+
+def _residualised_dosage_design(seed=0, n=90, m=14, k=5, proxy=None, effect_at=None):
+    """``(y, D, L, rez)`` as the permutation core builds them (``residualize_batch_dosage``): random genotypes,
+    a collapsed two-ancestry panel and ``k`` covariates that explain part of ``y``.  ``proxy=(i, j)`` makes
+    variant ``j`` an exact copy of variant ``i`` (genotype and local ancestry), a perfect-LD proxy on the same
+    ancestry background; ``effect_at`` puts an effect on that variant."""
+    from src.localqtl.cis.common import residualize_batch_dosage
+    from src.localqtl.regression_kernels import Residualizer
+    rng = np.random.default_rng(seed)
+    G = rng.integers(0, 3, size=(m, n)).astype(np.float32)
+    H = rng.integers(0, 3, size=(m, n, 1)).astype(np.float32)
+    if proxy is not None:
+        i, j = proxy
+        G[j], H[j] = G[i], H[i]
+    C = rng.normal(size=(n, k)).astype(np.float32)
+    y = C @ rng.normal(size=k) + rng.normal(size=n)
+    if effect_at is not None:
+        y = y + 1.0 * G[effect_at]
+    rez = Residualizer(torch.tensor(C))
+    y_res, D, L = residualize_batch_dosage(torch.tensor(y.astype(np.float32)), torch.tensor(G), torch.tensor(H),
+                                           rez, center=True, group=False)
+    return y_res, D, L, rez
+
+
+def test_pooled_lead_null_on_the_identity_permutation_is_the_observed_scan():
+    """The null of ``lead_selection="pooled"`` applied to the unpermuted phenotype returns the observed scan's
+    own numbers: the same pooled R^2 at every variant, the same lead, the same joint F at it.  One residualised
+    design, one selection statistic, one test statistic, re-residualisation included."""
+    from src.localqtl import regression_kernels as rk
+    from src.localqtl.cis._permute import projectors_of
+    from src.localqtl.cis.permutations import _pooled_lead_null, _pooled_lead_observed
+    y, D, L, rez = _residualised_dosage_design(seed=3)
+    n = int(y.shape[0])
+    G_sum = D.sum(dim=2)
+    ctx = rk.prep_ctx_for_dosage_perm(D, L, k_eff=rez.k_eff)
+    f_obs = torch.nan_to_num(rk.dosage_fstat(ctx, y), nan=-1.0)
+    ctx_p, r2_obs, *_ = _pooled_lead_observed(y, G_sum, L, rez.k_eff, None)
+    ix_obs = int(r2_obs.argmax())
+    # the selection statistic, variant by variant
+    r2_null = rk._perm_chunk_r2_block(ctx_p, L, G_sum, y.reshape(-1, 1))[:, 0]
+    torch.testing.assert_close(r2_null, r2_obs, rtol=1e-4, atol=1e-6)
+    assert int(r2_null.argmax()) == ix_obs
+    # the whole null path on the identity permutation
+    identity = _FixedPermutations(torch.arange(n).unsqueeze(0))
+    r2_sel, f_sel = _pooled_lead_null(ctx, ctx_p, L, G_sum, y, None, identity, 1, n, projectors_of(rez), None)
+    assert tuple(r2_sel.shape) == tuple(f_sel.shape) == (1,)
+    assert r2_sel.item() == pytest.approx(r2_obs[ix_obs].item(), rel=1e-4)
+    assert f_sel.item() == pytest.approx(f_obs[ix_obs].item(), rel=1e-4)
+
+
+def test_pooled_lead_ties_follow_one_rule_and_cannot_move_the_null_statistic():
+    """Ties.  Both paths return the first maximal index (``argmax`` for the observed scan, ``max(dim=0)`` for
+    the null).  An exact tie in pooled R^2 needs the same genotype and the same local ancestry, hence the same
+    ancestry dosages and the same joint F, so the statistic read at a tied lead does not depend on which member
+    of the tie is taken, in the observed scan or in any permutation."""
+    from src.localqtl import regression_kernels as rk
+    from src.localqtl.cis._permute import freedman_lane, projectors_of
+    from src.localqtl.cis.permutations import _pooled_lead_observed
+    r2 = torch.tensor([0.1, 0.7, 0.7, 0.3])
+    assert int(r2.argmax()) == 1
+    assert r2.unsqueeze(1).expand(-1, 3).contiguous().max(dim=0).indices.tolist() == [1, 1, 1]
+
+    i, j = 4, 9
+    y, D, L, rez = _residualised_dosage_design(seed=5, proxy=(i, j), effect_at=i)
+    n = int(y.shape[0])
+    G_sum = D.sum(dim=2)
+    ctx = rk.prep_ctx_for_dosage_perm(D, L, k_eff=rez.k_eff)
+    ctx_p, r2_obs, *_ = _pooled_lead_observed(y, G_sum, L, rez.k_eff, None)
+    f_obs = rk.dosage_fstat(ctx, y)
+    assert int(r2_obs.argmax()) in (i, j)                       # the proxy pair is the observed lead
+    assert r2_obs[i].item() == pytest.approx(r2_obs[j].item(), rel=1e-5)
+    assert f_obs[i].item() == pytest.approx(f_obs[j].item(), rel=1e-4)
+
+    g = torch.Generator().manual_seed(11)
+    sel = torch.stack([torch.randperm(n, generator=g) for _ in range(256)])
+    y_perm = freedman_lane(y[sel].T.contiguous(), projectors_of(rez))            # (n, 256)
+    R2 = rk._perm_chunk_r2_block(ctx_p, L, G_sum, y_perm)
+    F = rk._dosage_fstat_block(ctx, y_perm)
+    torch.testing.assert_close(R2[i], R2[j], rtol=1e-4, atol=1e-7)
+    torch.testing.assert_close(F[i], F[j], rtol=1e-3, atol=1e-5)
+    _, ix = rk.perm_chunk_r2_argmax(ctx_p, L, G_sum, y_perm)
+    assert ((ix == i) | (ix == j)).any()                        # some permutations select the tied pair
+    other = torch.where(ix == i, torch.full_like(ix, j), torch.where(ix == j, torch.full_like(ix, i), ix))
+    torch.testing.assert_close(rk.dosage_perm_chunk_f_at(ctx, y_perm, ix),
+                               rk.dosage_perm_chunk_f_at(ctx, y_perm, other), rtol=1e-3, atol=1e-5)
+
+
+@pytest.mark.parametrize("with_local_ancestry", [True, False])
+def test_main_model_observed_r2_is_the_null_statistic(with_local_ancestry):
+    """``ancestry_model="main"`` and ``tensorqtl_flavor`` compare an observed R^2 from the ridge-regularised
+    OLS t statistic (``run_batch_regression``) with null maxima from the partial-correlation kernels.  Two code
+    paths, one statistic: on the same vector they agree far inside the resolution of ``pval_perm``."""
+    from src.localqtl import regression_kernels as rk
+    from src.localqtl.cis.common import residualize_batch
+    rng = np.random.default_rng(8)
+    n, m, k = 90, 14, 5
+    G = torch.tensor(rng.integers(0, 3, size=(m, n)).astype(np.float32))
+    H = torch.tensor(rng.integers(0, 3, size=(m, n, 1)).astype(np.float32)) if with_local_ancestry else None
+    C = rng.normal(size=(n, k)).astype(np.float32)
+    y = torch.tensor((C @ rng.normal(size=k) + rng.normal(size=n)).astype(np.float32))
+    rez = rk.Residualizer(torch.tensor(C))
+    y_res, G_res, H_res = residualize_batch(y, G, H, rez, center=True)
+    _, _, tstats = rk.run_batch_regression(y=y_res, G=G_res, H=H_res, k_eff=rez.k_eff, device="cpu")
+    dof = n - rez.k_eff - (1 + (0 if H_res is None else int(H_res.shape[2])))
+    t2 = tstats[:, 0].double().pow(2)
+    r2_obs = (t2 / (t2 + dof)).to(torch.float32)
+    y_col = y_res.reshape(-1, 1)
+    if H_res is None:
+        *_, r2_null_max = rk.run_batch_regression_with_permutations(
+            y=y_res, G=G_res, H=None, y_perm=y_col, k_eff=rez.k_eff, device="cpu")
+    else:
+        ctx, *_ = rk.prep_ctx_for_perm(y_res, G_res, H_res, rez.k_eff)
+        r2_null = rk._perm_chunk_r2_block(ctx, H_res, G_res, y_col)[:, 0]
+        torch.testing.assert_close(r2_null, r2_obs, rtol=1e-3, atol=1e-6)
+        assert int(r2_null.argmax()) == int(r2_obs.argmax())
+        r2_null_max = rk.perm_chunk_r2(ctx, H_res, G_res, y_col)
+    assert r2_null_max.item() == pytest.approx(r2_obs.max().item(), rel=1e-3)

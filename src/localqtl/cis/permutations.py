@@ -168,9 +168,23 @@ def _dosage_lead_row(y_resid, D_resid, L_resid, G_t, H_t, ix: int, k_eff: int,
 
 def _beta_fit_on_minp(minp_null: np.ndarray, p_obs: float) -> tuple[float, float, float]:
     """
-    Beta approximation of the per-phenotype minimum p-value (FastQTL's
-    argument applied directly to p-values, as the joint dosage test is an
-    F test rather than a correlation).  Returns ``(pval_beta, shape1, shape2)``.
+    Beta approximation of the per-phenotype null of the joint dosage test
+    (FastQTL's argument applied directly to p-values, as the test is an F test
+    rather than a correlation).  ``minp_null`` holds the joint-F p-value of each
+    permutation at the nominal ``(K, dof)``: the minimum over the window for
+    ``lead_selection="joint"``, the p-value at the permutation's pooled lead for
+    ``"pooled"``.  Returns ``(pval_beta, shape1, shape2)``.
+
+    Known limitation (review of 2026-11-09).  Unlike the correlation scans there
+    is no effective-degrees-of-freedom step, and a two-parameter Beta does not
+    reproduce this null exactly: the fitted ``shape1`` sits near 0.8 rather
+    than 1, the body of the null distribution is slightly misfitted (KS distance
+    about 0.012-0.018 on 10,000-20,000 null draws) and the lower tail is
+    conservative (about 0.042-0.046 below .05, 0.006-0.008 below .01).  Both
+    lead rules show it.  ``pval_perm`` is calibrated and is the reference;
+    solving for an effective denominator dof that sets the moment ``shape1`` to
+    1, as tensorQTL does for correlations, was tried and does not remove the
+    misfit.
     """
     from scipy import stats as _st
     a, b = _beta_mle_on_p(np.asarray(minp_null, dtype=np.float64))

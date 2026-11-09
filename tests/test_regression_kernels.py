@@ -183,3 +183,41 @@ class TestRunBatchDosageRegression:
         b, se, *_ = _ols_dosage_numpy(y.numpy().astype(np.float64), D[0].numpy().astype(np.float64), None)
         np.testing.assert_allclose(res["betas"][0].numpy(), b, rtol=1e-3, atol=1e-4)
         assert (res["ses"] > 0).all()
+
+
+def test_dosage_joint_f_block_refit_and_nested_ols_agree_on_a_residualised_design():
+    """The permutation scan compares its null with the block estimator of the joint F (``dosage_fstat`` on the
+    ctx of ``prep_ctx_for_dosage_perm``) and reports the refit (``run_batch_dosage_regression``).  With
+    projected-out covariates and local-ancestry columns both are the F of the nested comparison
+    ``y ~ 1 + C + L`` against ``y ~ 1 + C + L + D_1..D_K`` in float64, with ``(K, n - 1 - k - (2K - 1))``
+    degrees of freedom."""
+    from src.localqtl.cis.common import residualize_batch_dosage
+    from src.localqtl.regression_kernels import Residualizer, dosage_fstat, prep_ctx_for_dosage_perm
+    rng = np.random.default_rng(2)
+    n, m, k, K = 120, 12, 6, 2
+    G = rng.integers(0, 3, size=(m, n)).astype(np.float32)
+    H = rng.integers(0, 3, size=(m, n, 1)).astype(np.float32)         # ancestry-0 haplotype count
+    C = rng.normal(size=(n, k)).astype(np.float32)
+    y = (C @ rng.normal(size=k) + 0.6 * G[2] + rng.normal(size=n)).astype(np.float32)
+    rez = Residualizer(torch.tensor(C))
+    y_res, D, L = residualize_batch_dosage(torch.tensor(y), torch.tensor(G), torch.tensor(H), rez,
+                                           center=True, group=False)
+    ctx = prep_ctx_for_dosage_perm(D, L, k_eff=rez.k_eff)
+    res = run_batch_dosage_regression(y_res, D, L, k_eff=rez.k_eff, device="cpu")
+    dof = n - 1 - k - (2 * K - 1)
+    assert ctx["K"] == K and ctx["dof"] == res["dof"] == dof
+    f_block = dosage_fstat(ctx, y_res)
+    torch.testing.assert_close(f_block, res["fstat"], rtol=1e-3, atol=1e-5)
+
+    def rss(X):
+        r = y.astype(np.float64) - X @ np.linalg.lstsq(X, y.astype(np.float64), rcond=None)[0]
+        return float(r @ r)
+
+    base = np.column_stack([np.ones(n), C.astype(np.float64)])
+    for v in range(m):
+        l0 = H[v, :, 0].astype(np.float64)
+        d = np.column_stack([G[v] * l0 / 2.0, G[v] * (2.0 - l0) / 2.0])
+        rss0, rss1 = rss(np.column_stack([base, l0])), rss(np.column_stack([base, l0, d]))
+        f_ref = ((rss0 - rss1) / K) / (rss1 / dof)
+        np.testing.assert_allclose(res["fstat"][v].item(), f_ref, rtol=5e-3, atol=1e-4)
+        np.testing.assert_allclose(f_block[v].item(), f_ref, rtol=5e-3, atol=1e-4)

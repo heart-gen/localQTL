@@ -259,6 +259,25 @@ ancestry effects differ.
                               covariates_df, haplotypes=panel, ancestry_model="dosage",
                               lead_selection="pooled", ld_aware=True, nperm=10_000, seed=1)
 
+.. note::
+
+   **Beta approximation of the dosage scan (known limitation).**  ``pval_beta``
+   of the dosage scan is a two-parameter Beta fitted by maximum likelihood to
+   the null joint-F p-values at the nominal ``(K, dof)``; there is no
+   effective-degrees-of-freedom step as in the correlation scans.  The Beta
+   family does not reproduce this null exactly: the fitted ``beta_shape1`` sits
+   near 0.8 rather than 1, the body of the null distribution is slightly
+   misfitted (Kolmogorov-Smirnov distance about 0.012-0.018) and the lower tail
+   is conservative (about 0.042-0.046 of null phenotypes below .05 and
+   0.006-0.008 below .01).  Both lead rules show it.  ``pval_perm`` is
+   calibrated and is the reference; q-values computed on ``pval_beta`` err on
+   the conservative side at the usual FDR levels, and
+   ``calculate_qvalues(perm_df.drop(columns="pval_beta"))`` gives the
+   ``pval_perm``-based q-values as a sensitivity analysis when ``nperm`` is
+   large enough to resolve the discovery threshold.  Solving for an effective
+   denominator dof, the analogue of ``true_dof``, does not remove the misfit;
+   a replacement null fit is planned for a later version.
+
 With ``group_s`` the maximum runs over the phenotypes of a group as well as
 over the window, giving one calibrated row per group -- the layout wanted for
 isoform or splicing-event phenotypes grouped by gene.  This is valid because

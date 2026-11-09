@@ -361,7 +361,21 @@ def nominal_pvals_tensorqtl(
 def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
                       qvalue_lambda: Optional[Union[float, Sequence[float]]] = None,
                       logger: Optional[SimpleLogger] = None) -> pd.DataFrame:
-    """Annotate permutation results with q-values, p-value threshold"""
+    """
+    Annotate permutation results with q-values and the nominal p-value threshold.
+
+    Q-values (Storey, ``py_qvalue``) are computed on ``pval_beta`` when the table has
+    any, else on ``pval_perm``.  A phenotype whose beta approximation could not be
+    fitted (``pval_beta`` NaN) is tested with its ``pval_perm``; with no ``pval_perm``
+    column it is treated as p = 1.  ``pval_nominal_threshold`` is the per-phenotype
+    Beta quantile of the global cutoff and is NaN where the beta shapes are missing.
+
+    For the ancestry-specific dosage scan ``pval_beta`` is a Beta fit to the null joint-F
+    p-values at the nominal degrees of freedom; it misfits the body of the null
+    distribution slightly and is conservative in the tails (see
+    :func:`localqtl.cis.map_permutations`), so its q-values err on the conservative side
+    at the usual FDR levels.  ``pval_perm`` is the calibrated reference.
+    """
     logger = logger or SimpleLogger()
 
     if res_df.empty:
@@ -384,6 +398,17 @@ def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
 
     # Compute q-values
     p = res_df[pcol].to_numpy(dtype=float)
+    if use_beta and "pval_perm" in res_df.columns:
+        # A beta fit that could not be made (degenerate null, see ``_beta_mle_on_p``) leaves
+        # ``pval_beta`` NaN: that phenotype is tested with its empirical permutation p-value
+        # rather than set to p = 1 and dropped from the discoveries.  The stored columns are
+        # not modified, and the phenotype keeps a NaN ``pval_nominal_threshold``.
+        p_perm = res_df["pval_perm"].to_numpy(dtype=float)
+        fill = ~np.isfinite(p) & np.isfinite(p_perm)
+        if fill.any():
+            logger.write(f"  * {int(fill.sum())} phenotypes without a beta approximation: "
+                         "using pval_perm for their q-values.")
+            p = np.where(fill, p_perm, p)
     if not np.all(np.isfinite(p)):
         logger.write("  * WARNING: non-finite p-values found; replacing with 1.0 for q-value calc.")
         p = np.where(np.isfinite(p), p, 1.0)

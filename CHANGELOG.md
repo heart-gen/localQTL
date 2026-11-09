@@ -40,6 +40,42 @@ the GitHub release body from that section and stops if the tag has none.
 
 - `CisMapper.map_permutations` now accepts `ld_aware`, `ld_aware_opts` (documented for 0.4.3 but
   only reachable through the function API) and `lead_selection`.
+- `calculate_qvalues` tests a phenotype whose beta approximation could not be fitted (`pval_beta`
+  NaN) with its `pval_perm`, as `_beta_mle_on_p` documents, instead of setting it to p = 1, which
+  removed it from the discoveries whatever its permutation p-value. The stored p-value columns are
+  not modified and the phenotype keeps a NaN `pval_nominal_threshold`; with no `pval_perm` column
+  the p = 1 fill is unchanged. Tables without NaN `pval_beta` are unaffected.
+
+### Known limitations
+
+- **Beta approximation of the dosage scan.** `pval_beta` of `ancestry_model="dosage"` is a
+  two-parameter Beta fitted by maximum likelihood to the null joint-F p-values at the nominal
+  `(K, dof)` (`cis.permutations._beta_fit_on_minp`), without the effective-degrees-of-freedom step
+  of the correlation scans. The Beta family does not reproduce this null exactly: `beta_shape1`
+  sits near 0.8 rather than 1 (median 0.78 against 1.05 for `ancestry_model="main"` on the
+  localQTL benchmark's null), the body of the null distribution is slightly misfitted
+  (Kolmogorov-Smirnov distance 0.012-0.018 on 10,000-20,000 null phenotypes) and the lower tail is
+  conservative (0.042-0.046 below .05, 0.006-0.008 below .01). It is not a consequence of
+  `lead_selection="pooled"`: the joint-lead null misfits as much, on an exact Gaussian null drawn
+  with the package's own kernels. `pval_perm` is calibrated and is the reference; q-values on
+  `pval_beta` held the nominal FDR on the benchmark (realized .048 at .05). Solving for an
+  effective denominator dof that sets the moment `shape1` to 1, the analogue of tensorQTL's
+  `true_df`, was tried and does not remove the misfit, so a replacement null fit is deferred to a
+  later version. Documented in the user guide and in `_beta_fit_on_minp`.
+
+### Review
+
+- **Permutation inference reviewed (2026-11-09,
+  `docs/reviews/2026-11-09_permutation_inference.md`).** The observed scan and its permutation
+  null are one procedure in the pooled-lead dosage scan (one residualised design, one selection
+  statistic, the first-index tie rule on both sides, re-residualised permuted phenotypes, one
+  joint-F estimator with the same sanitisation); the joint F, its degrees of freedom and its
+  regularisation are those of the nested OLS comparison and are identical for observed and
+  permuted statistics. No kernel or statistic changed. New tests pin the conclusions: the
+  pooled-lead null on the identity permutation returns the observed scan's numbers; an exact
+  proxy ties in pooled R^2 and carries the same joint F under every permutation; the `main` /
+  `tensorqtl_flavor` observed R^2 (ridge OLS) equals the null kernels' statistic; the block and
+  refit joint F equal the float64 nested-model F on a design with projected-out covariates.
 
 ## [0.4.3] - 2026-11-04
 
