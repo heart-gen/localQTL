@@ -10,6 +10,67 @@ To release: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`, u
 compare links at the bottom, merge, and only then tag `vX.Y.Z`. The release workflow builds
 the GitHub release body from that section and stops if the tag has none.
 
+## [Unreleased]
+
+### Changed
+
+- **The ancestry-specific dosage scan has two explicitly distinguished inference products, and
+  neither rests on the Beta approximation.** (1) Phenotype-level discovery: the calibrated
+  empirical permutation p-value `pval_perm` of the selected-lead null is the phenotype-level
+  p-value (`pval_fit_method = "empirical"`, the dosage scan's default); no Beta is fitted and
+  `pval_beta`, `beta_shape1`, `beta_shape2` are NaN. `calculate_qvalues` computes the q-values on
+  it (the path it already took for a NaN `pval_beta`). (2) Variant-level extraction of joint
+  associations: the scan stores a compact summary of each phenotype's permutation null, the
+  smallest null p-values exactly and quantiles on a geometric grid, of both the selected-lead
+  null and the window-maximum joint-F null (`result.attrs["null_summary"]`, read with
+  `localqtl.stats.null_summary_of`; the CLI writes `<prefix>.cis_qtl.null_summary.parquet`), and
+  `calculate_qvalues` sets `pval_nominal_threshold` to the gene-level cutoff's quantile of the
+  window-minimum null (`localqtl.stats.empirical_nominal_threshold`: the k-th smallest null
+  value, k = floor(p* (nperm + 1)), exact within the stored tail and log-interpolated above it;
+  NaN when p* is below the permutations' resolution). `get_significant_pairs` gains
+  `pair_pval_col`, the per-pair statistic the threshold applies to; the CLI's `cis_nominal
+  --cis_output` and `CisMapper.get_significant_pairs` pick `pval_joint` for a dosage table
+  (`localqtl.cis.postproc.pair_pval_column_of`), so the lead-level test, its null and the pair
+  statistic are one joint-F procedure. Before, the pairs of a dosage eGene were selected by
+  comparing the nominal table's pooled 1-df `pval_nominal` with a threshold derived from the Beta
+  fit of the joint-F null: two different statistics. With `lead_selection="pooled"` the two
+  nulls differ (the F at the permutation's pooled lead against the maximum over the window) and
+  are read from the same F block (`regression_kernels.dosage_perm_chunk_f_at_and_max`), so the
+  pooled-lead heterogeneity procedure and the joint-F model are unchanged. Motivation (localQTL
+  benchmark, 2026-11-09, `04_calibration_power/05_metrics/_m/discovery_source.*`): the Beta of
+  this F-based null is conservative in the tail (0.4.4 Known limitations); on the power
+  scenarios q-values on `pval_perm` found 11.6 % more dosage discoveries at FDR .05 (20,652 to
+  23,043 over 1,340 cells) with the realized false-discovery rate at the other models' level,
+  and nothing changed on the null scenarios. `pval_fit_method="beta"` keeps the legacy Beta
+  product for the dosage scan, with its threshold from the Beta quantile. The correlation scans
+  (`main`, `interaction`, `tensorqtl_flavor`) keep `"beta"` as their default and are unchanged;
+  `beta_approx=False` is `"empirical"` for every scan. Every permutation table now carries
+  `pval_fit_method` per row (the CLI: `--pval_fit_method {beta,empirical}`); tables written
+  before 0.4.5 are read as `"beta"` where `pval_beta` is finite.
+- `get_significant_pairs` selects phenotypes with `qval <= fdr` and keeps pairs with the pair
+  statistic `<= pval_nominal_threshold` (both boundaries included, as `calculate_qvalues` counts
+  its discoveries); before, both comparisons were strict.
+- `calculate_qvalues` derives the gene-level cutoff p* from the phenotype-level p-value of every
+  row (so a phenotype tested on `pval_perm` because its Beta fit failed takes part in it); for a
+  table whose rows all carry Beta parameters nothing changes.
+
+### Fixed
+
+- `calculate_qvalues(qvalue_lambda=x)` with a single lambda (the CLI's `--qvalue_lambda`) raised
+  inside `py_qvalue`, whose pi0 estimator takes a grid; a scalar lambda is now Storey's pi0 at
+  that lambda (R's `qvalue(lambda = x)`), passed to the q-value computation directly, and a pi0
+  of 0 is reported as such. The local FDR, which no caller used, is no longer requested: its
+  kernel density failed on tables with tied or very few p-values, which the empirical p-value of
+  a small scan produces.
+
+### Under evaluation (not in this release)
+
+- A generalized-Pareto extrapolation of the permutation tail (Knijnenburg et al. 2009) below the
+  resolution `1 / (nperm + 1)` of the empirical p-value. It becomes the default only if it passes
+  the localQTL benchmark's pre-registered validation (`configs/calibration.yaml:
+  discovery_source.gpd_acceptance`: an independent null, both lead rules, 10^6-permutation
+  references, the empirical/GPD transition, mixed-null FDR, and a material gain in discoveries).
+
 ## [0.4.4] - 2026-11-09
 
 ### Added

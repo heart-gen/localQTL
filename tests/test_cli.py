@@ -185,8 +185,28 @@ def test_cli_cis_dosage_and_paired_covariate(cli_inputs, tmp_path, monkeypatch):
           "--window", "10000", "--mode", "cis", "--permutations", "30", "--haplotypes", "x",
           "--ancestry_model", "dosage", "--min_ancestry_ac", "1"])
     cis_df = pd.read_csv(os.path.join(c["out"], "dos.cis_qtl.txt.gz"), sep="\t")
-    assert {"slope_anc0", "slope_anc1", "pval_joint", "af_anc0", "pval_perm", "pval_beta"} <= set(cis_df.columns)
+    assert {"slope_anc0", "slope_anc1", "pval_joint", "af_anc0", "pval_perm", "pval_beta", "pval_fit_method"} <= set(cis_df.columns)
     assert len(cis_df) == 3 and cis_df["pval_perm"].between(0, 1).all()
+    # 0.4.5: the dosage scan's phenotype-level product is the empirical p (no Beta), and the compact permutation
+    # null each nominal threshold is read from travels in a sidecar
+    assert (cis_df["pval_fit_method"] == "empirical").all() and cis_df["pval_beta"].isna().all()
+    null_summary = pd.read_parquet(os.path.join(c["out"], "dos.cis_qtl.null_summary.parquet"))
+    assert list(null_summary["phenotype_id"]) == list(cis_df["phenotype_id"]) and (null_summary["nperm"] == 30).all()
+    assert {"null_lead_p_top", "null_max_p_top", "null_max_p_levels", "levels", "K", "dof"} <= set(null_summary.columns)
+    # the variant-level product: pairs on pval_joint under the empirical threshold, through cis_nominal --cis_output
+    _run([c["geno"], c["bed"], "dos", "--covariates", c["cov"], "-o", c["out"], "--device", "cpu",
+          "--window", "10000", "--mode", "cis", "--permutations", "30", "--haplotypes", "x",
+          "--ancestry_model", "dosage", "--min_ancestry_ac", "1", "--fdr", "0.9"])
+    cis_df = pd.read_csv(os.path.join(c["out"], "dos.cis_qtl.txt.gz"), sep="\t")
+    assert (cis_df["qval"] <= 0.9).any() and cis_df.loc[cis_df["qval"] <= 0.9, "pval_nominal_threshold"].notna().any()
+    _run([c["geno"], c["bed"], "dos", "--covariates", c["cov"], "-o", c["out"], "--device", "cpu",
+          "--window", "10000", "--mode", "cis_nominal", "--haplotypes", "x", "--ancestry_model", "dosage",
+          "--min_ancestry_ac", "1", "--cis_output", os.path.join(c["out"], "dos.cis_qtl.txt.gz"), "--fdr", "0.9"])
+    pairs = pd.read_parquet(os.path.join(c["out"], "dos.cis_qtl.signif_pairs.parquet"))
+    thr = cis_df.set_index("phenotype_id")["pval_nominal_threshold"]
+    assert not pairs.empty and "pval_joint" in pairs.columns
+    assert (pairs["pval_joint"].to_numpy() <= pairs["phenotype_id"].map(thr).to_numpy() * (1 + 1e-6)).all()
+    assert set(pairs["phenotype_id"]) <= set(cis_df.loc[cis_df["qval"] <= 0.9, "phenotype_id"])
 
     # a phenotype-specific covariate now also reaches cis_independent and cis_susie
     paired = os.path.join(c["out"], "paired.txt")

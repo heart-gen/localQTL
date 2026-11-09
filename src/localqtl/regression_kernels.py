@@ -15,7 +15,7 @@ __all__ = [
     "run_batch_interaction_regression",
     "run_batch_regression_with_permutations",
     "perm_chunk_r2", "prep_ctx_for_perm",
-    "prep_ctx_for_dosage_perm", "dosage_fstat", "dosage_perm_chunk_fmax",
+    "prep_ctx_for_dosage_perm", "dosage_fstat", "dosage_perm_chunk_fmax", "dosage_perm_chunk_f_at", "dosage_perm_chunk_f_at_and_max",
 ]
 
 _DEFAULT_MIXED_PRECISION = os.environ.get("LOCALQTL_MIXED_PRECISION", "fp16").lower()
@@ -536,6 +536,21 @@ def dosage_perm_chunk_f_at(ctx: dict, y_perm: torch.Tensor, ix: torch.Tensor) ->
     F = _dosage_fstat_block(ctx, y_perm)                                  # (m, chunk)
     ix = ix.to(device=F.device, dtype=torch.long).view(1, -1)
     return torch.nan_to_num(F.gather(0, ix).squeeze(0), nan=-1.0).to(torch.float32)
+
+
+@torch.no_grad()
+def dosage_perm_chunk_f_at_and_max(ctx: dict, y_perm: torch.Tensor, ix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    :func:`dosage_perm_chunk_f_at` and :func:`dosage_perm_chunk_fmax` from one F
+    block: ``(f_at, f_max)``, ``(chunk,)`` each.  The pooled-lead scan needs both
+    nulls (0.4.5): the F at the permutation's pooled lead calibrates the
+    phenotype-level p-value, the maximum over the window is the null of the
+    window-minimum p-value from which the pair extraction reads its nominal
+    threshold.  The block is computed once; the second statistic is a reduction.
+    """
+    F = torch.nan_to_num(_dosage_fstat_block(ctx, y_perm), nan=-1.0)       # (m, chunk)
+    ix = ix.to(device=F.device, dtype=torch.long).view(1, -1)
+    return F.gather(0, ix).squeeze(0).to(torch.float32), F.amax(dim=0).to(torch.float32)
 
 
 def _is_cuda(*tensors):

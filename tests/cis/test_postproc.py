@@ -66,3 +66,24 @@ def test_get_significant_pairs_group_mode(tmp_path):
 
     assert set(result["group_id"]) == {"g1"}
     assert (result["pval_nominal"] <= result["pval_nominal_threshold_group"]).all()
+
+
+def test_get_significant_pairs_compares_the_named_pair_statistic_boundary_included(tmp_path):
+    """``pair_pval_col`` names the per-pair statistic the threshold applies to (``pval_joint`` for the dosage scan);
+    a pair at the threshold is kept, a phenotype at the FDR is selected, a NaN threshold contributes no pairs."""
+    res_df = pd.DataFrame({"phenotype_id": ["geneA", "geneB", "geneC"], "qval": [0.01, 0.05, 0.02],
+                           "pval_nominal_threshold": [0.01, 0.02, float("nan")]})
+    _write_nominal(tmp_path, "chr1", [
+        {"phenotype_id": "geneA", "variant_id": "v1", "pval_nominal": 0.5, "pval_joint": 0.01},     # at the threshold
+        {"phenotype_id": "geneA", "variant_id": "v2", "pval_nominal": 0.001, "pval_joint": 0.2},    # pooled p small, joint not
+        {"phenotype_id": "geneB", "variant_id": "v3", "pval_nominal": 0.5, "pval_joint": 0.015},
+        {"phenotype_id": "geneC", "variant_id": "v4", "pval_nominal": 1e-9, "pval_joint": 1e-9},
+    ])
+    out = get_significant_pairs(res_df, {"chr1": str(tmp_path / "cis_nominal.chr1.parquet")}, fdr=0.05,
+                                logger=SimpleLogger(verbose=False), pair_pval_col="pval_joint")
+    assert sorted(zip(out["phenotype_id"], out["variant_id"])) == [("geneA", "v1"), ("geneB", "v3")]
+    assert "pval_joint" in out.columns
+    # the default statistic is pval_nominal, as before
+    out2 = get_significant_pairs(res_df, {"chr1": str(tmp_path / "cis_nominal.chr1.parquet")}, fdr=0.05,
+                                 logger=SimpleLogger(verbose=False))
+    assert sorted(zip(out2["phenotype_id"], out2["variant_id"])) == [("geneA", "v2")]

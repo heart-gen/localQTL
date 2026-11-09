@@ -10,7 +10,8 @@ except Exception:
 
 from ..utils import SimpleLogger, subseed
 from .._torch_utils import to_device_tensor
-from ..stats import beta_approx_pval, get_f_pval, get_t_pval, _beta_mle_on_p
+from ..stats import (beta_approx_pval, get_f_pval, get_t_pval, _beta_mle_on_p, summarise_null_p,
+                     NULL_SUMMARY_LEVELS, NullSummary, null_summary_of)
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from ..preproc import (impute_mean_and_filter, allele_stats, filter_by_maf,
                        ancestry_allele_stats)
@@ -21,6 +22,7 @@ from ..regression_kernels import (
     dosage_fstat,
     dosage_perm_chunk_fmax,
     dosage_perm_chunk_f_at,
+    dosage_perm_chunk_f_at_and_max,
     prep_ctx_for_perm,
     perm_chunk_r2_argmax,
 )
@@ -104,7 +106,8 @@ def _pooled_lead_values(ix: int, r2: torch.Tensor, b: torch.Tensor, s: torch.Ten
 
 def _pooled_lead_null(ctx_d: dict, ctx_p: dict, L_resid: torch.Tensor, G_resid: torch.Tensor,
                       y_resid: torch.Tensor, y_src: torch.Tensor | None, stream: PermutationStream, nperm: int,
-                      n_samples: int, projectors, mixed_precision: str | None) -> tuple[torch.Tensor, torch.Tensor]:
+                      n_samples: int, projectors, mixed_precision: str | None
+                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     The selection-aware null of the pooled-lead dosage scan (``lead_selection="pooled"``).
 
@@ -117,21 +120,26 @@ def _pooled_lead_null(ctx_d: dict, ctx_p: dict, L_resid: torch.Tensor, G_resid: 
     test as the test and calibrates its p-value for the selection; the maximum F
     over the window (the joint-lead null) would be conservative at a lead the joint
     F did not pick, and the pooled model's own p-value is never substituted for the
-    dosage model's.  Returns ``(r2_sel, f_sel)``, ``(nperm,)`` each: the pooled
-    maximum R^2 of each permutation and the joint F at its variant.
+    dosage model's.  Returns ``(r2_sel, f_sel, f_max)``, ``(nperm,)`` each: the pooled
+    maximum R^2 of each permutation, the joint F at its variant (the null of the
+    phenotype-level p-value) and the maximum joint F over the window (the null of the
+    window-minimum p-value, from which the pair extraction reads its nominal
+    threshold; 0.4.5), read from the same F block.
     """
-    r2_parts, f_parts = [], []
+    r2_parts, f_parts, fmax_parts = [], [], []
     for sel in stream.iter_chunks(nperm):
         flat = sel.reshape(-1)
         y_perm = (y_resid if y_src is None else y_src).index_select(0, flat).view(sel.shape[0], n_samples).transpose(0, 1)
         y_perm = freedman_lane(y_perm, projectors)
         r2_max, ix = perm_chunk_r2_argmax(ctx_p, L_resid, G_resid, y_perm, mixed_precision=mixed_precision)
         r2_parts.append(r2_max)
-        f_parts.append(dosage_perm_chunk_f_at(ctx_d, y_perm, ix))
+        f_at, f_max = dosage_perm_chunk_f_at_and_max(ctx_d, y_perm, ix)
+        f_parts.append(f_at)
+        fmax_parts.append(f_max)
     if not r2_parts:
         empty = torch.empty((0,), device=y_resid.device, dtype=torch.float32)
-        return empty, empty
-    return torch.cat(r2_parts), torch.cat(f_parts)
+        return empty, empty, empty
+    return torch.cat(r2_parts), torch.cat(f_parts), torch.cat(fmax_parts)
 
 def _dosage_lead_row(y_resid, D_resid, L_resid, G_t, H_t, ix: int, k_eff: int,
                      min_ancestry_ac: float, device: str):
@@ -166,6 +174,44 @@ def _dosage_lead_row(y_resid, D_resid, L_resid, G_t, H_t, ix: int, k_eff: int,
     return dosage_vals, float(slope[0]), float(slope_se[0]), float(tstat[0]), int(dof)
 
 
+def _null_summary_row(key: dict, f_lead_null: np.ndarray, f_max_null: np.ndarray, K: int, dof: int,
+                      nperm: int) -> dict:
+    """
+    The compact record of one phenotype's (or group's) dosage permutation null
+    (0.4.5): the ``NULL_SUMMARY_TOP`` smallest null p-values and the quantiles at
+    ``NULL_SUMMARY_LEVELS`` of two nulls on the nominal ``(K, dof)`` p-value scale,
+    ``lead`` (the joint-F p at the permutation's selected lead: the null of
+    ``pval_perm``) and ``max`` (the window-minimum joint-F p: the null the pair
+    extraction's nominal threshold is read from, :func:`localqtl.stats.calculate_qvalues`).
+    With ``lead_selection="joint"`` the two coincide.
+    """
+    lead_top, lead_q = summarise_null_p(get_f_pval(np.asarray(f_lead_null, dtype=np.float64), K, dof))
+    max_top, max_q = summarise_null_p(get_f_pval(np.asarray(f_max_null, dtype=np.float64), K, dof))
+    row = dict(key)
+    row.update({"nperm": int(nperm), "K": int(K), "dof": int(dof), "levels": NULL_SUMMARY_LEVELS.astype(np.float32),
+                "null_lead_p_top": lead_top, "null_lead_p_levels": lead_q,
+                "null_max_p_top": max_top, "null_max_p_levels": max_q})
+    return row
+
+
+def _resolve_fit_method(pval_fit_method: str | None, beta_approx: bool, ancestry_model: str | None) -> str:
+    """
+    ``"beta"`` or ``"empirical"``: the explicit ``pval_fit_method`` when given, else
+    ``"empirical"`` for the ancestry-specific dosage scan (0.4.5: its Beta
+    approximation is conservative in the tail, see :func:`_beta_fit_on_minp`) and
+    whenever ``beta_approx`` is off, else ``"beta"``.  ``beta_approx=False`` with an
+    explicit ``"beta"`` is a contradiction.
+    """
+    if pval_fit_method is None:
+        return "empirical" if (not beta_approx or ancestry_model == "dosage") else "beta"
+    m = str(pval_fit_method).lower()
+    if m not in {"beta", "empirical"}:
+        raise ValueError(f"pval_fit_method must be 'beta' or 'empirical', got {pval_fit_method!r}")
+    if m == "beta" and not beta_approx:
+        raise ValueError("pval_fit_method='beta' needs beta_approx=True")
+    return m
+
+
 def _beta_fit_on_minp(minp_null: np.ndarray, p_obs: float) -> tuple[float, float, float]:
     """
     Beta approximation of the per-phenotype null of the joint dosage test
@@ -174,6 +220,11 @@ def _beta_fit_on_minp(minp_null: np.ndarray, p_obs: float) -> tuple[float, float
     permutation at the nominal ``(K, dof)``: the minimum over the window for
     ``lead_selection="joint"``, the p-value at the permutation's pooled lead for
     ``"pooled"``.  Returns ``(pval_beta, shape1, shape2)``.
+
+    Legacy since 0.4.5 (``pval_fit_method="beta"``): the dosage scan's default
+    phenotype-level p-value is the empirical ``pval_perm`` and its nominal
+    threshold is read from the stored null (:func:`_null_summary_row`), because
+    of the limitation below.
 
     Known limitation (review of 2026-11-09).  Unlike the correlation scans there
     is no effective-degrees-of-freedom step, and a two-parameter Beta does not
@@ -186,7 +237,9 @@ def _beta_fit_on_minp(minp_null: np.ndarray, p_obs: float) -> tuple[float, float
     Both lead rules show it.  ``pval_perm`` is calibrated and is the reference;
     solving for an effective denominator dof that sets the moment ``shape1`` to
     1, as tensorQTL does for correlations, was tried and does not remove the
-    misfit.
+    misfit.  On the localQTL benchmark's power scenarios q-values on
+    ``pval_perm`` found 11.6 % more dosage discoveries at FDR .05 with the
+    realized FDR at the other models' level (2026-11-09).
     """
     from scipy import stats as _st
     a, b = _beta_mle_on_p(np.asarray(minp_null, dtype=np.float64))
@@ -229,6 +282,7 @@ def _run_permutation_core(
         perm_source_ctx: tuple | None = None,
         ld_aware: dict | None = None,
         lead_selection: str = "joint",
+        pval_fit_method: str = "beta",
 ) -> pd.DataFrame:
     """
     One top association per phenotype with empirical permutation p-value (no grouping).
@@ -243,8 +297,10 @@ def _run_permutation_core(
         "phenotype_id", "variant_id", "start_distance", "end_distance",
         "num_var", "slope", "slope_se", "tstat", "r2_nominal", "pval_nominal",
         "pval_perm", "pval_beta", "beta_shape1", "beta_shape2",
-        "ma_samples", "ma_count", "af", "true_dof", "pval_true_dof"
+        "ma_samples", "ma_count", "af", "true_dof", "pval_true_dof", "pval_fit_method",
     ]
+    fit_beta = str(pval_fit_method) == "beta"        # else "empirical": no Beta, pval_beta NaN, the null stored
+    null_rows: list[dict] = []
     interaction_columns: list[str] = []
     if ancestry_model == "interaction" and n_ancestries is not None and n_ancestries > 0:
         interaction_columns = _interaction_columns(int(n_ancestries))
@@ -282,6 +338,7 @@ def _run_permutation_core(
         "af": np.float32,
         "true_dof": np.float32,
         "pval_true_dof": np.float32,
+        "pval_fit_method": object,
     }
     for col in interaction_columns + dosage_columns + pooled_cols:
         dtype_map[col] = np.float32
@@ -438,9 +495,10 @@ def _run_permutation_core(
                 mode=perm_indices_mode,
             )
             if pooled_lead:
-                _, f_sel = _pooled_lead_null(ctx, ctx_p, L_resid, G_sum, y_resid_t, y_src, stream, nperm,
-                                             n_samples, projectors_of(rez_b), mixed_precision)
+                _, f_sel, f_win = _pooled_lead_null(ctx, ctx_p, L_resid, G_sum, y_resid_t, y_src, stream, nperm,
+                                                    n_samples, projectors_of(rez_b), mixed_precision)
                 fmax_np = f_sel.detach().cpu().numpy()
+                fwin_np = f_win.detach().cpu().numpy()
             else:
                 fmax_parts = []
                 for sel in stream.iter_chunks(nperm):
@@ -450,13 +508,16 @@ def _run_permutation_core(
                     fmax_parts.append(dosage_perm_chunk_fmax(ctx, y_perm))
                 fmax_np = (torch.cat(fmax_parts).detach().cpu().numpy() if fmax_parts
                            else np.empty(0, dtype=np.float64))
+                fwin_np = fmax_np
             pval_perm = float((np.sum(fmax_np >= f_block) + 1) / (fmax_np.size + 1))
-            if beta_approx and fmax_np.size:
+            if fit_beta and fmax_np.size:
                 minp_null = get_f_pval(fmax_np, K, dof)
                 pval_beta, a_hat, b_hat = _beta_fit_on_minp(
                     minp_null, float(get_f_pval(f_block, K, dof)))
             else:
                 pval_beta = a_hat = b_hat = np.nan
+            if fmax_np.size:
+                null_rows.append(_null_summary_row({"phenotype_id": pid, "group_id": None}, fmax_np, fwin_np, K, dof, nperm))
             # The joint test is an F test, so there is no t-style effective
             # dof to re-estimate: report the residual dof and leave p_true NaN.
             true_dof = dof
@@ -539,7 +600,7 @@ def _run_permutation_core(
             pval_nominal = float(get_t_pval(tval, dof))
             pval_perm = float((np.sum(r2_perm_np >= r2_nominal) + 1) / (r2_perm_np.size + 1))
 
-            if beta_approx:
+            if fit_beta:
                 pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
                     r2_perm_np, r2_nominal, dof_init=dof
                 )
@@ -596,7 +657,7 @@ def _run_permutation_core(
             pval_nominal = float(get_t_pval(tval, dof))
             pval_perm = float((np.sum(r2_perm_np >= r2_nominal) + 1) / (r2_perm_np.size + 1))
 
-            if beta_approx:
+            if fit_beta:
                 pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
                     r2_perm_np, r2_nominal, dof_init=dof
                 )
@@ -655,7 +716,7 @@ def _run_permutation_core(
             pval_perm = float((np.sum(r2_perm_np >= r2_nominal) + 1) / (r2_perm_np.size + 1))
 
             # Optional Beta approximation
-            if beta_approx:
+            if fit_beta:
                 pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
                     r2_perm_np, r2_nominal, dof_init=dof
                 )
@@ -692,6 +753,7 @@ def _run_permutation_core(
             "pval_nominal": pval_nominal,
             "pval_perm": pval_perm,
             "pval_beta": pval_beta,
+            "pval_fit_method": "beta" if fit_beta else "empirical",
         }
         if interaction_mode and interaction_columns:
             for anc_idx in range(len(interaction_columns) // 4):
@@ -722,7 +784,10 @@ def _run_permutation_core(
                 f"      processed {processed}/{total_phenotypes} phenotypes on {chrom_label}"
             )
 
-    return buffers_to_dataframe(expected_columns, buffers, cursor)
+    out = buffers_to_dataframe(expected_columns, buffers, cursor)
+    if null_rows:
+        out.attrs["null_summary"] = NullSummary(pd.DataFrame(null_rows))
+    return out
 
 
 def _run_permutation_core_group(
@@ -738,6 +803,7 @@ def _run_permutation_core_group(
         perm_source_ctx: tuple | None = None,
         ld_aware: dict | None = None,
         lead_selection: str = "joint",
+        pval_fit_method: str = "beta",
 ) -> pd.DataFrame:
     """
     Group-aware permutation mapping: returns one top association per group with empirical p-values.
@@ -753,8 +819,10 @@ def _run_permutation_core_group(
         "group_id", "group_size", "phenotype_id", "variant_id", "start_distance",
         "end_distance", "num_var", "slope", "slope_se", "tstat",
         "r2_nominal", "pval_nominal", "pval_perm", "pval_beta", "beta_shape1",
-        "beta_shape2", "ma_samples", "ma_count", "af", "true_dof", "pval_true_dof",
+        "beta_shape2", "ma_samples", "ma_count", "af", "true_dof", "pval_true_dof", "pval_fit_method",
     ]
+    fit_beta = str(pval_fit_method) == "beta"        # else "empirical": no Beta, pval_beta NaN, the null stored
+    null_rows: list[dict] = []
     interaction_columns: list[str] = []
     if ancestry_model == "interaction" and n_ancestries is not None and n_ancestries > 0:
         interaction_columns = _interaction_columns(int(n_ancestries))
@@ -794,6 +862,7 @@ def _run_permutation_core_group(
         "af": np.float32,
         "true_dof": np.float32,
         "pval_true_dof": np.float32,
+        "pval_fit_method": object,
     }
     for col in interaction_columns + dosage_columns + pooled_cols:
         dtype_map[col] = np.float32
@@ -927,7 +996,7 @@ def _run_permutation_core_group(
             # variant) its own pooled R^2 selects.
             G_sum = D_resid.sum(dim=2) if pooled_lead else None
             best_score = -float("inf")
-            r2_sel_global = f_sel_global = None
+            r2_sel_global = f_sel_global = f_win_global = None
             for j, y_resid in enumerate(Y_resid):
                 y_src = _perm_source_row(perm_source_ctx, ids_list[j])
                 f_obs = torch.nan_to_num(dosage_fstat(ctx, y_resid), nan=-1.0)
@@ -961,14 +1030,15 @@ def _run_permutation_core_group(
                     mode=perm_indices_mode,
                 )
                 if pooled_lead:
-                    r2_sel, f_sel = _pooled_lead_null(ctx, ctx_p, L_resid, G_sum, y_resid, y_src, stream, nperm,
-                                                      n_samples_g, projectors_of(rez), mixed_precision)
+                    r2_sel, f_sel, f_win = _pooled_lead_null(ctx, ctx_p, L_resid, G_sum, y_resid, y_src, stream, nperm,
+                                                             n_samples_g, projectors_of(rez), mixed_precision)
                     if r2_sel_global is None:
-                        r2_sel_global, f_sel_global = r2_sel, f_sel
+                        r2_sel_global, f_sel_global, f_win_global = r2_sel, f_sel, f_win
                     else:
                         better = r2_sel > r2_sel_global
                         r2_sel_global = torch.where(better, r2_sel, r2_sel_global)
                         f_sel_global = torch.where(better, f_sel, f_sel_global)
+                        f_win_global = torch.maximum(f_win_global, f_win)
                     continue
                 fmax_parts = []
                 for sel in stream.iter_chunks(nperm):
@@ -983,21 +1053,28 @@ def _run_permutation_core_group(
                                      else torch.maximum(f_perm_global, f_perm_pheno))
             if pooled_lead:
                 f_perm_global = f_sel_global
+            else:
+                f_win_global = f_perm_global
 
             if best_ix_var >= 0:
                 best_dof = dof
                 fmax_np = (f_perm_global.detach().cpu().numpy()
                            if f_perm_global is not None else np.empty(0, dtype=np.float64))
+                fwin_np = (f_win_global.detach().cpu().numpy()
+                           if f_win_global is not None else np.empty(0, dtype=np.float64))
                 # ``best_f_val`` shares the estimator of the null, so it is
                 # what the null is compared against; the refit below gives the
                 # stable F that the row reports.
                 pval_perm = float((np.sum(fmax_np >= best_f_val) + 1) / (fmax_np.size + 1))
-                if beta_approx and fmax_np.size:
+                if fit_beta and fmax_np.size:
                     pval_beta, a_hat, b_hat = _beta_fit_on_minp(
                         get_f_pval(fmax_np, K, dof), float(get_f_pval(best_f_val, K, dof))
                     )
                 else:
                     pval_beta = a_hat = b_hat = np.nan
+                if fmax_np.size:
+                    null_rows.append(_null_summary_row({"phenotype_id": ids_list[best_ix_pheno], "group_id": group_id},
+                                                       fmax_np, fwin_np, K, dof, nperm))
                 # The joint test is an F test, so there is no t-style effective
                 # dof to re-estimate: report the residual dof and leave p_true NaN.
                 true_dof = dof
@@ -1185,7 +1262,7 @@ def _run_permutation_core_group(
                     (r2_perm_global >= torch.tensor(best_r2_val, device=r2_perm_global.device)).sum().add_(1).float() / (r2_perm_global.numel() + 1)
                 ).item()
                 r2_perm_np = r2_perm_global.detach().cpu().numpy()
-                if beta_approx:
+                if fit_beta:
                     pval_beta, a_hat, b_hat, true_dof, p_true = beta_approx_pval(
                         r2_perm_np, best_r2_val, dof_init=best_dof
                     )
@@ -1218,6 +1295,7 @@ def _run_permutation_core_group(
             "pval_nominal": pval_nominal,
             "pval_perm": pval_perm,
             "pval_beta": float(pval_beta),
+            "pval_fit_method": "beta" if fit_beta else "empirical",
             "beta_shape1": float(a_hat),
             "beta_shape2": float(b_hat),
             "true_dof": float(true_dof) if np.isfinite(true_dof) else float(best_dof),
@@ -1255,7 +1333,10 @@ def _run_permutation_core_group(
                 f"      processed {processed}/{total_groups} phenotype groups on {chrom_label}"
             )
 
-    return buffers_to_dataframe(expected_columns, buffers, cursor)
+    out = buffers_to_dataframe(expected_columns, buffers, cursor)
+    if null_rows:
+        out.attrs["null_summary"] = NullSummary(pd.DataFrame(null_rows))
+    return out
 
 
 def map_permutations(
@@ -1275,10 +1356,23 @@ def map_permutations(
         ld_aware: bool = False,
         ld_aware_opts: dict | None = None,
         lead_selection: str = "joint",
+        pval_fit_method: str | None = None,
 ) -> pd.DataFrame:
     """
     Empirical cis-QTL mapping (one top variant per phenotype) with permutations.
     Returns a DataFrame with empirical p-values (and optional Beta approximation).
+
+    ``pval_fit_method`` (0.4.5) names the phenotype-level inference product and is
+    reported per row: ``"beta"`` fits the Beta approximation (``pval_beta``,
+    ``beta_shape1``, ``beta_shape2``; the default of the correlation scans, tensorQTL's
+    construction); ``"empirical"`` fits nothing, leaves those columns NaN and makes the
+    calibrated ``pval_perm`` the phenotype-level p-value (the default of
+    ``ancestry_model="dosage"``, whose Beta is conservative in the tail, and of
+    ``beta_approx=False``).  The dosage scan also stores a compact summary of each
+    phenotype's permutation null in ``result.attrs["null_summary"]`` (the smallest
+    null p-values and quantiles of the selected-lead null and of the window-minimum
+    null), from which :func:`localqtl.stats.calculate_qvalues` reads the nominal
+    threshold of the pair extraction without Beta parameters.
 
     Parameters
     ----------
@@ -1292,7 +1386,7 @@ def map_permutations(
         ``"dosage"`` runs the ancestry-specific dosage scan: the per-variant
         statistic is the joint Wald F over the K ancestry effects and the
         permutation statistic is its maximum over the window, so ``pval_perm``
-        and ``pval_beta`` calibrate the *joint* signal.  ``pval_nominal`` is
+        calibrates the *joint* signal (``pval_fit_method`` below).  ``pval_nominal`` is
         then the joint p-value of the lead variant and the per-ancestry
         columns of :func:`localqtl.cis.map_nominal` are reported for it.
         With ``group_s`` the maximum is taken over the phenotypes of the
@@ -1356,7 +1450,8 @@ def map_permutations(
     logger.write(f"  * {phenotype_df.shape[0]} phenotypes")
     logger.write(f"  * {variant_df.shape[0]} variants")
     logger.write(f"  * cis-window: \u00B1{window:,}")
-    logger.write(f"  * nperm={nperm:,} (beta_approx={'on' if beta_approx else 'off'})")
+    fit_method = _resolve_fit_method(pval_fit_method, beta_approx, ancestry_model)
+    logger.write(f"  * nperm={nperm:,} (pval_fit_method={fit_method})")
     logger.write(f"  * seed: {seed}")
     if maf_threshold and maf_threshold > 0:
         logger.write(f"  * applying in-sample {maf_threshold:g} MAF filter")
@@ -1479,6 +1574,7 @@ def map_permutations(
                         perm_source_ctx=perm_source_ctx,
                         ld_aware=ld_opts,
                         lead_selection=lead_selection,
+                        pval_fit_method=fit_method,
                     )
                 else:
                     chrom_df = core(
@@ -1497,6 +1593,7 @@ def map_permutations(
                         perm_source_ctx=perm_source_ctx,
                         ld_aware=ld_opts,
                         lead_selection=lead_selection,
+                        pval_fit_method=fit_method,
                     )
             results.append(chrom_df)
             if logger.verbose:
@@ -1508,5 +1605,11 @@ def map_permutations(
         logger.write(f"    Completed permutation scan in {elapsed / 60:.2f} min")
 
     if results:
-        return pd.concat(results, axis=0, ignore_index=True)
+        nulls = [null_summary_of(r) for r in results if "null_summary" in r.attrs]
+        for r in results:
+            r.attrs.pop("null_summary", None)
+        out = pd.concat(results, axis=0, ignore_index=True)
+        if nulls:
+            out.attrs["null_summary"] = NullSummary(pd.concat(nulls, axis=0, ignore_index=True))
+        return out
     return pd.DataFrame()

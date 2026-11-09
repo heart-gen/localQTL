@@ -198,7 +198,7 @@ def test_map_permutations_ld_aware_reports_the_conditional_contrast_at_the_lead(
     r = out.iloc[0]
     # the marginal columns are untouched by the LD-aware pass
     for c in ("variant_id", "pval_perm", "pval_beta", "slope_anc0", "pval_diff_anc0_anc1"):
-        assert r[c] == base.iloc[0][c]
+        assert r[c] == base.iloc[0][c] or (pd.isna(r[c]) and pd.isna(base.iloc[0][c]))
     assert r["variant_id"] in ("v0", "v1") and r["n_cs_ld"] >= 1 and r["cs_size_ld"] >= 1
     assert 0 <= r["pip_ld"] <= 1 and np.isfinite(r["pval_diff_ld_anc0_anc1"]) and r["dof_ld"] <= r["true_dof"]
     if r["n_conditioned_ld"] == 0:                     # the lead is its credible set: the conditional is the marginal

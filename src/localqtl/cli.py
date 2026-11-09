@@ -36,10 +36,10 @@ import torch
 
 from . import genotypeio, pgen, susie, trans
 from .cis import map_conditional_dosage, map_independent, map_nominal, map_permutations
-from .cis.postproc import get_significant_pairs
+from .cis.postproc import get_significant_pairs, pair_pval_column_of
 from .compat import from_tensorqtl_columns, to_tensorqtl_columns
 from .phenotypeio import read_phenotype_bed
-from .stats import calculate_qvalues
+from .stats import NullSummary, calculate_qvalues, null_summary_of
 from .utils import SimpleLogger
 
 __all__ = ["build_parser", "main"]
@@ -103,6 +103,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Table (parquet or tsv) with loci to fine-map (phenotype_id, chr, pos) with mode 'trans_susie'.")
     parser.add_argument('--disable_beta_approx', action='store_true',
                         help='Disable Beta-distribution approximation of empirical p-values (not recommended).')
+    parser.add_argument('--pval_fit_method', default=None, choices=['beta', 'empirical'],
+                        help="'cis' mode: the phenotype-level inference product, reported per row as pval_fit_method. "
+                             "'beta' fits the Beta approximation (pval_beta; the default of the correlation scans); "
+                             "'empirical' fits nothing and makes the calibrated pval_perm the phenotype-level p-value "
+                             "(the default of --ancestry_model dosage since 0.4.5, and of --disable_beta_approx). The "
+                             "dosage scan also writes <prefix>.cis_qtl.null_summary.parquet, the compact permutation "
+                             "null each nominal threshold is read from.")
     parser.add_argument('--warn_monomorphic', action='store_true',
                         help='Accepted for tensorQTL compatibility (monomorphic variants are always dropped).')
     parser.add_argument('--max_effects', type=int, default=10,
@@ -368,14 +375,26 @@ def main(argv=None) -> int:
             kw.update(ld_aware=True, ld_aware_opts={'condition_on': args.condition_on, 'L': args.max_effects})
         if args.lead_selection != 'joint':
             kw.update(lead_selection=args.lead_selection)
+        if args.pval_fit_method is not None:
+            kw.update(pval_fit_method=args.pval_fit_method)
         if pgr is None:
             res_df = map_permutations(genotype_df, variant_df, phenotype_df, phenotype_pos_df, **kw)
         else:
-            res_df = pd.concat([map_permutations(gt, var, p, ppos, **kw) for gt, var, p, ppos, _ in _chunks()],
-                               ignore_index=True)
+            parts = [map_permutations(gt, var, p, ppos, **kw) for gt, var, p, ppos, _ in _chunks()]
+            nulls = [null_summary_of(d) for d in parts if "null_summary" in d.attrs]
+            for d in parts:
+                d.attrs.pop("null_summary", None)
+            res_df = pd.concat(parts, ignore_index=True)
+            if nulls:
+                res_df.attrs["null_summary"] = NullSummary(pd.concat(nulls, ignore_index=True))
         logger.write('  * writing output')
         res_df = calculate_qvalues(res_df, fdr=args.fdr, qvalue_lambda=args.qvalue_lambda, logger=logger)
         _write_tsv(_names(res_df, args), os.path.join(args.output_dir, f'{args.prefix}.cis_qtl.txt.gz'), index=False)
+        if null_summary_of(res_df) is not None:
+            # the compact permutation null of each phenotype (dosage scan): calculate_qvalues(..., null_summary=...)
+            # recomputes the empirical nominal thresholds from it without rerunning the permutations
+            null_summary_of(res_df).to_parquet(os.path.join(args.output_dir, f'{args.prefix}.cis_qtl.null_summary.parquet'),
+                                               index=False)
 
     elif args.mode == 'cis_nominal':
         has_int = interaction_df is not None
@@ -393,7 +412,7 @@ def main(argv=None) -> int:
                 cis_df = from_tensorqtl_columns(pd.read_csv(args.cis_output, sep='\t'))
                 signif_df = get_significant_pairs(
                     cis_df, os.path.join(args.output_dir, f'{args.prefix}.cis_qtl_pairs.*.parquet'),
-                    group_s=group_s, fdr=args.fdr, logger=logger)
+                    group_s=group_s, fdr=args.fdr, logger=logger, pair_pval_col=pair_pval_column_of(cis_df))
                 signif_df.to_parquet(os.path.join(args.output_dir, f'{args.prefix}.cis_qtl.signif_pairs.parquet'))
         else:
             chunks = []

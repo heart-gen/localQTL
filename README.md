@@ -173,12 +173,22 @@ estimation is future work.
 
 `map_permutations(ancestry_model="dosage")` calibrates the scan: the
 per-variant statistic is the joint Wald F over the K ancestry effects and the
-permutation statistic is its maximum over the cis-window, so `pval_perm` and
-`pval_beta` apply to the *joint* signal while the per-ancestry columns are
-reported for the lead variant. Because the joint test is an F test rather
-than a correlation, the Beta approximation is fitted to the permuted minimum
-p-values directly; `true_dof` is therefore the residual degrees of freedom and
-`pval_true_dof` is `NaN`. The dosage model is available in `map_nominal` and
+permutation statistic is its maximum over the cis-window, so `pval_perm`
+applies to the *joint* signal while the per-ancestry columns are reported for
+the lead variant; `true_dof` is the residual degrees of freedom and
+`pval_true_dof` is `NaN`. Since 0.4.5 the scan has two explicit inference
+products: the phenotype-level p-value is the calibrated empirical `pval_perm`
+(`pval_fit_method = "empirical"`, the default; no Beta is fitted and
+`pval_beta` / `beta_shape1` / `beta_shape2` are NaN, because the Beta
+approximation of this F-based null is conservative in the tail), and the
+variant-level pairs are read from the permutation null of the window-minimum
+joint-F p-value: the scan stores a compact summary of each phenotype's null
+(`null_summary_of(perm_df)`; the CLI writes `<prefix>.cis_qtl.null_summary.parquet`),
+`calculate_qvalues` sets `pval_nominal_threshold` to its quantile at the
+gene-level cutoff, and `get_significant_pairs(..., pair_pval_col="pval_joint")`
+keeps the variants whose joint-F p-value is at most that threshold (the CLI
+and `CisMapper` pick `pval_joint` for a dosage table). `pval_fit_method="beta"`
+keeps the legacy Beta. The dosage model is available in `map_nominal` and
 `map_permutations` (and in the `cis` / `cis_nominal` CLI modes), but not with
 `interaction_covariate`, `paired_covariate_df` or `map_independent`.
 
@@ -190,7 +200,7 @@ perm_df = mapper.map_permutations(nperm=10_000, ancestry_model="dosage", min_anc
 1-df statistic of `y ~ G + L` on the same residualised design, which is the
 lead of `ancestry_model="main"`, instead of the joint F, and reports the
 dosage model's own joint test at that variant. `pval_nominal` is still
-`pval_joint`, and `pval_perm` / `pval_beta` still calibrate the joint F, but
+`pval_joint`, and `pval_perm` still calibrates the joint F, but
 the null they are compared with selects its lead the same way: in every
 permutation the pooled scan picks a variant and the joint F is read there, so
 the p-value is calibrated for the selection procedure (the maximum F over the
