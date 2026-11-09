@@ -123,6 +123,20 @@ two ancestries; 40,000 null phenotypes, the Beta fitted on half and scored on th
 - The misfit is real, small, and conservative in the lower tail. The benchmark ledger shows the same shape
   on 9,806 null leads: KS D .0179 (p .0036), .0455 / .0082 / .0009 below .05 / .01 / .001, median
   `beta_shape1` 0.78 against 1.05 for `main`.
+- The cost grows into the tail. Pooled over the benchmark's two null realisations (S0 and S12, 19,586
+  leads), `pval_beta` against `pval_perm` of the same scan:
+
+  | Model | below .05 | below .01 | below .001 |
+  |---|---|---|---|
+  | `dosage` | 864 / 982 | 132 / 197 | 9 / 20 |
+  | `interaction` | 892 / 955 | 151 / 184 | 7 / 17 |
+  | `main` | 968 / 1,012 | 162 / 193 | 21 / 24 |
+  | tensorQTL | 796 / 847 | 138 / 164 | 16 / 17 |
+
+  Every beta approximation rejects somewhat less often than its permutation p-value (tensorQTL's own about
+  16 % less at .01). The dosage scan loses a third at .01 and half at .001. The interaction scan, which
+  uses the `true_dof` path and was outside this review, loses as much at .001. This is a cost in power at
+  stringent thresholds and no risk to type-I error.
 - It is not a consequence of pooled-lead selection. The joint-lead null misfits as much.
 - The empirical p (the `pval_perm` construction) is calibrated. `pval_perm` is the reference.
 - An effective denominator degrees of freedom, the analogue of tensorQTL's `true_df`, brings `shape1` to 1
@@ -212,8 +226,12 @@ phenotypes are this extreme under a null that involves neither: 22 of 9,806 belo
 null. That count is the gate's row measured without permutation noise, not a second finding, and taken
 alone it is a rarer event than the ledger suggested (p .0005 as a single test, .006 times 12). A defect in
 the observed statistic or in the generator would not depend on the seed and would reappear on S12, which
-has 5 against 9.8. The evidence supports a fluctuation of the S0 realisation that tensorQTL shares, and
-it does not support a software defect. Pooled over both realisations the row is 24 of 19,586 (p .19).
+has 5 against 9.8. S0 was simulated on 2026-10-26 and S12 on 2026-11-09 after two changes to the
+simulator, so two S0 cells were simulated again with today's code (job 7806511): phenotypes and covariates
+are byte-identical to the stored cells. S12 is a replicate of the generator that produced S0.
+
+The evidence supports a fluctuation of the S0 realisation that tensorQTL shares, and it does not support a
+software defect. Pooled over both realisations the row is 24 of 19,586 (p .19).
 
 ## F. What changed, and what did not
 

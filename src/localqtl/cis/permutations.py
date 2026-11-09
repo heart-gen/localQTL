@@ -180,8 +180,10 @@ def _beta_fit_on_minp(minp_null: np.ndarray, p_obs: float) -> tuple[float, float
     reproduce this null exactly: the fitted ``shape1`` sits near 0.8 rather
     than 1, the body of the null distribution is slightly misfitted (KS distance
     about 0.012-0.018 on 10,000-20,000 null draws) and the lower tail is
-    conservative (about 0.042-0.046 below .05, 0.006-0.008 below .01).  Both
-    lead rules show it.  ``pval_perm`` is calibrated and is the reference;
+    conservative (about 0.042-0.046 below .05, 0.005-0.008 below .01).  The
+    cost grows into the tail: against ``pval_perm`` on the same null leads it
+    rejects about two thirds as often at .01 and about half as often at .001.
+    Both lead rules show it.  ``pval_perm`` is calibrated and is the reference;
     solving for an effective denominator dof that sets the moment ``shape1`` to
     1, as tensorQTL does for correlations, was tried and does not remove the
     misfit.

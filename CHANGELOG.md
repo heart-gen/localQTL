@@ -55,7 +55,10 @@ the GitHub release body from that section and stops if the tag has none.
   sits near 0.8 rather than 1 (median 0.78 against 1.05 for `ancestry_model="main"` on the
   localQTL benchmark's null), the body of the null distribution is slightly misfitted
   (Kolmogorov-Smirnov distance 0.012-0.018 on 10,000-20,000 null phenotypes) and the lower tail is
-  conservative (0.042-0.046 below .05, 0.006-0.008 below .01). It is not a consequence of
+  conservative (0.042-0.046 below .05, 0.005-0.008 below .01). The cost grows into the tail: on
+  the benchmark's 19,586 null leads `pval_beta` falls below .01 for 132 phenotypes against 197
+  for `pval_perm`, and below .001 for 9 against 20 (`ancestry_model="main"`: 162 against 193 and
+  21 against 24). It is not a consequence of
   `lead_selection="pooled"`: the joint-lead null misfits as much, on an exact Gaussian null drawn
   with the package's own kernels. `pval_perm` is calibrated and is the reference; q-values on
   `pval_beta` held the nominal FDR on the benchmark (realized .048 at .05). Solving for an

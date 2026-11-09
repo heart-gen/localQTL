@@ -269,7 +269,10 @@ ancestry effects differ.
    near 0.8 rather than 1, the body of the null distribution is slightly
    misfitted (Kolmogorov-Smirnov distance about 0.012-0.018) and the lower tail
    is conservative (about 0.042-0.046 of null phenotypes below .05 and
-   0.006-0.008 below .01).  Both lead rules show it.  ``pval_perm`` is
+   0.005-0.008 below .01).  The cost grows into the tail: against
+   ``pval_perm`` on the same null leads, ``pval_beta`` rejects about two
+   thirds as often at .01 and about half as often at .001.  Both lead rules
+   show it.  ``pval_perm`` is
    calibrated and is the reference; q-values computed on ``pval_beta`` err on
    the conservative side at the usual FDR levels, and
    ``calculate_qvalues(perm_df.drop(columns="pval_beta"))`` gives the
