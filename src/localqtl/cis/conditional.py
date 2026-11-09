@@ -21,6 +21,7 @@ from ..preproc import allele_stats, ancestry_allele_stats, impute_mean_and_filte
 from ..regression_kernels import Residualizer, run_batch_dosage_regression
 from ..utils import SimpleLogger
 from .common import ancestry_dosage_design, residualize_batch_dosage
+from .ld_aware import conditioning_columns, ld_aware_contrast, ld_columns
 from .nominal import _dosage_columns, _n_ancestries, dosage_result_arrays
 
 __all__ = ["map_conditional_dosage"]
@@ -65,6 +66,7 @@ def map_conditional_dosage(
         loci_df: pd.DataFrame | None = None,
         *,
         condition_on: str = "genotype",
+        credible_sets_df: pd.DataFrame | None = None,
         min_ancestry_ac: float = 0.0,
         device: str = "cuda",
         tensorqtl_flavor: bool = False,
@@ -101,6 +103,18 @@ def map_conditional_dosage(
         dosages instead, so an ancestry-differential secondary signal cannot
         leak into the variant being tested; it costs K degrees of freedom per
         conditioned signal.  ``"none"`` fits every signal marginally.
+    credible_sets_df : DataFrame, optional
+        The phenotype's fine-mapped credible sets (``phenotype_id``,
+        ``variant_id``; the summary of :func:`localqtl.susie.map`).  Adds the
+        LD-aware contrast of :mod:`localqtl.cis.ld_aware` next to the
+        standard columns: every signal is refitted conditional on the other
+        signals *and* on the credible-set variants of its phenotype, entered
+        as ``condition_on`` says (``"none"`` is rejected), with the block
+        orthogonalised against the signal's own pooled genotype and reduced
+        to its rank.  The ``*_ld`` columns, ``n_conditioned_ld`` (other
+        signals plus credible-set variants) and ``n_conditioned_cs``
+        (credible-set variants alone) are appended; the standard columns are
+        unchanged.
     min_ancestry_ac : float, default 0
         Ancestries whose in-sample minor-allele count is below this value get
         NaN effect estimates and pairwise differences (the joint test and the
@@ -134,6 +148,20 @@ def map_conditional_dosage(
     sets = _signal_sets(signals_df, phenotype_df, genotype_df)
     if not sets:
         raise ValueError("signals_df is empty.")
+    cs_sets: dict[str, list[str]] = {}
+    if credible_sets_df is not None:
+        if condition_on == "none":
+            raise ValueError("credible_sets_df needs condition_on='genotype' or 'dosage'.")
+        for col in ("phenotype_id", "variant_id"):
+            if col not in credible_sets_df.columns:
+                raise ValueError(f"credible_sets_df must contain '{col}'.")
+        unknown_cs = set(credible_sets_df["variant_id"].astype(str)) - set(genotype_df.index.astype(str))
+        if unknown_cs:
+            raise ValueError(f"{len(unknown_cs)} credible-set variants are not in genotype_df "
+                             f"(first: {sorted(unknown_cs)[:5]})")
+        for pid, sub in credible_sets_df.groupby("phenotype_id", sort=False):
+            if str(pid) in sets:
+                cs_sets[str(pid)] = list(dict.fromkeys(sub["variant_id"].astype(str)))
     ranks = {}
     if "rank" in signals_df.columns:
         ranks = {(str(r.phenotype_id), str(r.variant_id)): r.rank
@@ -143,7 +171,8 @@ def map_conditional_dosage(
     # sub-frames have to be grouped by chromosome and ascending in position.
     # Ordering them by variant ID instead silently drops the signals of any
     # phenotype whose IDs do not happen to sort the way its positions do.
-    vsub = variant_df.loc[sorted({v for vs in sets.values() for v in vs})]
+    vsub = variant_df.loc[sorted({v for vs in sets.values() for v in vs}
+                                 | {v for vs in cs_sets.values() for v in vs})]
     order = np.lexsort((vsub["pos"].to_numpy(dtype=np.int64),
                         vsub["chrom"].astype(str).to_numpy()))
     needed = list(vsub.index[order])
@@ -154,6 +183,7 @@ def map_conditional_dosage(
     # makes the generator serve the closed interval [start, end].
     rows_pos = {}
     for pid, vs in sets.items():
+        vs = list(dict.fromkeys(list(vs) + cs_sets.get(pid, [])))
         pos = vsub.loc[vs, "pos"].to_numpy(dtype=np.int64)
         chroms = set(vsub.loc[vs, "chrom"].astype(str))
         if len(chroms) > 1:
@@ -181,6 +211,9 @@ def map_conditional_dosage(
     logger.write(f"localQTL: conditional ancestry-specific effects at {len(needed)} variants "
                  f"across {len(sets)} phenotypes")
     logger.write(f"  * conditioning on other signals: {condition_on}")
+    if credible_sets_df is not None:
+        logger.write(f"  * LD-aware contrast: conditioning on the credible-set variants of "
+                     f"{sum(1 for p in sets if cs_sets.get(p))} phenotypes ({condition_on})")
     if min_ancestry_ac and min_ancestry_ac > 0:
         logger.write(f"  * masking ancestry effects with in-sample minor-allele count < {min_ancestry_ac:g}")
 
@@ -227,10 +260,20 @@ def map_conditional_dosage(
                          f"signal(s): {dropped[:5]}")
         if not wanted:
             continue
+        cs_here = [v for v in cs_sets.get(str(pid), []) if v in where]
 
         af_t, ma_samples_t, ma_count_t = allele_stats(G_t, ploidy=2)
         start_pos = real_start[str(pid)]
         end_pos = real_end[str(pid)]
+        G_base = None
+        if credible_sets_df is not None:
+            # the LD-aware refit starts from the covariate residual of the whole block
+            if base_rez is None:
+                base_rez = Residualizer(base_design, tensorqtl_flavor=tensorqtl_flavor)
+            if base_rez.rank > 0:
+                (G_base,) = base_rez.transform(G_t, center=True)
+            else:
+                G_base = G_t - G_t.mean(1, keepdim=True)
 
         for vid in wanted:
             t = where[vid]
@@ -280,6 +323,17 @@ def map_conditional_dosage(
                 rec["rank"] = ranks.get((str(pid), vid), np.nan)
             for col in _dosage_columns(K):
                 rec[col] = float(np.asarray(vals[col]).reshape(-1)[0])
+            if credible_sets_df is not None:
+                # other signals and the credible-set variants, each once, entered as condition_on says
+                cond_ids = list(dict.fromkeys([o for o in wanted if o != vid] + [c for c in cs_here if c != vid]))
+                n_cs = sum(1 for c in cs_here if c != vid)
+                y_b, D_b, L_b = residualize_batch_dosage(y_t, G_one, H_one, base_rez, center=True, group=False)
+                X_cond = conditioning_columns(G_t, H_t, base_rez, [where[c] for c in cond_ids],
+                                              condition_on=condition_on, G_resid=G_base)
+                ld = ld_aware_contrast(y_b, D_b, L_b, G_base[t], X_cond, k_eff=base_rez.k_eff,
+                                       anc_stats=anc_stats, min_ancestry_ac=min_ancestry_ac, device=device)
+                rec.update(ld)
+                rec["n_conditioned_cs"] = int(n_cs)
             records.append(rec)
 
     if not records:
@@ -290,6 +344,8 @@ def map_conditional_dosage(
                  "ma_count", "slope", "slope_se", "tstat", "pval_nominal", "dof"]
         if n_anc_out:
             cols += _dosage_columns(int(n_anc_out))
+            if credible_sets_df is not None:
+                cols += ld_columns(int(n_anc_out), with_cs=False) + ["n_conditioned_cs"]
         return pd.DataFrame(columns=cols)
 
     out = pd.DataFrame.from_records(records)

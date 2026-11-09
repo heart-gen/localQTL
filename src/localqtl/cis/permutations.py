@@ -20,6 +20,9 @@ from ..regression_kernels import (
     prep_ctx_for_dosage_perm,
     dosage_fstat,
     dosage_perm_chunk_fmax,
+    dosage_perm_chunk_f_at,
+    prep_ctx_for_perm,
+    perm_chunk_r2_argmax,
 )
 from ._permute import PermutationStream, compute_perm_r2_max, freedman_lane, perm_source, projectors_of
 from ._buffer import (
@@ -39,6 +42,7 @@ from .common import (
     prepare_interaction_covariate,
 )
 from .nominal import _dosage_columns, _n_ancestries, dosage_result_arrays
+from .ld_aware import ld_columns, lead_ld_contrast, resolve_ld_options
 
 __all__ = [
     "map_permutations",
@@ -56,11 +60,78 @@ def _interaction_columns(n_ancestries: int) -> list[str]:
         ])
     return cols
 
+LD_INT_COLUMNS = frozenset({"n_conditioned_ld", "rank_ld", "dof_ld", "n_cs_ld", "cs_size_ld"})
+
+
 def _nanmax(x: torch.Tensor, dim: int):
     if hasattr(torch, "nanmax"):
         return torch.nanmax(x, dim=dim)
     replace = torch.full_like(x, float("-inf"))
     return torch.max(torch.where(torch.isnan(x), replace, x), dim=dim)
+
+
+LEAD_SELECTIONS = ("joint", "pooled")
+#: The pooled 1-df statistics of the lead that a pooled-lead dosage scan reports next to its own joint test.
+POOLED_LEAD_COLUMNS = ["slope_pooled", "slope_se_pooled", "tstat_pooled", "pval_nominal_pooled", "r2_pooled"]
+
+
+def _pooled_lead_observed(y_resid: torch.Tensor, G_resid: torch.Tensor, L_resid: torch.Tensor | None,
+                          k_eff: int, mixed_precision: str | None):
+    """
+    The pooled 1-df scan of one phenotype on the dosage model's own residualised
+    design: ``G = sum_k D_k`` with the local-ancestry columns ``L`` as covariates,
+    which is the design of ``ancestry_model="main"``, so the lead it picks is the
+    main model's lead.  Returns the ctx the null reuses
+    (:func:`localqtl.regression_kernels.prep_ctx_for_perm`), the per-variant
+    partial R^2 (NaN as ``-1``, so it never wins) and the nominal slope / se / t of
+    the pooled effect.
+    """
+    if L_resid is None or L_resid.shape[2] == 0:
+        raise ValueError("lead_selection='pooled' needs the local-ancestry columns of the dosage design.")
+    ctx_p, b, s, tt = prep_ctx_for_perm(y_resid, G_resid, L_resid, k_eff, mixed_precision=mixed_precision)
+    t2 = tt[:, 0].double().pow(2)
+    r2 = torch.nan_to_num((t2 / (t2 + float(ctx_p["dof"]))).to(torch.float32), nan=-1.0)
+    return ctx_p, r2, b[:, 0], s[:, 0], tt[:, 0]
+
+
+def _pooled_lead_values(ix: int, r2: torch.Tensor, b: torch.Tensor, s: torch.Tensor, tt: torch.Tensor,
+                        dof: int) -> dict[str, float]:
+    """The :data:`POOLED_LEAD_COLUMNS` of the lead ``ix``: what selected it, never the row's own test."""
+    tval = float(tt[ix].item())
+    return {"slope_pooled": float(b[ix].item()), "slope_se_pooled": float(s[ix].item()), "tstat_pooled": tval,
+            "pval_nominal_pooled": float(get_t_pval(tval, int(dof))), "r2_pooled": float(r2[ix].item())}
+
+
+def _pooled_lead_null(ctx_d: dict, ctx_p: dict, L_resid: torch.Tensor, G_resid: torch.Tensor,
+                      y_resid: torch.Tensor, y_src: torch.Tensor | None, stream: PermutationStream, nperm: int,
+                      n_samples: int, projectors, mixed_precision: str | None) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    The selection-aware null of the pooled-lead dosage scan (``lead_selection="pooled"``).
+
+    For every permuted phenotype the pooled 1-df scan picks its lead (the variant
+    with the largest partial R^2 of ``y ~ G + L``,
+    :func:`localqtl.regression_kernels.perm_chunk_r2_argmax`) and the joint F of the
+    dosage model is read at that variant
+    (:func:`localqtl.regression_kernels.dosage_perm_chunk_f_at`), which is what the
+    observed scan does.  Comparing the observed joint F to this null keeps the joint
+    test as the test and calibrates its p-value for the selection; the maximum F
+    over the window (the joint-lead null) would be conservative at a lead the joint
+    F did not pick, and the pooled model's own p-value is never substituted for the
+    dosage model's.  Returns ``(r2_sel, f_sel)``, ``(nperm,)`` each: the pooled
+    maximum R^2 of each permutation and the joint F at its variant.
+    """
+    r2_parts, f_parts = [], []
+    for sel in stream.iter_chunks(nperm):
+        flat = sel.reshape(-1)
+        y_perm = (y_resid if y_src is None else y_src).index_select(0, flat).view(sel.shape[0], n_samples).transpose(0, 1)
+        y_perm = freedman_lane(y_perm, projectors)
+        r2_max, ix = perm_chunk_r2_argmax(ctx_p, L_resid, G_resid, y_perm, mixed_precision=mixed_precision)
+        r2_parts.append(r2_max)
+        f_parts.append(dosage_perm_chunk_f_at(ctx_d, y_perm, ix))
+    if not r2_parts:
+        empty = torch.empty((0,), device=y_resid.device, dtype=torch.float32)
+        return empty, empty
+    return torch.cat(r2_parts), torch.cat(f_parts)
 
 def _dosage_lead_row(y_resid, D_resid, L_resid, G_t, H_t, ix: int, k_eff: int,
                      min_ancestry_ac: float, device: str):
@@ -97,9 +168,25 @@ def _dosage_lead_row(y_resid, D_resid, L_resid, G_t, H_t, ix: int, k_eff: int,
 
 def _beta_fit_on_minp(minp_null: np.ndarray, p_obs: float) -> tuple[float, float, float]:
     """
-    Beta approximation of the per-phenotype minimum p-value (FastQTL's
-    argument applied directly to p-values, as the joint dosage test is an
-    F test rather than a correlation).  Returns ``(pval_beta, shape1, shape2)``.
+    Beta approximation of the per-phenotype null of the joint dosage test
+    (FastQTL's argument applied directly to p-values, as the test is an F test
+    rather than a correlation).  ``minp_null`` holds the joint-F p-value of each
+    permutation at the nominal ``(K, dof)``: the minimum over the window for
+    ``lead_selection="joint"``, the p-value at the permutation's pooled lead for
+    ``"pooled"``.  Returns ``(pval_beta, shape1, shape2)``.
+
+    Known limitation (review of 2026-11-09).  Unlike the correlation scans there
+    is no effective-degrees-of-freedom step, and a two-parameter Beta does not
+    reproduce this null exactly: the fitted ``shape1`` sits near 0.8 rather
+    than 1, the body of the null distribution is slightly misfitted (KS distance
+    about 0.012-0.018 on 10,000-20,000 null draws) and the lower tail is
+    conservative (about 0.042-0.046 below .05, 0.005-0.008 below .01).  The
+    cost grows into the tail: against ``pval_perm`` on the same null leads it
+    rejects about two thirds as often at .01 and about half as often at .001.
+    Both lead rules show it.  ``pval_perm`` is calibrated and is the reference;
+    solving for an effective denominator dof that sets the moment ``shape1`` to
+    1, as tensorQTL does for correlations, was tried and does not remove the
+    misfit.
     """
     from scipy import stats as _st
     a, b = _beta_mle_on_p(np.asarray(minp_null, dtype=np.float64))
@@ -140,6 +227,8 @@ def _run_permutation_core(
         paired_ctx: dict | None = None,
         min_ancestry_ac: float = 0.0,
         perm_source_ctx: tuple | None = None,
+        ld_aware: dict | None = None,
+        lead_selection: str = "joint",
 ) -> pd.DataFrame:
     """
     One top association per phenotype with empirical permutation p-value (no grouping).
@@ -164,6 +253,15 @@ def _run_permutation_core(
     if ancestry_model == "dosage" and n_ancestries is not None and n_ancestries > 0:
         dosage_columns = _dosage_columns(int(n_ancestries))
         expected_columns.extend(dosage_columns)
+    pooled_lead = str(lead_selection or "joint").lower() == "pooled"
+    pooled_cols: list[str] = []                   # the pooled statistics of the lead (lead_selection="pooled")
+    if pooled_lead and dosage_columns:
+        pooled_cols = list(POOLED_LEAD_COLUMNS)
+        expected_columns.extend(pooled_cols)
+    ld_cols: list[str] = []                       # the LD-aware contrast of the lead (ld_aware)
+    if ld_aware is not None and dosage_columns:
+        ld_cols = ld_columns(int(n_ancestries))
+        expected_columns.extend(ld_cols)
     dtype_map = {
         "phenotype_id": object,
         "variant_id": object,
@@ -185,8 +283,10 @@ def _run_permutation_core(
         "true_dof": np.float32,
         "pval_true_dof": np.float32,
     }
-    for col in interaction_columns + dosage_columns:
+    for col in interaction_columns + dosage_columns + pooled_cols:
         dtype_map[col] = np.float32
+    for col in ld_cols:
+        dtype_map[col] = np.int32 if col in LD_INT_COLUMNS else np.float32
     buffers = allocate_result_buffers(expected_columns, dtype_map, _estimate_rows(ig, chrom))
     cursor = 0
     processed = 0
@@ -285,15 +385,28 @@ def _run_permutation_core(
         k_eff = rez_b.k_eff if rez_b is not None else 1
 
         dosage_vals: dict[str, float] | None = None
+        pooled_vals: dict[str, float] | None = None
+        ld_vals: dict | None = None
         if dosage_mode:
             # Joint Wald F over the K ancestry effects is the per-variant
-            # statistic; the permutation statistic is its maximum over the
-            # window (equivalently the smallest joint p-value).
+            # statistic.  Joint lead (default): the permutation statistic is
+            # its maximum over the window (equivalently the smallest joint
+            # p-value).  Pooled lead: the lead is the variant the pooled 1-df
+            # scan picks and the permutation statistic is the joint F at the
+            # variant each permutation picks the same way, so the joint test
+            # stays the test and its p-value is calibrated for the selection.
             K = int(D_resid.shape[2])
             ctx = prep_ctx_for_dosage_perm(D_resid, L_resid, k_eff=k_eff)
             dof = int(ctx["dof"])
             f_obs = torch.nan_to_num(dosage_fstat(ctx, y_resid_t), nan=-1.0)
-            ix = int(f_obs.argmax().item())
+            if pooled_lead:
+                G_sum = D_resid.sum(dim=2)
+                ctx_p, r2_pooled, b_p, s_p, t_p = _pooled_lead_observed(
+                    y_resid_t, G_sum, L_resid, k_eff, mixed_precision)
+                ix = int(r2_pooled.argmax().item())
+                pooled_vals = _pooled_lead_values(ix, r2_pooled, b_p, s_p, t_p, int(ctx_p["dof"]))
+            else:
+                ix = int(f_obs.argmax().item())
             # Two estimates of the lead's F, deliberately: ``f_block`` shares
             # the estimator (and so the float32 error) of the permutation
             # null and is what the null is compared against, while the refit
@@ -303,6 +416,12 @@ def _run_permutation_core(
             dosage_vals, beta, se, tval, _ = _dosage_lead_row(
                 y_resid_t, D_resid, L_resid, G_t, H_t, ix, k_eff, min_ancestry_ac, device
             )
+            if ld_aware is not None:
+                ld_vals = lead_ld_contrast(
+                    y_resid_t, D_resid, L_resid, G_t, H_t, rez_b, ix, k_eff=k_eff,
+                    condition_on=ld_aware["condition_on"], susie=ld_aware["susie"],
+                    min_ancestry_ac=min_ancestry_ac, device=device,
+                )
             f_lead = float(dosage_vals["fstat_joint"])
             pval_nominal = float(dosage_vals["pval_joint"])
             r2_nominal = float(K * f_lead / (K * f_lead + dof)) if f_lead > 0 else 0.0
@@ -318,14 +437,19 @@ def _run_permutation_core(
                 seed=subseed(seed, pid) if seed is not None else None,
                 mode=perm_indices_mode,
             )
-            fmax_parts = []
-            for sel in stream.iter_chunks(nperm):
-                flat = sel.reshape(-1)
-                y_perm = (y_resid_t if y_src is None else y_src).index_select(0, flat).view(sel.shape[0], n_samples).transpose(0, 1)
-                y_perm = freedman_lane(y_perm, projectors_of(rez_b))
-                fmax_parts.append(dosage_perm_chunk_fmax(ctx, y_perm))
-            fmax_np = (torch.cat(fmax_parts).detach().cpu().numpy() if fmax_parts
-                       else np.empty(0, dtype=np.float64))
+            if pooled_lead:
+                _, f_sel = _pooled_lead_null(ctx, ctx_p, L_resid, G_sum, y_resid_t, y_src, stream, nperm,
+                                             n_samples, projectors_of(rez_b), mixed_precision)
+                fmax_np = f_sel.detach().cpu().numpy()
+            else:
+                fmax_parts = []
+                for sel in stream.iter_chunks(nperm):
+                    flat = sel.reshape(-1)
+                    y_perm = (y_resid_t if y_src is None else y_src).index_select(0, flat).view(sel.shape[0], n_samples).transpose(0, 1)
+                    y_perm = freedman_lane(y_perm, projectors_of(rez_b))
+                    fmax_parts.append(dosage_perm_chunk_fmax(ctx, y_perm))
+                fmax_np = (torch.cat(fmax_parts).detach().cpu().numpy() if fmax_parts
+                           else np.empty(0, dtype=np.float64))
             pval_perm = float((np.sum(fmax_np >= f_block) + 1) / (fmax_np.size + 1))
             if beta_approx and fmax_np.size:
                 minp_null = get_f_pval(fmax_np, K, dof)
@@ -579,6 +703,12 @@ def _run_permutation_core(
         if dosage_mode and dosage_vals is not None:
             for col in dosage_columns:
                 row[col] = dosage_vals.get(col, np.nan)
+        if pooled_cols and pooled_vals is not None:
+            for col in pooled_cols:
+                row[col] = pooled_vals.get(col, np.nan)
+        if ld_cols and ld_vals is not None:
+            for col in ld_cols:
+                row[col] = ld_vals.get(col, np.nan)
         write_row(buffers, cursor, row)
         cursor += 1
         processed += 1
@@ -606,6 +736,8 @@ def _run_permutation_core_group(
         interaction_covariate_t: torch.Tensor | None = None,
         min_ancestry_ac: float = 0.0,
         perm_source_ctx: tuple | None = None,
+        ld_aware: dict | None = None,
+        lead_selection: str = "joint",
 ) -> pd.DataFrame:
     """
     Group-aware permutation mapping: returns one top association per group with empirical p-values.
@@ -631,6 +763,15 @@ def _run_permutation_core_group(
     if ancestry_model == "dosage" and n_ancestries is not None and n_ancestries > 0:
         dosage_columns = _dosage_columns(int(n_ancestries))
         expected_columns.extend(dosage_columns)
+    pooled_lead = str(lead_selection or "joint").lower() == "pooled"
+    pooled_cols: list[str] = []                   # the pooled statistics of the lead (lead_selection="pooled")
+    if pooled_lead and dosage_columns:
+        pooled_cols = list(POOLED_LEAD_COLUMNS)
+        expected_columns.extend(pooled_cols)
+    ld_cols: list[str] = []                       # the LD-aware contrast of the lead (ld_aware)
+    if ld_aware is not None and dosage_columns:
+        ld_cols = ld_columns(int(n_ancestries))
+        expected_columns.extend(ld_cols)
     dtype_map = {
         "group_id": object,
         "group_size": np.int32,
@@ -654,8 +795,10 @@ def _run_permutation_core_group(
         "true_dof": np.float32,
         "pval_true_dof": np.float32,
     }
-    for col in interaction_columns + dosage_columns:
+    for col in interaction_columns + dosage_columns + pooled_cols:
         dtype_map[col] = np.float32
+    for col in ld_cols:
+        dtype_map[col] = np.int32 if col in LD_INT_COLUMNS else np.float32
     buffers = allocate_result_buffers(expected_columns, dtype_map,
                                       _estimate_rows(ig, chrom, grouped=True))
     cursor = 0
@@ -752,6 +895,8 @@ def _run_permutation_core_group(
         true_dof = float("nan")
         pval_nominal = float("nan")
         dosage_vals: dict[str, float] | None = None
+        pooled_vals: dict[str, float] | None = None
+        ld_vals: dict | None = None
         num_var = int(G_resid.shape[0])
 
         r2_perm_global = torch.full((nperm,), -float("inf"), device=G_resid.device, dtype=torch.float32)
@@ -776,15 +921,34 @@ def _run_permutation_core_group(
                                       auto_perm_chunk(int(D_resid.shape[0]), nperm,
                                                       pH=int(ctx["p"]))))
 
+            # Pooled lead: the group's lead is the (phenotype, variant) with
+            # the largest pooled R^2, as in the main model's grouped scan, and
+            # each permutation's null F is the joint F at the (phenotype,
+            # variant) its own pooled R^2 selects.
+            G_sum = D_resid.sum(dim=2) if pooled_lead else None
+            best_score = -float("inf")
+            r2_sel_global = f_sel_global = None
             for j, y_resid in enumerate(Y_resid):
                 y_src = _perm_source_row(perm_source_ctx, ids_list[j])
                 f_obs = torch.nan_to_num(dosage_fstat(ctx, y_resid), nan=-1.0)
-                f_max_t, ix_t = torch.max(f_obs, dim=0)
-                f_max = float(f_max_t.item())
-                if f_max > best_f_val:
-                    best_f_val = f_max
-                    best_ix_var = int(ix_t.item())
-                    best_ix_pheno = int(j)
+                if pooled_lead:
+                    ctx_p, r2_pooled, b_p, s_p, t_p = _pooled_lead_observed(
+                        y_resid, G_sum, L_resid, k_eff_g, mixed_precision)
+                    r2_max_t, ix_t = torch.max(r2_pooled, dim=0)
+                    score = float(r2_max_t.item())
+                    if score > best_score:
+                        best_score = score
+                        best_ix_var = int(ix_t.item())
+                        best_ix_pheno = int(j)
+                        best_f_val = float(f_obs[best_ix_var].item())
+                        pooled_vals = _pooled_lead_values(best_ix_var, r2_pooled, b_p, s_p, t_p, int(ctx_p["dof"]))
+                else:
+                    f_max_t, ix_t = torch.max(f_obs, dim=0)
+                    f_max = float(f_max_t.item())
+                    if f_max > best_f_val:
+                        best_f_val = f_max
+                        best_ix_var = int(ix_t.item())
+                        best_ix_pheno = int(j)
                 # Every phenotype of the group is permuted with the same seed,
                 # so the maximum across the group preserves the within-group
                 # correlation structure (as in the correlation-based path).
@@ -796,6 +960,16 @@ def _run_permutation_core_group(
                     seed=perm_seed_base,
                     mode=perm_indices_mode,
                 )
+                if pooled_lead:
+                    r2_sel, f_sel = _pooled_lead_null(ctx, ctx_p, L_resid, G_sum, y_resid, y_src, stream, nperm,
+                                                      n_samples_g, projectors_of(rez), mixed_precision)
+                    if r2_sel_global is None:
+                        r2_sel_global, f_sel_global = r2_sel, f_sel
+                    else:
+                        better = r2_sel > r2_sel_global
+                        r2_sel_global = torch.where(better, r2_sel, r2_sel_global)
+                        f_sel_global = torch.where(better, f_sel, f_sel_global)
+                    continue
                 fmax_parts = []
                 for sel in stream.iter_chunks(nperm):
                     flat = sel.reshape(-1)
@@ -807,6 +981,8 @@ def _run_permutation_core_group(
                     f_perm_pheno = torch.cat(fmax_parts)
                     f_perm_global = (f_perm_pheno if f_perm_global is None
                                      else torch.maximum(f_perm_global, f_perm_pheno))
+            if pooled_lead:
+                f_perm_global = f_sel_global
 
             if best_ix_var >= 0:
                 best_dof = dof
@@ -831,6 +1007,12 @@ def _run_permutation_core_group(
                     Y_resid[best_ix_pheno], D_resid, L_resid, G_t, H_t,
                     best_ix_var, k_eff_g, min_ancestry_ac, device,
                 )
+                if ld_aware is not None:
+                    ld_vals = lead_ld_contrast(
+                        Y_resid[best_ix_pheno], D_resid, L_resid, G_t, H_t, rez, best_ix_var, k_eff=k_eff_g,
+                        condition_on=ld_aware["condition_on"], susie=ld_aware["susie"],
+                        min_ancestry_ac=min_ancestry_ac, device=device,
+                    )
                 f_lead_g = float(dosage_vals["fstat_joint"])
                 pval_nominal = float(dosage_vals["pval_joint"])
                 best_r2_val = (float(K * f_lead_g / (K * f_lead_g + dof))
@@ -1054,6 +1236,12 @@ def _run_permutation_core_group(
         if dosage_mode and dosage_vals is not None:
             for col in dosage_columns:
                 row[col] = dosage_vals.get(col, np.nan)
+        if pooled_cols and pooled_vals is not None:
+            for col in pooled_cols:
+                row[col] = pooled_vals.get(col, np.nan)
+        if ld_cols and ld_vals is not None:
+            for col in ld_cols:
+                row[col] = ld_vals.get(col, np.nan)
         write_row(buffers, cursor, row)
         cursor += 1
         processed += 1
@@ -1084,6 +1272,9 @@ def map_permutations(
         interaction_covariate: Optional[object] = None,
         paired_covariate_df: Optional[pd.DataFrame] = None,
         min_ancestry_ac: float = 0.0,
+        ld_aware: bool = False,
+        ld_aware_opts: dict | None = None,
+        lead_selection: str = "joint",
 ) -> pd.DataFrame:
     """
     Empirical cis-QTL mapping (one top variant per phenotype) with permutations.
@@ -1112,11 +1303,51 @@ def map_permutations(
         this value get NaN effect estimates and pairwise differences in the
         reported lead row (the joint test and the variant ranking are
         unchanged).
+    ld_aware : bool, default False
+        Dosage model: also report the LD-aware contrast of the lead
+        (:mod:`localqtl.cis.ld_aware`): SuSiE on the pooled genotypes of the
+        window gives the phenotype's credible sets, and the lead's
+        ancestry-specific dosages are refitted conditional on the other
+        credible-set variants, so a shared causal effect tagged with
+        ancestry-specific LD cannot show up as heterogeneity at the lead.
+        Adds the ``*_ld`` columns (``pval_diff_ld_anc{i}_anc{j}``,
+        ``n_conditioned_ld``, ``cs_size_ld``, ``pip_ld``, ...).
+    ld_aware_opts : dict, optional
+        ``condition_on`` (``"genotype"``, default, or ``"dosage"``) and the
+        SuSiE settings ``L``, ``coverage``, ``min_abs_corr``, ``max_iter``,
+        ``tol``, ``scaled_prior_variance``.
+    lead_selection : {"joint", "pooled"}, default "joint"
+        Dosage model: which statistic picks each phenotype's lead.  ``"joint"``
+        is the scan described above (the lead maximises the joint F).
+        ``"pooled"`` picks the lead with the pooled 1-df statistic of
+        ``y ~ G + L`` on the same residualised design, i.e. the lead of
+        ``ancestry_model="main"``, and reports the dosage model's own joint
+        test at that variant: ``pval_nominal`` is still ``pval_joint`` and
+        ``pval_perm`` / ``pval_beta`` still calibrate the joint F, but against
+        a null in which every permutation selects its lead by the pooled
+        statistic too (the joint F at the permutation's pooled lead), so the
+        p-value is calibrated for the selection procedure.  The pooled
+        model's own p-value is never substituted for the dosage model's; it
+        is reported as information in ``pval_nominal_pooled`` with
+        ``slope_pooled``, ``slope_se_pooled``, ``tstat_pooled`` and
+        ``r2_pooled``.  With ``ld_aware`` the LD-aware contrast is evaluated
+        at the pooled lead; with ``group_s`` the group's lead is the
+        (phenotype, variant) with the largest pooled R^2.
     """
     device = device if device in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
     torch_device = torch.device(device)
     logger = logger or SimpleLogger(verbose=verbose, timestamps=True)
     sync = (torch.cuda.synchronize if device == "cuda" else None)
+    ld_opts = None
+    if ld_aware:
+        if ancestry_model != "dosage" or haplotypes is None:
+            raise ValueError("ld_aware needs ancestry_model='dosage' with haplotypes.")
+        ld_opts = resolve_ld_options(ld_aware_opts)
+    lead_selection = str(lead_selection or "joint").lower()
+    if lead_selection not in LEAD_SELECTIONS:
+        raise ValueError(f"lead_selection must be one of {LEAD_SELECTIONS}, got {lead_selection!r}.")
+    if lead_selection == "pooled" and (ancestry_model != "dosage" or haplotypes is None):
+        raise ValueError("lead_selection='pooled' needs ancestry_model='dosage' with haplotypes.")
 
     # Header (tensorQTL-style)
     logger.write("cis-QTL mapping: permutation scan (top per phenotype)")
@@ -1142,6 +1373,9 @@ def map_permutations(
     elif ancestry_model == "dosage":
         logger.write("  * ancestry model: ancestry-specific dosage "
                      "(permutations calibrate the joint F over ancestries)")
+        if lead_selection == "pooled":
+            logger.write("  * lead selection: pooled 1-df statistic (the main model's lead); the joint F is "
+                         "tested at it against a null that selects the same way (selection-aware)")
         if min_ancestry_ac and min_ancestry_ac > 0:
             logger.write(f"  * masking ancestry effects with in-sample minor-allele count < {min_ancestry_ac:g}")
     if interaction_covariate is not None:
@@ -1161,6 +1395,10 @@ def map_permutations(
         raise ValueError("ancestry_model='dosage' cannot be combined with paired_covariate_df.")
     if min_ancestry_ac and min_ancestry_ac > 0 and ancestry_model != "dosage":
         raise ValueError("min_ancestry_ac is only meaningful with ancestry_model='dosage'.")
+    if ld_opts is not None:
+        logger.write(f"  * LD-aware contrast of the lead: conditioning on its credible sets "
+                     f"({ld_opts['condition_on']}; SuSiE L={ld_opts['susie']['L']}, "
+                     f"coverage={ld_opts['susie']['coverage']}, min_abs_corr={ld_opts['susie']['min_abs_corr']})")
 
     covariates_use = covariates_df
     if isinstance(interaction_covariate, str) and covariates_df is not None:
@@ -1239,6 +1477,8 @@ def map_permutations(
                         interaction_covariate_t=interaction_cov_t,
                         min_ancestry_ac=min_ancestry_ac,
                         perm_source_ctx=perm_source_ctx,
+                        ld_aware=ld_opts,
+                        lead_selection=lead_selection,
                     )
                 else:
                     chrom_df = core(
@@ -1255,6 +1495,8 @@ def map_permutations(
                         paired_ctx=paired_ctx,
                         min_ancestry_ac=min_ancestry_ac,
                         perm_source_ctx=perm_source_ctx,
+                        ld_aware=ld_opts,
+                        lead_selection=lead_selection,
                     )
             results.append(chrom_df)
             if logger.verbose:

@@ -233,6 +233,54 @@ of freedom and ``pval_true_dof`` is ``NaN``.  ``interaction_covariate`` and
                               covariates_df, haplotypes=panel, ancestry_model="dosage",
                               nperm=10_000, min_ancestry_ac=10, seed=1)
 
+``lead_selection="pooled"`` (0.4.4) picks each phenotype's lead with the pooled
+1-df statistic of ``y ~ G + L`` on the same residualised design -- the lead of
+``ancestry_model="main"`` -- instead of the joint F, and reports the dosage
+model's own joint test at that variant.  ``pval_nominal`` is still
+``pval_joint`` and ``pval_perm`` / ``pval_beta`` still calibrate the joint F,
+but the null they are compared with selects its lead the same way: in every
+permutation the pooled scan picks a variant and the joint F is read there, so
+the p-value is calibrated for the selection procedure.  The maximum F over the
+window (the joint-lead null) would be conservative at a variant the joint F did
+not pick, and the pooled model's own p-value is never substituted for the
+dosage model's; it is reported as information in ``pval_nominal_pooled``, with
+``slope_pooled``, ``slope_se_pooled``, ``tstat_pooled`` and ``r2_pooled``.
+``ld_aware`` evaluates the LD-aware contrast at the pooled lead, and with
+``group_s`` the group's lead is the (phenotype, variant) with the largest
+pooled R^2.  The pooled lead is the variant the ancestry contrast is usually
+wanted at: on the localQTL benchmark's shared-effect design the contrast at the
+joint lead was anti-conservative (42 % below .05) while at the pooled lead it
+was calibrated (4.3 %), because the joint F prefers variants whose marginal
+ancestry effects differ.
+
+.. code-block:: python
+
+   perm_df = map_permutations(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
+                              covariates_df, haplotypes=panel, ancestry_model="dosage",
+                              lead_selection="pooled", ld_aware=True, nperm=10_000, seed=1)
+
+.. note::
+
+   **Beta approximation of the dosage scan (known limitation).**  ``pval_beta``
+   of the dosage scan is a two-parameter Beta fitted by maximum likelihood to
+   the null joint-F p-values at the nominal ``(K, dof)``; there is no
+   effective-degrees-of-freedom step as in the correlation scans.  The Beta
+   family does not reproduce this null exactly: the fitted ``beta_shape1`` sits
+   near 0.8 rather than 1, the body of the null distribution is slightly
+   misfitted (Kolmogorov-Smirnov distance about 0.012-0.018) and the lower tail
+   is conservative (about 0.042-0.046 of null phenotypes below .05 and
+   0.005-0.008 below .01).  The cost grows into the tail: against
+   ``pval_perm`` on the same null leads, ``pval_beta`` rejects about two
+   thirds as often at .01 and about half as often at .001.  Both lead rules
+   show it.  ``pval_perm`` is
+   calibrated and is the reference; q-values computed on ``pval_beta`` err on
+   the conservative side at the usual FDR levels, and
+   ``calculate_qvalues(perm_df.drop(columns="pval_beta"))`` gives the
+   ``pval_perm``-based q-values as a sensitivity analysis when ``nperm`` is
+   large enough to resolve the discovery threshold.  Solving for an effective
+   denominator dof, the analogue of ``true_dof``, does not remove the misfit;
+   a replacement null fit is planned for a later version.
+
 With ``group_s`` the maximum runs over the phenotypes of a group as well as
 over the window, giving one calibrated row per group -- the layout wanted for
 isoform or splicing-event phenotypes grouped by gene.  This is valid because
@@ -334,7 +382,7 @@ Command line
 ``<prefix>.cis_qtl_top_assoc.txt.gz``, ``<prefix>.cis_independent_qtl.txt.gz``,
 ``<prefix>.trans_qtl_pairs.parquet`` ...).  Local ancestry is enabled with
 ``--haplotypes`` (RFMix / FLARE output or an rfmix_reader cache),
-``--ancestry_model`` and ``--min_ancestry_ac``; ``--device``,
+``--ancestry_model``, ``--min_ancestry_ac`` and ``--lead_selection``; ``--device``,
 ``--perm_chunk`` and ``--localqtl_names`` are the other localQTL additions.
 The extra mode ``cis_conditional`` re-fits already-selected signals with the
 ancestry-specific dosage model (``--condition_on``, writing

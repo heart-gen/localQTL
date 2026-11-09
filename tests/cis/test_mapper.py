@@ -103,3 +103,21 @@ def test_cis_mapper_calculates_qvalues(monkeypatch, toy_data):
     assert called["fdr"] == 0.1
     assert called["qvalue_lambda"] == 0.4
     assert called["logger"] is mapper.logger
+
+
+def test_cis_mapper_forwards_the_dosage_scan_options(monkeypatch, toy_data):
+    """``ld_aware``, ``ld_aware_opts`` and ``lead_selection`` reach ``map_permutations`` through the mapper."""
+    mapper = _build_mapper(toy_data)
+    called = {}
+
+    def fake_perm(**kwargs):
+        called.update(kwargs)
+        return pd.DataFrame({"phenotype_id": ["geneA"]})
+
+    monkeypatch.setattr("src.localqtl.cis.mapper._map_permutations", fake_perm)
+    mapper.map_permutations(nperm=5, ancestry_model="dosage", ld_aware=True, ld_aware_opts={"L": 2},
+                            lead_selection="pooled")
+    assert called["ancestry_model"] == "dosage" and called["ld_aware"] is True
+    assert called["ld_aware_opts"] == {"L": 2} and called["lead_selection"] == "pooled"
+    mapper.map_permutations(nperm=5)
+    assert called["ld_aware"] is False and called["lead_selection"] == "joint"

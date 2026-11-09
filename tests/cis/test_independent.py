@@ -208,3 +208,31 @@ def test_map_independent_paired_covariate_validation():
                         group_s=pd.Series({"geneA": "grp"}), **base)
     with pytest.raises(ValueError, match="samples"):
         map_independent(paired_covariate_df=d["paired"].iloc[:, :5], **base)
+
+
+@pytest.mark.parametrize("with_panel", [False, True])
+def test_independent_signals_report_a_consistent_standard_error_for_either_sign(with_panel):
+    """Two independent signals of opposite sign: every reported row has ``slope / slope_se == tstat``
+    (the negative signal used to carry ``|slope| * 1e8`` as its standard error)."""
+    from tests.conftest import make_random_panel
+    rng = np.random.default_rng(21)
+    n, m = 200, 10
+    samples = [f"S{i}" for i in range(n)]
+    G = rng.integers(0, 3, size=(m, n)).astype(np.float32)
+    gdf = pd.DataFrame(G, index=[f"v{i}" for i in range(m)], columns=samples)
+    vdf = pd.DataFrame({"chrom": "chr1", "pos": 100 + 10 * np.arange(m)}, index=gdf.index)
+    y = (1.2 * G[3] - 0.9 * G[7] + rng.normal(size=n)).astype(np.float32)
+    pdf = pd.DataFrame([y, rng.normal(size=n).astype(np.float32)], index=["geneB", "geneN"], columns=samples)
+    pos = pd.DataFrame({"chr": "chr1", "start": 140, "end": 140}, index=pdf.index)
+    cov = pd.DataFrame(rng.normal(size=(n, 2)), index=samples, columns=["c1", "c2"])
+    kw = dict(device="cpu", window=1000, logger=SimpleLogger(verbose=False), nperm=300, seed=1)
+    if with_panel:
+        panel, _ = make_random_panel(vdf, samples, seed=22)
+        kw.update(haplotypes=panel, ancestry_model="main")
+    cis = map_permutations(gdf, vdf, pdf, pos, cov, **kw)
+    cis["qval"] = [0.001, 0.04]                                   # both phenotypes enter; the threshold is the null one's
+    ind = map_independent(gdf, vdf, cis, pdf, pos, cov, **kw)
+    b = ind[ind["phenotype_id"] == "geneB"].set_index("variant_id")
+    assert b.loc["v3", "slope"] > 0 > b.loc["v7", "slope"]
+    assert ((ind["slope_se"] > 0) & (ind["slope_se"] < 1)).all()
+    np.testing.assert_allclose(ind["slope"] / ind["slope_se"], ind["tstat"], rtol=1e-4)

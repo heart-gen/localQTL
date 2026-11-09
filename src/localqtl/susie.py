@@ -244,7 +244,12 @@ def _get_purity(pos, X, Xcorr, squared=False, n=100):
     if len(pos) == 1:
         return np.ones(3)
     if len(pos) > n:
-        pos = np.random.choice(pos, n, replace=False)
+        # the member indices are a tensor on the compute device: draw the subsample on the host
+        # (the random stream is unchanged) and index on the device
+        idx = pos.detach().cpu().numpy() if torch.is_tensor(pos) else np.asarray(pos)
+        chosen = np.random.choice(idx, n, replace=False)
+        device = pos.device if torch.is_tensor(pos) else (X.device if X is not None else Xcorr.device)
+        pos = torch.as_tensor(chosen, dtype=torch.long, device=device)
     if Xcorr is None:
         X_sub = X[:, pos]
         value = _corrcoef(X_sub.T).abs()
@@ -373,7 +378,7 @@ def susie_get_cs(res, X=None, Xcorr=None, coverage=0.95, min_abs_corr=0.5,
         purity.index = rownames
         ordering = purity.values[:, 0].argsort()[::-1]
         return {
-            'cs': {rownames[i]: cs[i].numpy() for i in ordering},
+            'cs': {rownames[i]: cs[i].detach().cpu().numpy() for i in ordering},
             'purity': purity.iloc[ordering],
             'cs_index': include_idx[is_pure[ordering]].cpu().numpy(),
             'coverage': coverage,

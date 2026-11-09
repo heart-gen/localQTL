@@ -186,6 +186,30 @@ p-values directly; `true_dof` is therefore the residual degrees of freedom and
 perm_df = mapper.map_permutations(nperm=10_000, ancestry_model="dosage", min_ancestry_ac=10)
 ```
 
+`lead_selection="pooled"` (0.4.4) picks each phenotype's lead with the pooled
+1-df statistic of `y ~ G + L` on the same residualised design, which is the
+lead of `ancestry_model="main"`, instead of the joint F, and reports the
+dosage model's own joint test at that variant. `pval_nominal` is still
+`pval_joint`, and `pval_perm` / `pval_beta` still calibrate the joint F, but
+the null they are compared with selects its lead the same way: in every
+permutation the pooled scan picks a variant and the joint F is read there, so
+the p-value is calibrated for the selection procedure (the maximum F over the
+window, the joint-lead null, would be conservative at a variant the joint F
+did not pick). The pooled model's own p-value is never substituted for the
+dosage model's; it is reported as information in `pval_nominal_pooled`, with
+`slope_pooled`, `slope_se_pooled`, `tstat_pooled` and `r2_pooled`. `ld_aware`
+evaluates the LD-aware contrast at the pooled lead, and with `group_s` the
+group's lead is the (phenotype, variant) with the largest pooled R². The pooled
+lead is where the ancestry contrast is usually wanted: on the localQTL
+benchmark's shared-effect design the contrast at the joint lead was
+anti-conservative (42 % below .05) and at the pooled lead calibrated (4.3 %),
+because the joint F prefers variants whose marginal ancestry effects differ.
+
+```python
+perm_df = mapper.map_permutations(nperm=10_000, ancestry_model="dosage", lead_selection="pooled",
+                                  ld_aware=True)
+```
+
 With `group_s` the maximum is taken over the phenotypes of a group as well as
 over the window, which gives one calibrated row per group — the natural layout
 for isoform- or splicing-event phenotypes grouped by gene. This is valid
@@ -246,6 +270,68 @@ mode reads only the listed variants and fits one signal at a time, it rejects
 
 `start_distance` and `end_distance` are measured from the phenotype's own
 start and end, as in the other cis outputs, so the two can be joined directly.
+
+### LD-aware ancestry contrast
+
+`pval_diff_anc{i}_anc{j}` compares the *marginal* ancestry-specific effects
+of one variant. At a variant that tags the causal variant rather than being
+it, the marginal effects differ whenever the LD between the two differs
+between ancestries, even when the causal effect is identical in every
+ancestry: on the localQTL benchmark's shared-effect design, 42 % of the joint
+leads of a permutation scan had `pval_diff` below 0.05 against 5.3 % at the
+causal variant. A marginal contrast at a selected lead is therefore
+descriptive; it is not evidence that the regulatory effect differs by
+ancestry.
+
+`map_permutations(ancestry_model="dosage", ld_aware=True)` adds the LD-aware
+contrast of each lead: SuSiE is fitted to the pooled genotypes of the window
+(`localqtl.susie`; `L`, `coverage`, `min_abs_corr`, `max_iter`, `tol` and
+`scaled_prior_variance` through `ld_aware_opts`), and the lead's
+ancestry-specific dosages are conditioned on the other members of the
+phenotype's credible sets, as their pooled genotypes
+(`condition_on="genotype"`, the default) or their ancestry-specific dosages
+(`"dosage"`, stricter). A shared causal effect carried by any typed
+credible-set variant is then explained by that variant's own column and
+cannot leak into the lead's contrast, while an ancestry difference of the
+causal effect still reaches the lead through the ancestry-specific LD that
+the pooled column does not carry. When the causal variant is not typed,
+nothing carries the effect and the LD-aware contrast equals the marginal one
+(`n_conditioned_ld == 0`).
+
+```python
+perm_df = mapper.map_permutations(nperm=10_000, ancestry_model="dosage", ld_aware=True,
+                                  ld_aware_opts={"condition_on": "genotype", "L": 10})
+```
+
+The columns are written next to the marginal ones: `slope_ld_anc{k}`,
+`slope_se_ld_anc{k}`, `tstat_ld_anc{k}`, `pval_ld_anc{k}`, `fstat_joint_ld`,
+`pval_joint_ld`, `z_diff_ld_anc{i}_anc{j}`, `pval_diff_ld_anc{i}_anc{j}`,
+`n_conditioned_ld` (conditioning variants), `rank_ld` (rank of the
+conditioning block once it is orthogonalised against the lead's own genotype,
+so a perfect-LD copy of the lead costs nothing), `dof_ld`, `n_cs_ld`
+(credible sets of the phenotype), `cs_size_ld` (size of the set holding the
+lead, 0 when none does) and `pip_ld`. The contrast, its standard error and
+`dof_ld` are those of the full conditional regression; the per-ancestry
+`slope_ld_anc{k}` are the lead's pooled effect split by that contrast, so
+read the contrast rather than the individual slopes as the LD-aware quantity.
+When the conditioning block leaves no residual degrees of freedom (a credible
+set as large as the sample allows), nothing can be tested: the `*_ld`
+statistics are NaN and `dof_ld` is 0.
+The marginal columns, `pval_perm` and `pval_beta` are unchanged: the LD-aware
+pass runs after the lead is chosen and does not enter the permutation
+statistic.
+
+`map_conditional_dosage(..., credible_sets_df=summary_df)` adds the same
+columns at known signals, conditioning on the other signals of the phenotype
+*and* on the credible-set variants (a table with `phenotype_id` and
+`variant_id`: the summary of `localqtl.susie.map`, or the `cis_susie`
+output), each once; `n_conditioned_cs` counts the credible-set variants and
+`condition_on="none"` is rejected with credible sets.
+
+On the command line, `--ld_aware` adds the contrast to `--mode cis
+--ancestry_model dosage` (`L` from `--max_effects`, the conditioning mode
+from `--condition_on`) and `--credible_sets <table>` adds it to `--mode
+cis_conditional`.
 
 ### Covariate interaction scans
 
@@ -500,7 +586,8 @@ for interaction scans, `<prefix>.cis_qtl.signif_pairs.parquet` with
 genotypes in chunks. Output columns use tensorQTL's spelling unless
 `--localqtl_names` is given; `--device`, `--perm_chunk`, `--haplotypes`,
 `--la_format`, `--la_source`, `--la_cache_dir`, `--use_posterior`,
-`--ancestry_model` and `--min_ancestry_ac` are localQTL additions.
+`--ancestry_model`, `--min_ancestry_ac`, `--condition_on`, `--ld_aware`,
+`--lead_selection` and `--credible_sets` are localQTL additions.
 
 ### External validation: AlphaGenome Atlas and IGVF Catalog
 

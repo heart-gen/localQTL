@@ -10,6 +10,136 @@ To release: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`, u
 compare links at the bottom, merge, and only then tag `vX.Y.Z`. The release workflow builds
 the GitHub release body from that section and stops if the tag has none.
 
+## [Unreleased]
+
+### Added
+
+- **Pooled-lead selection for the dosage scan** (`map_permutations(ancestry_model="dosage",
+  lead_selection="pooled")`, CLI `--lead_selection pooled`). The lead of each phenotype is the
+  variant the pooled 1-df statistic of `y ~ G + L` picks on the dosage model's own residualised
+  design, i.e. the lead of `ancestry_model="main"`, and the row reports the dosage model's own
+  joint test at that variant: `pval_nominal` is still `pval_joint`, and `pval_perm` / `pval_beta`
+  still calibrate the joint F, but against a null in which every permutation selects its lead by
+  the pooled statistic too and the joint F is read at that variant
+  (`regression_kernels.perm_chunk_r2_argmax`, `dosage_perm_chunk_f_at`), so the p-value is
+  calibrated for the selection procedure; the maximum F over the window (the joint-lead null)
+  would be conservative at a variant the joint F did not pick. The pooled model's p-value is never
+  substituted for the dosage model's; it is reported as information in `pval_nominal_pooled`
+  with `slope_pooled`, `slope_se_pooled`, `tstat_pooled` and `r2_pooled`. `ld_aware` evaluates
+  the LD-aware contrast at the pooled lead; with `group_s` the group's lead is the (phenotype,
+  variant) with the largest pooled R^2 and the null selects the same way. The default,
+  `lead_selection="joint"`, is the 0.4.3 scan, unchanged. Motivation (localQTL benchmark,
+  2026-11-06): on the shared-effect null the ancestry contrast at the joint lead read 42 % below
+  .05 against 4.3 % at the pooled lead, because the joint F prefers variants whose marginal
+  ancestry effects differ. Tests: the pooled lead is the main model's lead and the row's test the
+  nominal dosage scan's joint test there; the kernel-level null is uniform where the joint-lead
+  null is conservative; calibration under the null, ungrouped and grouped; the CLI and the
+  mapper.
+
+### Fixed
+
+- **Standard errors of negative effects from the permutation kernels.**
+  `prep_ctx_for_perm` and `run_batch_regression_with_permutations` derived the slope's standard
+  error as `|beta| / clamp(t, 1e-8)`, which is `|beta| * 1e8` whenever the effect is negative. The
+  reported slope, standard error and t statistic were then inconsistent in every table that takes
+  its lead statistics from these kernels: `slope_se_pooled` of the pooled-lead dosage scan (new in
+  this release) and, in earlier releases too, `slope_se` of grouped `map_permutations` scans, of
+  the g x local-ancestry and g x covariate interaction scans (with `slope_se_gxh_anc{k}`), and of
+  the signals `map_independent` adds. Slopes, t statistics, R^2, every p-value and the choice of
+  lead were not affected, nor were the ungrouped `main` scan, the nominal scans and the dosage
+  model's own statistics. The standard error is now computed from the residual sums of squares
+  (`sqrt(RSS / dof / SS_g)`), so it no longer depends on the sign of the effect and is positive at
+  a zero effect; standard errors of positive effects change only in the last float digits. Tables
+  written by an earlier version need their `slope_se` recomputed as `|slope / tstat|` wherever the
+  slope is negative.
+- **LD-aware refits with no residual degrees of freedom are not reported.** A credible set broad
+  enough for its conditioning block to exhaust the sample (`n - k_eff - rank_ld - p < 1`, with `p`
+  the lead's own design columns) left a saturated conditional model whose residual is numerical
+  noise, and the regression kernel's dof floor of 1 turned that into finite, sometimes extreme
+  statistics (joint F near 1e8 and p near 1e-5 on a null phenotype). `ld_aware_contrast` now
+  returns every `*_ld` slope, standard error, t, F, z and p-value as NaN with `dof_ld = 0` in that
+  case; `n_conditioned_ld` and `rank_ld` still describe the block. Both entry points
+  (`map_permutations(ld_aware=True)`, `map_conditional_dosage(credible_sets_df=...)`) go through
+  it; the marginal columns of the row are unchanged.
+- `CisMapper.map_permutations` now accepts `ld_aware`, `ld_aware_opts` (documented for 0.4.3 but
+  only reachable through the function API) and `lead_selection`.
+- `calculate_qvalues` tests a phenotype whose beta approximation could not be fitted (`pval_beta`
+  NaN) with its `pval_perm`, as `_beta_mle_on_p` documents, instead of setting it to p = 1, which
+  removed it from the discoveries whatever its permutation p-value. The stored p-value columns are
+  not modified and the phenotype keeps a NaN `pval_nominal_threshold`; with no `pval_perm` column
+  the p = 1 fill is unchanged. Tables without NaN `pval_beta` are unaffected.
+
+### Known limitations
+
+- **Beta approximation of the dosage scan.** `pval_beta` of `ancestry_model="dosage"` is a
+  two-parameter Beta fitted by maximum likelihood to the null joint-F p-values at the nominal
+  `(K, dof)` (`cis.permutations._beta_fit_on_minp`), without the effective-degrees-of-freedom step
+  of the correlation scans. The Beta family does not reproduce this null exactly: `beta_shape1`
+  sits near 0.8 rather than 1 (median 0.78 against 1.05 for `ancestry_model="main"` on the
+  localQTL benchmark's null), the body of the null distribution is slightly misfitted
+  (Kolmogorov-Smirnov distance 0.012-0.018 on 10,000-20,000 null phenotypes) and the lower tail is
+  conservative (0.042-0.046 below .05, 0.005-0.008 below .01). The cost grows into the tail: on
+  the benchmark's 19,586 null leads `pval_beta` falls below .01 for 132 phenotypes against 197
+  for `pval_perm`, and below .001 for 9 against 20 (`ancestry_model="main"`: 162 against 193 and
+  21 against 24). It is not a consequence of
+  `lead_selection="pooled"`: the joint-lead null misfits as much, on an exact Gaussian null drawn
+  with the package's own kernels. `pval_perm` is calibrated and is the reference; q-values on
+  `pval_beta` held the nominal FDR on the benchmark (realized .048 at .05). Solving for an
+  effective denominator dof that sets the moment `shape1` to 1, the analogue of tensorQTL's
+  `true_df`, was tried and does not remove the misfit, so a replacement null fit is deferred to a
+  later version. Documented in the user guide and in `_beta_fit_on_minp`.
+
+### Review
+
+- **Permutation inference reviewed (2026-11-09,
+  `docs/reviews/2026-11-09_permutation_inference.md`).** The observed scan and its permutation
+  null are one procedure in the pooled-lead dosage scan (one residualised design, one selection
+  statistic, the first-index tie rule on both sides, re-residualised permuted phenotypes, one
+  joint-F estimator with the same sanitisation); the joint F, its degrees of freedom and its
+  regularisation are those of the nested OLS comparison and are identical for observed and
+  permuted statistics. No kernel or statistic changed. New tests pin the conclusions: the
+  pooled-lead null on the identity permutation returns the observed scan's numbers; an exact
+  proxy ties in pooled R^2 and carries the same joint F under every permutation; the `main` /
+  `tensorqtl_flavor` observed R^2 (ridge OLS) equals the null kernels' statistic; the block and
+  refit joint F equal the float64 nested-model F on a design with projected-out covariates.
+
+## [0.4.3] - 2026-11-04
+
+### Added
+
+- **LD-aware ancestry contrast** (`localqtl.cis.ld_aware`). The pairwise contrast of the dosage
+  model, `pval_diff_anc{i}_anc{j}`, compares *marginal* ancestry-specific effects; at a lead that
+  tags the causal variant it fires whenever the LD between the two differs by ancestry, even when
+  the causal effect is the same in every ancestry (on the localQTL benchmark's shared-effect
+  design, 42 % of the joint leads of the permutation scan had `pval_diff` below .05 against 5.3 %
+  at the causal variant). `map_permutations(ancestry_model="dosage", ld_aware=True,
+  ld_aware_opts=...)` fits SuSiE to the pooled genotypes of each window and reports the lead's
+  contrast conditional on the other members of the phenotype's credible sets (their pooled
+  genotypes, `condition_on="genotype"`, or their ancestry-specific dosages, `"dosage"`) as
+  `slope_ld_anc{k}`, `slope_se_ld_anc{k}`, `tstat_ld_anc{k}`, `pval_ld_anc{k}`, `fstat_joint_ld`,
+  `pval_joint_ld`, `z_diff_ld_anc{i}_anc{j}`, `pval_diff_ld_anc{i}_anc{j}`, `n_conditioned_ld`,
+  `rank_ld`, `dof_ld`, `n_cs_ld`, `cs_size_ld` and `pip_ld`, next to the unchanged marginal
+  columns; `pval_perm` and `pval_beta` are unaffected. `map_conditional_dosage(...,
+  credible_sets_df=...)` adds the same columns at known signals, conditioning on the other
+  signals and on the credible-set variants (`n_conditioned_cs`). The conditioning block is
+  orthogonalised against the lead's own genotype and reduced to its rank, so a conditioning
+  variant in perfect LD with the lead costs no degree of freedom and leaves the lead
+  identifiable; the contrast, its standard error and `dof_ld` are those of the full conditional
+  regression. CLI: `--ld_aware` (`--mode cis` with `--ancestry_model dosage`; `L` from
+  `--max_effects`, the mode from `--condition_on`) and `--credible_sets <table>` (`--mode
+  cis_conditional`; the `cis_susie` summary is accepted as is). `tests/cis/test_ld_aware.py`
+  checks the contrast against a full conditional OLS in both modes, the rank reduction, the
+  tagging leak against the window's credible sets, and both entry points.
+
+### Fixed
+
+- **SuSiE credible sets on the GPU.** `susie_get_cs` holds the member indices as tensors on the
+  compute device, subsampled a set larger than 100 members with `np.random.choice` before the
+  purity filter and returned the pure sets with `.numpy()`; both raise "can't convert cuda:0
+  device type tensor to numpy" on a GPU (`cis_susie`, and the LD-aware contrast on its first GPU
+  run). The subsample is now drawn on the host and indexed on the device, and the returned sets
+  are copied to the host; the CPU path and its random stream are unchanged.
+
 ## [0.4.2] - 2026-10-26
 
 ### Fixed
@@ -350,7 +480,8 @@ output; see *Upgrading from 0.1* in the README.
   (`InputGeneratorCisWithHaps`), PLINK 1/2 readers, streaming Parquet sinks and pure-Python
   q-values.
 
-[Unreleased]: https://github.com/heart-gen/localQTL/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/heart-gen/localQTL/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/heart-gen/localQTL/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/heart-gen/localQTL/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/heart-gen/localQTL/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/heart-gen/localQTL/compare/v0.3.0...v0.4.0
