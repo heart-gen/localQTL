@@ -63,13 +63,16 @@ the GitHub release body from that section and stops if the tag has none.
   kernel density failed on tables with tied or very few p-values, which the empirical p-value of
   a small scan produces.
 
-### Under evaluation (not in this release)
+### Evaluated and not adopted
 
 - A generalized-Pareto extrapolation of the permutation tail (Knijnenburg et al. 2009) below the
-  resolution `1 / (nperm + 1)` of the empirical p-value. It becomes the default only if it passes
-  the localQTL benchmark's pre-registered validation (`configs/calibration.yaml:
-  discovery_source.gpd_acceptance`: an independent null, both lead rules, 10^6-permutation
-  references, the empirical/GPD transition, mixed-null FDR, and a material gain in discoveries).
+  resolution `1 / (nperm + 1)` of the empirical p-value, scored by the localQTL benchmark's
+  pre-registered validation (`configs/calibration.yaml: discovery_source.gpd_acceptance`,
+  2026-11-10) against 10^6 Freedman-Lane and 10^6 exact Gaussian null draws at 200 null loci
+  under both lead rules. Fitted to 10,000 permutations it is within the accuracy bar down to
+  1e-5 and outside it below, where the two references disagree with each other by as much, and
+  its empirical/GPD switch is not continuous at every locus. It stays out of localQTL; the
+  empirical p-value is the only phenotype-level product.
 
 ## [0.4.4] - 2026-11-09
 

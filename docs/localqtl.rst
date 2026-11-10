@@ -298,9 +298,12 @@ ancestry effects differ.
    p-value is the reference and the Beta a legacy option.  The resolution of
    ``pval_perm`` is ``1 / (nperm + 1)``: phenotypes at the floor tie, and a
    gene-level cutoff below the floor leaves ``pval_nominal_threshold`` NaN.  A
-   generalized-Pareto extrapolation of the tail is under evaluation for a later
-   version and is adopted only if it passes the benchmark's pre-registered
-   validation.
+   generalized-Pareto extrapolation of the tail (Knijnenburg et al. 2009) was
+   evaluated against 10^6-permutation references at 200 null loci under both
+   lead rules (localQTL benchmark, 2026-11-10) and is not adopted: fitted to
+   10,000 permutations it meets the pre-registered accuracy down to 1e-5 and
+   not below, where the references themselves cannot resolve it, so the
+   empirical p-value remains the only phenotype-level product.
 
 With ``group_s`` the maximum runs over the phenotypes of a group as well as
 over the window, giving one calibrated row per group -- the layout wanted for
