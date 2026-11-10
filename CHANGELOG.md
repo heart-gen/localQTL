@@ -10,7 +10,7 @@ To release: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`, u
 compare links at the bottom, merge, and only then tag `vX.Y.Z`. The release workflow builds
 the GitHub release body from that section and stops if the tag has none.
 
-## [Unreleased]
+## [0.4.5] - 2026-11-10
 
 ### Changed
 
@@ -544,7 +544,8 @@ output; see *Upgrading from 0.1* in the README.
   (`InputGeneratorCisWithHaps`), PLINK 1/2 readers, streaming Parquet sinks and pure-Python
   q-values.
 
-[Unreleased]: https://github.com/heart-gen/localQTL/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/heart-gen/localQTL/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/heart-gen/localQTL/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/heart-gen/localQTL/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/heart-gen/localQTL/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/heart-gen/localQTL/compare/v0.4.1...v0.4.2
