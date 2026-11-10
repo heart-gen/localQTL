@@ -31,8 +31,6 @@ __all__ = [
     "NULL_SUMMARY_TOP",
     "summarise_null_p",
     "empirical_nominal_threshold",
-    "NullSummary",
-    "null_summary_of",
 ]
 
 # --------------------------------------------------------------------------- empirical null summaries (0.4.5)
@@ -43,46 +41,6 @@ __all__ = [
 # (a geometric grid of cumulative probabilities from 1e-4 to 1, ratio 10^(1/20)) for the body.
 NULL_SUMMARY_LEVELS: np.ndarray = np.unique(np.round(np.logspace(-4.0, 0.0, 81), 10))
 NULL_SUMMARY_TOP: int = 250
-
-
-class NullSummary:
-    """
-    The null-summary table of a permutation scan, as it travels in
-    ``DataFrame.attrs["null_summary"]``.  pandas compares ``attrs`` with ``==`` when it
-    concatenates frames and deep-copies them on ``copy()``; a bare DataFrame there raises
-    on the comparison and is copied wholesale, so the table is wrapped: equal by identity
-    of the table, shared on copy (the summary is read-only).  ``.df`` is the table, one
-    row per phenotype (``phenotype_id``, ``group_id``, ``nperm``, ``K``, ``dof``,
-    ``levels``, ``null_lead_p_top``, ``null_lead_p_levels``, ``null_max_p_top``,
-    ``null_max_p_levels``).  :func:`null_summary_of` reads it from a result frame.
-    """
-    __slots__ = ("df",)
-
-    def __init__(self, df: pd.DataFrame):
-        self.df = df
-
-    def __eq__(self, other):
-        return isinstance(other, NullSummary) and other.df is self.df
-
-    def __hash__(self):
-        return id(self.df)
-
-    def __deepcopy__(self, memo):
-        return NullSummary(self.df)
-
-    def __len__(self):
-        return len(self.df)
-
-    def __repr__(self):
-        return f"NullSummary({len(self.df)} rows)"
-
-
-def null_summary_of(res_df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    """The null-summary table carried by a permutation result (``attrs["null_summary"]``), or ``None``."""
-    v = getattr(res_df, "attrs", {}).get("null_summary")
-    if v is None:
-        return None
-    return v.df if isinstance(v, NullSummary) else v
 
 
 def summarise_null_p(p_null: np.ndarray, top: int = NULL_SUMMARY_TOP,
@@ -484,10 +442,6 @@ def _fit_method_of(res_df: pd.DataFrame) -> np.ndarray:
 def _null_summary_lookup(res_df: pd.DataFrame, null_summary: pd.DataFrame | None) -> tuple[pd.DataFrame | None, str | None]:
     """The null summary indexed by the key that matches ``res_df`` (``group_id`` of a grouped
     scan, else ``phenotype_id``), or ``(None, None)``."""
-    if null_summary is None:
-        null_summary = null_summary_of(res_df)
-    elif isinstance(null_summary, NullSummary):
-        null_summary = null_summary.df
     if null_summary is None or len(null_summary) == 0:
         return None, None
     if "group_id" in res_df.columns and "group_id" in null_summary.columns and null_summary["group_id"].notna().any():
@@ -513,9 +467,9 @@ def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
       with ``beta_approx=False``): the phenotype-level p-value is the calibrated
       ``pval_perm`` of the selected-lead null, and the nominal threshold is the
       ``p*``-quantile of the phenotype's own window-minimum null
-      (:func:`empirical_nominal_threshold` on the ``null_summary`` the scan stored:
-      ``res_df.attrs["null_summary"]`` or the ``null_summary`` argument, the table the
-      CLI writes as ``<prefix>.cis_qtl.null_summary.parquet``).  Without a summary the
+      (:func:`empirical_nominal_threshold` on ``null_summary``, the table
+      ``map_permutations(..., return_null_summary=True)`` returns next to the results and
+      the CLI writes as ``<prefix>.cis_qtl.null_summary.parquet``).  Without a summary the
       threshold is NaN and the pair extraction skips the phenotype.
 
     Tables written before 0.4.5 carry no ``pval_fit_method``: a finite ``pval_beta`` is

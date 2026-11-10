@@ -234,7 +234,7 @@ pairs :func:`localqtl.cis.get_significant_pairs` extracts, is read from the
 permutation null of the *window-minimum* joint-F p-value: the scan stores a
 compact summary of each phenotype's null (the smallest null p-values and
 quantiles of both the selected-lead null and the window-maximum null;
-``null_summary_of(perm_df)``, the CLI's
+the second element of ``map_permutations(..., return_null_summary=True)``, the CLI's
 ``<prefix>.cis_qtl.null_summary.parquet``) and
 :func:`localqtl.stats.calculate_qvalues` sets ``pval_nominal_threshold`` to
 the ``p*``-quantile of that null (:func:`localqtl.stats.empirical_nominal_threshold`),

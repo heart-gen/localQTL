@@ -11,7 +11,7 @@ except Exception:
 from ..utils import SimpleLogger, subseed
 from .._torch_utils import to_device_tensor
 from ..stats import (beta_approx_pval, get_f_pval, get_t_pval, _beta_mle_on_p, summarise_null_p,
-                     NULL_SUMMARY_LEVELS, NullSummary, null_summary_of)
+                     NULL_SUMMARY_LEVELS)
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from ..preproc import (impute_mean_and_filter, allele_stats, filter_by_maf,
                        ancestry_allele_stats)
@@ -283,9 +283,11 @@ def _run_permutation_core(
         ld_aware: dict | None = None,
         lead_selection: str = "joint",
         pval_fit_method: str = "beta",
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
     """
-    One top association per phenotype with empirical permutation p-value (no grouping).
+    One top association per phenotype with empirical permutation p-value (no grouping);
+    returns ``(results, null_summary)``, the second ``None`` unless the dosage scan stored
+    its permutation nulls (:func:`_null_summary_row`).
     ``paired_ctx`` maps phenotype IDs to ``(Residualizer, residualized y)`` for
     phenotype-specific covariates (see ``map_nominal``).  ``perm_source_ctx`` is
     ``(centred raw phenotypes, {phenotype_id: row})`` when the scan permutes the raw
@@ -785,9 +787,7 @@ def _run_permutation_core(
             )
 
     out = buffers_to_dataframe(expected_columns, buffers, cursor)
-    if null_rows:
-        out.attrs["null_summary"] = NullSummary(pd.DataFrame(null_rows))
-    return out
+    return out, (pd.DataFrame(null_rows) if null_rows else None)
 
 
 def _run_permutation_core_group(
@@ -804,9 +804,10 @@ def _run_permutation_core_group(
         ld_aware: dict | None = None,
         lead_selection: str = "joint",
         pval_fit_method: str = "beta",
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
     """
-    Group-aware permutation mapping: returns one top association per group with empirical p-values.
+    Group-aware permutation mapping: one top association per group with empirical p-values;
+    returns ``(results, null_summary)`` like :func:`_run_permutation_core`.
     """
     if nperm is None or nperm <= 0:
         raise ValueError("nperm must be a positive integer for map_permutations.")
@@ -1334,9 +1335,7 @@ def _run_permutation_core_group(
             )
 
     out = buffers_to_dataframe(expected_columns, buffers, cursor)
-    if null_rows:
-        out.attrs["null_summary"] = NullSummary(pd.DataFrame(null_rows))
-    return out
+    return out, (pd.DataFrame(null_rows) if null_rows else None)
 
 
 def map_permutations(
@@ -1357,10 +1356,12 @@ def map_permutations(
         ld_aware_opts: dict | None = None,
         lead_selection: str = "joint",
         pval_fit_method: str | None = None,
-) -> pd.DataFrame:
+        return_null_summary: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame | None]:
     """
     Empirical cis-QTL mapping (one top variant per phenotype) with permutations.
-    Returns a DataFrame with empirical p-values (and optional Beta approximation).
+    Returns a DataFrame with empirical p-values (and optional Beta approximation); with
+    ``return_null_summary=True`` the pair ``(results, null_summary)``.
 
     ``pval_fit_method`` (0.4.5) names the phenotype-level inference product and is
     reported per row: ``"beta"`` fits the Beta approximation (``pval_beta``,
@@ -1368,11 +1369,12 @@ def map_permutations(
     construction); ``"empirical"`` fits nothing, leaves those columns NaN and makes the
     calibrated ``pval_perm`` the phenotype-level p-value (the default of
     ``ancestry_model="dosage"``, whose Beta is conservative in the tail, and of
-    ``beta_approx=False``).  The dosage scan also stores a compact summary of each
-    phenotype's permutation null in ``result.attrs["null_summary"]`` (the smallest
-    null p-values and quantiles of the selected-lead null and of the window-minimum
-    null), from which :func:`localqtl.stats.calculate_qvalues` reads the nominal
-    threshold of the pair extraction without Beta parameters.
+    ``beta_approx=False``).  The dosage scan also keeps a compact summary of each
+    phenotype's permutation null (the smallest null p-values and quantiles of the
+    selected-lead null and of the window-minimum null, one row per phenotype or
+    group), returned as the second element with ``return_null_summary=True`` and
+    ``None`` for the other scans; :func:`localqtl.stats.calculate_qvalues` reads the
+    nominal threshold of the pair extraction from it without Beta parameters.
 
     Parameters
     ----------
@@ -1550,6 +1552,7 @@ def map_permutations(
 
     overall_start = time.time()
     results: list[pd.DataFrame] = []
+    null_parts: list[pd.DataFrame] = []
     with logger.time_block("Permutation scan (per-chrom)", sync=sync, sec=False):
         for chrom in ig.chrs:
             chrom_total = int(phenotype_counts.get(chrom, 0))
@@ -1559,7 +1562,7 @@ def map_permutations(
             with logger.time_block(f"{chrom}: map_permutations", sync=sync):
                 total_units = _estimate_rows(ig, chrom, grouped=group_mode)
                 if group_mode:
-                    chrom_df = core(
+                    chrom_df, chrom_null = core(
                         ig, variant_df, rez, nperm=nperm, device=device,
                         beta_approx=beta_approx, maf_threshold=maf_threshold,
                         seed=seed, chrom=chrom,
@@ -1577,7 +1580,7 @@ def map_permutations(
                         pval_fit_method=fit_method,
                     )
                 else:
-                    chrom_df = core(
+                    chrom_df, chrom_null = core(
                         ig, variant_df, rez, nperm=nperm, device=device,
                         beta_approx=beta_approx, maf_threshold=maf_threshold,
                         seed=seed, chrom=chrom,
@@ -1596,6 +1599,8 @@ def map_permutations(
                         pval_fit_method=fit_method,
                     )
             results.append(chrom_df)
+            if chrom_null is not None:
+                null_parts.append(chrom_null)
             if logger.verbose:
                 elapsed = time.time() - chrom_start
                 logger.write(f"    Chromosome {chrom} completed in {elapsed / 60:.2f} min")
@@ -1604,12 +1609,7 @@ def map_permutations(
         elapsed = time.time() - overall_start
         logger.write(f"    Completed permutation scan in {elapsed / 60:.2f} min")
 
-    if results:
-        nulls = [null_summary_of(r) for r in results if "null_summary" in r.attrs]
-        for r in results:
-            r.attrs.pop("null_summary", None)
-        out = pd.concat(results, axis=0, ignore_index=True)
-        if nulls:
-            out.attrs["null_summary"] = NullSummary(pd.concat(nulls, axis=0, ignore_index=True))
-        return out
-    return pd.DataFrame()
+    out = pd.concat(results, axis=0, ignore_index=True) if results else pd.DataFrame()
+    if return_null_summary:
+        return out, (pd.concat(null_parts, axis=0, ignore_index=True) if null_parts else None)
+    return out

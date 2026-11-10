@@ -39,7 +39,7 @@ from .cis import map_conditional_dosage, map_independent, map_nominal, map_permu
 from .cis.postproc import get_significant_pairs, pair_pval_column_of
 from .compat import from_tensorqtl_columns, to_tensorqtl_columns
 from .phenotypeio import read_phenotype_bed
-from .stats import NullSummary, calculate_qvalues, null_summary_of
+from .stats import calculate_qvalues
 from .utils import SimpleLogger
 
 __all__ = ["build_parser", "main"]
@@ -377,24 +377,22 @@ def main(argv=None) -> int:
             kw.update(lead_selection=args.lead_selection)
         if args.pval_fit_method is not None:
             kw.update(pval_fit_method=args.pval_fit_method)
+        kw["return_null_summary"] = True
         if pgr is None:
-            res_df = map_permutations(genotype_df, variant_df, phenotype_df, phenotype_pos_df, **kw)
+            res_df, null_summary = map_permutations(genotype_df, variant_df, phenotype_df, phenotype_pos_df, **kw)
         else:
             parts = [map_permutations(gt, var, p, ppos, **kw) for gt, var, p, ppos, _ in _chunks()]
-            nulls = [null_summary_of(d) for d in parts if "null_summary" in d.attrs]
-            for d in parts:
-                d.attrs.pop("null_summary", None)
-            res_df = pd.concat(parts, ignore_index=True)
-            if nulls:
-                res_df.attrs["null_summary"] = NullSummary(pd.concat(nulls, ignore_index=True))
+            res_df = pd.concat([d for d, _ in parts], ignore_index=True)
+            nulls = [n for _, n in parts if n is not None]
+            null_summary = pd.concat(nulls, ignore_index=True) if nulls else None
         logger.write('  * writing output')
-        res_df = calculate_qvalues(res_df, fdr=args.fdr, qvalue_lambda=args.qvalue_lambda, logger=logger)
+        res_df = calculate_qvalues(res_df, fdr=args.fdr, qvalue_lambda=args.qvalue_lambda, logger=logger,
+                                   null_summary=null_summary)
         _write_tsv(_names(res_df, args), os.path.join(args.output_dir, f'{args.prefix}.cis_qtl.txt.gz'), index=False)
-        if null_summary_of(res_df) is not None:
+        if null_summary is not None:
             # the compact permutation null of each phenotype (dosage scan): calculate_qvalues(..., null_summary=...)
             # recomputes the empirical nominal thresholds from it without rerunning the permutations
-            null_summary_of(res_df).to_parquet(os.path.join(args.output_dir, f'{args.prefix}.cis_qtl.null_summary.parquet'),
-                                               index=False)
+            null_summary.to_parquet(os.path.join(args.output_dir, f'{args.prefix}.cis_qtl.null_summary.parquet'), index=False)
 
     elif args.mode == 'cis_nominal':
         has_int = interaction_df is not None

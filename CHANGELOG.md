@@ -22,9 +22,9 @@ the GitHub release body from that section and stops if the tag has none.
   it (the path it already took for a NaN `pval_beta`). (2) Variant-level extraction of joint
   associations: the scan stores a compact summary of each phenotype's permutation null, the
   smallest null p-values exactly and quantiles on a geometric grid, of both the selected-lead
-  null and the window-maximum joint-F null (`result.attrs["null_summary"]`, read with
-  `localqtl.stats.null_summary_of`; the CLI writes `<prefix>.cis_qtl.null_summary.parquet`), and
-  `calculate_qvalues` sets `pval_nominal_threshold` to the gene-level cutoff's quantile of the
+  null and the window-maximum joint-F null (the second element of `map_permutations(...,
+  return_null_summary=True)`; the CLI writes `<prefix>.cis_qtl.null_summary.parquet`), and
+  `calculate_qvalues(..., null_summary=...)` sets `pval_nominal_threshold` to the gene-level cutoff's quantile of the
   window-minimum null (`localqtl.stats.empirical_nominal_threshold`: the k-th smallest null
   value, k = floor(p* (nperm + 1)), exact within the stored tail and log-interpolated above it;
   NaN when p* is below the permutations' resolution). `get_significant_pairs` gains

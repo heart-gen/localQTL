@@ -8,7 +8,7 @@ import pytest
 from src.localqtl.cis.nominal import map_nominal
 from src.localqtl.cis.permutations import map_permutations
 from src.localqtl.cis.postproc import get_significant_pairs, pair_pval_column_of
-from src.localqtl.stats import NULL_SUMMARY_LEVELS, calculate_qvalues, empirical_nominal_threshold, null_summary_of
+from src.localqtl.stats import NULL_SUMMARY_LEVELS, calculate_qvalues, empirical_nominal_threshold
 from src.localqtl.utils import SimpleLogger
 
 LG = SimpleLogger(verbose=False)
@@ -45,22 +45,26 @@ def _scan(d, tmp_path, lead_selection, nperm=200, seed=3):
     kw = dict(haplotypes=d["panel"], ancestry_model="dosage", device="cpu", window=1000, logger=LG)
     map_nominal(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"], d["covariates_df"],
                 out_dir=str(tmp_path), out_prefix="nom", write_stats=True, **kw)
-    perm = map_permutations(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
-                            d["covariates_df"], nperm=nperm, seed=seed, lead_selection=lead_selection, **kw)
-    return perm, str(tmp_path / "nom.chr1.parquet")
+    perm, ns = map_permutations(d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"],
+                                d["covariates_df"], nperm=nperm, seed=seed, lead_selection=lead_selection,
+                                return_null_summary=True, **kw)
+    return perm, ns, str(tmp_path / "nom.chr1.parquet")
 
 
 @pytest.mark.parametrize("lead_selection", ["pooled", "joint"])
 def test_dosage_discovery_end_to_end(tmp_path, lead_selection):
     d = _cohort()
-    perm, nominal = _scan(d, tmp_path, lead_selection)
+    perm, ns, nominal = _scan(d, tmp_path, lead_selection)
     assert len(perm) == len(d["ids"])
     # product 1: the empirical p is the phenotype-level statistic; the Beta columns are blank
     assert (perm["pval_fit_method"] == "empirical").all()
     assert perm[["pval_beta", "beta_shape1", "beta_shape2"]].isna().all().all()
     # the stored null: one row per phenotype, both nulls on the (K, dof) p scale, sorted, max <= lead draw by draw
-    ns = null_summary_of(perm)
     assert list(ns["phenotype_id"]) == list(perm["phenotype_id"]) and (ns["nperm"] == 200).all()
+    # the result table itself is an ordinary frame: parquet-writable, no attrs
+    perm.to_parquet(tmp_path / "perm.parquet", index=False)
+    ns.to_parquet(tmp_path / "ns.parquet", index=False)
+    pd.testing.assert_frame_equal(pd.read_parquet(tmp_path / "ns.parquet")[["phenotype_id", "nperm"]], ns[["phenotype_id", "nperm"]])
     for _, row in ns.iterrows():
         top_lead, top_max = np.asarray(row["null_lead_p_top"]), np.asarray(row["null_max_p_top"])
         assert top_lead.shape == top_max.shape == (200,)           # nperm <= NULL_SUMMARY_TOP: the whole null, sorted
@@ -75,8 +79,10 @@ def test_dosage_discovery_end_to_end(tmp_path, lead_selection):
         p_obs = r["pval_nominal"]
         k = int((np.asarray(row["null_lead_p_top"], dtype=np.float64) <= p_obs * (1 + 1e-4)).sum())
         assert abs(r["pval_perm"] - (k + 1) / 201) <= 2.5 / 201, (r["phenotype_id"], r["pval_perm"], k)
-    # q-values and thresholds
-    res = calculate_qvalues(perm, fdr=0.05, logger=LG, qvalue_lambda=0.5)
+    # q-values and thresholds (the summary is passed explicitly; without it the empirical thresholds are NaN)
+    bare = calculate_qvalues(perm.copy(), fdr=0.05, logger=LG, qvalue_lambda=0.5)
+    assert bare["pval_nominal_threshold"].isna().all()
+    res = calculate_qvalues(perm, fdr=0.05, logger=LG, qvalue_lambda=0.5, null_summary=ns)
     sig = res["qval"] <= 0.05
     found = set(res.loc[sig, "phenotype_id"])
     assert set(d["ids"][:d["n_signal"]]) <= found                   # every planted signal is discovered
@@ -112,17 +118,17 @@ def test_fit_method_beta_keeps_the_legacy_product_and_the_same_empirical_p(tmp_p
     kw = dict(haplotypes=d["panel"], ancestry_model="dosage", device="cpu", window=1000, logger=LG, nperm=200, seed=5,
               lead_selection="pooled")
     args = (d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"], d["covariates_df"])
-    emp = map_permutations(*args, **kw)
-    beta = map_permutations(*args, pval_fit_method="beta", **kw)
+    emp, ns_e = map_permutations(*args, return_null_summary=True, **kw)
+    beta, ns_b = map_permutations(*args, pval_fit_method="beta", return_null_summary=True, **kw)
     assert (beta["pval_fit_method"] == "beta").all() and np.isfinite(beta["pval_beta"]).all()
     # the same permutations: pval_perm, leads and every non-Beta column identical; the Beta is the only addition
     for col in [c for c in emp.columns if c not in ("pval_beta", "beta_shape1", "beta_shape2", "pval_fit_method")]:
         pd.testing.assert_series_equal(emp[col], beta[col], check_names=False)
     # the null summary is stored either way, so the empirical threshold is available to both products
-    pd.testing.assert_frame_equal(null_summary_of(emp).drop(columns="levels"), null_summary_of(beta).drop(columns="levels"))
+    pd.testing.assert_frame_equal(ns_e.drop(columns="levels"), ns_b.drop(columns="levels"))
     # q-values: the Beta table uses pval_beta, the empirical table pval_perm; thresholds from the Beta vs the null
     rb = calculate_qvalues(beta.copy(), fdr=0.5, logger=LG, qvalue_lambda=0.5)
-    re_ = calculate_qvalues(emp.copy(), fdr=0.5, logger=LG, qvalue_lambda=0.5)
+    re_ = calculate_qvalues(emp.copy(), fdr=0.5, logger=LG, qvalue_lambda=0.5, null_summary=ns_e)
     assert (rb["qval"] <= 0.5).sum() >= 2 and (re_["qval"] <= 0.5).sum() >= 2
     assert np.isfinite(rb.loc[rb["qval"] <= 0.5, "pval_nominal_threshold"]).all()
     assert np.isfinite(re_.loc[re_["qval"] <= 0.5, "pval_nominal_threshold"]).all()
@@ -138,7 +144,9 @@ def test_correlation_scans_keep_the_beta_product_by_default_and_report_the_metho
     main = map_permutations(*args, haplotypes=d["panel"], ancestry_model="main", device="cpu", window=1000, logger=LG,
                             nperm=100, seed=2)
     assert (main["pval_fit_method"] == "beta").all() and np.isfinite(main["pval_beta"]).all()
-    assert "null_summary" not in main.attrs
+    _, ns = map_permutations(*args, haplotypes=d["panel"], ancestry_model="main", device="cpu", window=1000, logger=LG,
+                             nperm=100, seed=2, return_null_summary=True)
+    assert ns is None                                                       # only the dosage scan stores its null
     off = map_permutations(*args, haplotypes=d["panel"], ancestry_model="main", device="cpu", window=1000, logger=LG,
                            nperm=100, seed=2, beta_approx=False)
     assert (off["pval_fit_method"] == "empirical").all() and off["pval_beta"].isna().all()

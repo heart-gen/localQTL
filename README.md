@@ -183,7 +183,8 @@ products: the phenotype-level p-value is the calibrated empirical `pval_perm`
 approximation of this F-based null is conservative in the tail), and the
 variant-level pairs are read from the permutation null of the window-minimum
 joint-F p-value: the scan stores a compact summary of each phenotype's null
-(`null_summary_of(perm_df)`; the CLI writes `<prefix>.cis_qtl.null_summary.parquet`),
+(`perm_df, null_summary = map_permutations(..., return_null_summary=True)`; the CLI writes
+`<prefix>.cis_qtl.null_summary.parquet`),
 `calculate_qvalues` sets `pval_nominal_threshold` to its quantile at the
 gene-level cutoff, and `get_significant_pairs(..., pair_pval_col="pval_joint")`
 keeps the variants whose joint-F p-value is at most that threshold (the CLI

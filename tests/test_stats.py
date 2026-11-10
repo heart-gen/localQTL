@@ -128,15 +128,13 @@ def test_calculate_qvalues_reads_the_fit_method_per_row_and_the_empirical_thresh
         row = s.loc[pid]
         assert out.set_index("phenotype_id").loc[pid, "pval_nominal_threshold"] == pytest.approx(
             empirical_nominal_threshold(row["null_max_p_top"], row["null_max_p_levels"], 10_000, p_star))
-    # the summary can travel on the table itself, wrapped so pandas' attrs handling (concat, copy) stays valid
-    from src.localqtl.stats import NullSummary, null_summary_of
-    df2 = df.copy()
-    df2.attrs["null_summary"] = NullSummary(summary)
-    out2 = calculate_qvalues(df2.copy(), logger=lg)
+    # the summary table itself is parquet-writable (list columns) and reads back to the same thresholds
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as d:
+        summary.to_parquet(os.path.join(d, "ns.parquet"), index=False)
+        back = pd.read_parquet(os.path.join(d, "ns.parquet"))
+    out2 = calculate_qvalues(df.copy(), logger=lg, null_summary=back)
     np.testing.assert_allclose(out2["pval_nominal_threshold"].to_numpy(), out["pval_nominal_threshold"].to_numpy())
-    assert null_summary_of(df2.copy()) is summary                       # shared, not deep-copied
-    both = pd.concat([df2, df2.copy()], ignore_index=True)              # a bare DataFrame in attrs would raise here
-    assert len(both) == 2 * len(df2)
 
 
 def test_calculate_qvalues_infers_the_method_of_tables_written_before_0_4_5():

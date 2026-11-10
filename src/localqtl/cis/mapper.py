@@ -130,6 +130,7 @@ class CisMapper:
             ld_aware_opts: Optional[dict] = None,
             lead_selection: str = "joint",
             pval_fit_method: Optional[str] = None,
+            return_null_summary: bool = False,
     ) -> pd.DataFrame:
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
         return _map_permutations(
@@ -159,6 +160,7 @@ class CisMapper:
             ld_aware_opts=ld_aware_opts,
             lead_selection=lead_selection,
             pval_fit_method=pval_fit_method,
+            return_null_summary=return_null_summary,
         )
 
     def map_independent(
@@ -230,8 +232,8 @@ class CisMapper:
             qvalue_lambda: Optional[float] = None,
             null_summary: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
-        """Annotate permutation results with q-values via :func:`calculate_qvalues`; ``null_summary``
-        (else ``perm_df.attrs["null_summary"]``) gives the empirical nominal thresholds."""
+        """Annotate permutation results with q-values via :func:`calculate_qvalues`; ``null_summary`` (the second
+        element of ``map_permutations(..., return_null_summary=True)``) gives the empirical nominal thresholds."""
         return _calculate_qvalues(
             perm_df, fdr=fdr,
             qvalue_lambda=qvalue_lambda,
