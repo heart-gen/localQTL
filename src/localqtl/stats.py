@@ -27,7 +27,76 @@ __all__ = [
     "nominal_pvals_tensorqtl",
     "calculate_qvalues",
     "pval_from_corr_r2",
+    "NULL_SUMMARY_LEVELS",
+    "NULL_SUMMARY_TOP",
+    "summarise_null_p",
+    "empirical_nominal_threshold",
 ]
+
+# --------------------------------------------------------------------------- empirical null summaries (0.4.5)
+# The permutation null of a phenotype is kept as a compact summary so that the nominal
+# threshold of the pair extraction can be read from the null itself instead of from Beta
+# parameters: the ``NULL_SUMMARY_TOP`` smallest null p-values exactly (the extreme tail,
+# where any later extrapolation would be fitted) and the quantiles at ``NULL_SUMMARY_LEVELS``
+# (a geometric grid of cumulative probabilities from 1e-4 to 1, ratio 10^(1/20)) for the body.
+NULL_SUMMARY_LEVELS: np.ndarray = np.unique(np.round(np.logspace(-4.0, 0.0, 81), 10))
+NULL_SUMMARY_TOP: int = 250
+
+
+def summarise_null_p(p_null: np.ndarray, top: int = NULL_SUMMARY_TOP,
+                     levels: np.ndarray = NULL_SUMMARY_LEVELS) -> tuple[np.ndarray, np.ndarray]:
+    """
+    ``(p_top, p_levels)`` of one phenotype's permutation null ``p_null`` (``nperm``
+    p-values): the ``top`` smallest values in increasing order, and for every
+    cumulative probability ``l`` in ``levels`` the ``max(1, ceil(l * nperm))``-th
+    smallest value (the empirical quantile).  Non-finite values count as 1 (a
+    permutation whose statistic was unusable is the least extreme draw).
+    """
+    p = np.asarray(p_null, dtype=np.float64).reshape(-1)
+    p = np.where(np.isfinite(p), p, 1.0)
+    p.sort()
+    n = p.size
+    if n == 0:
+        return np.empty(0, dtype=np.float32), np.full(len(levels), np.nan, dtype=np.float32)
+    k = np.clip(np.ceil(np.asarray(levels, dtype=np.float64) * n).astype(int), 1, n) - 1
+    return p[:min(int(top), n)].astype(np.float32), p[k].astype(np.float32)
+
+
+def empirical_nominal_threshold(p_top: np.ndarray, p_levels: np.ndarray, nperm: int, p_star: float,
+                                levels: np.ndarray = NULL_SUMMARY_LEVELS) -> float:
+    """
+    The nominal p-value threshold ``t`` of one phenotype at the gene-level cutoff
+    ``p_star``, read from the empirical null of the window-minimum p-value: ``t`` is
+    the ``k``-th smallest null value with ``k = floor(p_star * (nperm + 1))``, so a
+    variant whose nominal p-value is at most ``t`` has an empirical p-value against
+    that null of at most ``(k + 1) / (nperm + 1)``, i.e. ``p_star`` to the resolution
+    of the permutations (the analogue of ``beta.ppf(p_star, a, b)``).  ``k`` within
+    the stored top values is exact; above it ``t`` is interpolated between the
+    stored quantiles, linearly in ``log t`` against ``log`` cumulative probability.
+    ``p_star`` below ``1 / (nperm + 1)`` has no empirical resolution: NaN.
+    """
+    n = int(nperm)
+    if not (np.isfinite(p_star) and n > 0):
+        return float("nan")
+    k = int(np.floor(float(p_star) * (n + 1) + 1e-6))     # p* is read from float32 p-values: 1 / (n + 1) is k = 1
+    if k < 1:
+        return float("nan")
+    k = min(k, n)
+    top = np.asarray(p_top, dtype=np.float64).reshape(-1)
+    if k <= top.size:
+        return float(top[k - 1])
+    lv = np.asarray(levels, dtype=np.float64)
+    q = np.asarray(p_levels, dtype=np.float64).reshape(-1)
+    ok = np.isfinite(q) & (q > 0)
+    if ok.sum() < 2:
+        return float("nan")
+    lv, q = lv[ok], q[ok]
+    level = k / n                                       # the cumulative probability of the k-th smallest
+    if level <= lv[0]:
+        return float(q[0])
+    if level >= lv[-1]:
+        return float(q[-1])
+    return float(np.exp(np.interp(np.log(level), np.log(lv), np.log(q))))
 
 def get_t_pval(t, df, two_tailed: bool = True, log10: bool = False):
     """
@@ -358,23 +427,57 @@ def nominal_pvals_tensorqtl(
         return pvals, dof
 
 
+def _fit_method_of(res_df: pd.DataFrame) -> np.ndarray:
+    """``pval_fit_method`` per row: the column when present, else ``"beta"`` where a Beta
+    p-value exists and ``"empirical"`` elsewhere (tables written before 0.4.5)."""
+    if "pval_fit_method" in res_df.columns:
+        m = res_df["pval_fit_method"].astype(object).where(res_df["pval_fit_method"].notna(), None).to_numpy()
+        has_beta = res_df["pval_beta"].notna().to_numpy() if "pval_beta" in res_df.columns else np.zeros(len(res_df), bool)
+        return np.array([str(v) if v is not None else ("beta" if b else "empirical") for v, b in zip(m, has_beta)], dtype=object)
+    if "pval_beta" in res_df.columns:
+        return np.where(res_df["pval_beta"].notna().to_numpy(), "beta", "empirical").astype(object)
+    return np.full(len(res_df), "empirical", dtype=object)
+
+
+def _null_summary_lookup(res_df: pd.DataFrame, null_summary: pd.DataFrame | None) -> tuple[pd.DataFrame | None, str | None]:
+    """The null summary indexed by the key that matches ``res_df`` (``group_id`` of a grouped
+    scan, else ``phenotype_id``), or ``(None, None)``."""
+    if null_summary is None or len(null_summary) == 0:
+        return None, None
+    if "group_id" in res_df.columns and "group_id" in null_summary.columns and null_summary["group_id"].notna().any():
+        key = "group_id"
+    else:
+        key = "phenotype_id"
+    return null_summary.drop_duplicates(key).set_index(key), key
+
+
 def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
                       qvalue_lambda: Optional[Union[float, Sequence[float]]] = None,
-                      logger: Optional[SimpleLogger] = None) -> pd.DataFrame:
+                      logger: Optional[SimpleLogger] = None,
+                      null_summary: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """
     Annotate permutation results with q-values and the nominal p-value threshold.
 
-    Q-values (Storey, ``py_qvalue``) are computed on ``pval_beta`` when the table has
-    any, else on ``pval_perm``.  A phenotype whose beta approximation could not be
-    fitted (``pval_beta`` NaN) is tested with its ``pval_perm``; with no ``pval_perm``
-    column it is treated as p = 1.  ``pval_nominal_threshold`` is the per-phenotype
-    Beta quantile of the global cutoff and is NaN where the beta shapes are missing.
+    Two inference products, read per row from ``pval_fit_method``:
 
-    For the ancestry-specific dosage scan ``pval_beta`` is a Beta fit to the null joint-F
-    p-values at the nominal degrees of freedom; it misfits the body of the null
-    distribution slightly and is conservative in the tails (see
-    :func:`localqtl.cis.map_permutations`), so its q-values err on the conservative side
-    at the usual FDR levels.  ``pval_perm`` is the calibrated reference.
+    * ``"beta"`` (the correlation scans, tensorQTL's construction): the phenotype-level
+      p-value is ``pval_beta`` and the nominal threshold of the pair extraction is the
+      Beta quantile ``beta.ppf(p*, shape1, shape2)``.
+    * ``"empirical"`` (the ancestry-specific dosage scan since 0.4.5, and every scan run
+      with ``beta_approx=False``): the phenotype-level p-value is the calibrated
+      ``pval_perm`` of the selected-lead null, and the nominal threshold is the
+      ``p*``-quantile of the phenotype's own window-minimum null
+      (:func:`empirical_nominal_threshold` on ``null_summary``, the table
+      ``map_permutations(..., return_null_summary=True)`` returns next to the results and
+      the CLI writes as ``<prefix>.cis_qtl.null_summary.parquet``).  Without a summary the
+      threshold is NaN and the pair extraction skips the phenotype.
+
+    Tables written before 0.4.5 carry no ``pval_fit_method``: a finite ``pval_beta`` is
+    read as ``"beta"``.  A phenotype whose beta approximation could not be fitted
+    (``pval_beta`` NaN) is tested with its ``pval_perm``.  Q-values are Storey's
+    (``py_qvalue``) over all rows; ``p*`` is the gene-level cutoff between the largest
+    significant and the smallest non-significant phenotype-level p-value (tensorQTL's
+    convention) and is shared by both products.
     """
     logger = logger or SimpleLogger()
 
@@ -382,10 +485,10 @@ def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
         logger.write("Computing q-values: Input is empty, returning unchanged.")
         return res_df.copy()
 
-    # Choose p-value column
-    use_beta = ("pval_beta" in res_df.columns) and (~res_df["pval_beta"].isna()).any()
-    pcol = "pval_beta" if use_beta else "pval_perm"
-    logger.write(f"Computing q-values on '{pcol}' ({res_df.shape[0]} phenotypes).")
+    method = _fit_method_of(res_df)
+    is_beta = method == "beta"
+    n_beta, n_emp = int(is_beta.sum()), int((~is_beta).sum())
+    logger.write(f"Computing q-values ({res_df.shape[0]} phenotypes: {n_beta} on pval_beta, {n_emp} on pval_perm).")
 
     # Optional correlation report (only if we have >2 finite pairs)
     if "pval_perm" in res_df.columns and "pval_beta" in res_df.columns:
@@ -393,59 +496,92 @@ def calculate_qvalues(res_df: pd.DataFrame, fdr: float = 0.05,
         if mask.sum() >= 3:
             r = stats.pearsonr(res_df.loc[mask, "pval_perm"], res_df.loc[mask, "pval_beta"])[0]
             logger.write(f"  * Corr(p_perm, p_beta) = {r:.4f}")
-        else:
-            logger.write("  * Skipping corr(p_perm, p_beta): insufficient non-NaN values.")
 
-    # Compute q-values
-    p = res_df[pcol].to_numpy(dtype=float)
-    if use_beta and "pval_perm" in res_df.columns:
+    # The phenotype-level p-value of each row
+    p_perm = res_df["pval_perm"].to_numpy(dtype=float) if "pval_perm" in res_df.columns else np.full(len(res_df), np.nan)
+    p_beta = res_df["pval_beta"].to_numpy(dtype=float) if "pval_beta" in res_df.columns else np.full(len(res_df), np.nan)
+    p = np.where(is_beta, p_beta, p_perm)
+    fill = ~np.isfinite(p) & np.isfinite(p_perm)
+    if fill.any():
         # A beta fit that could not be made (degenerate null, see ``_beta_mle_on_p``) leaves
         # ``pval_beta`` NaN: that phenotype is tested with its empirical permutation p-value
         # rather than set to p = 1 and dropped from the discoveries.  The stored columns are
         # not modified, and the phenotype keeps a NaN ``pval_nominal_threshold``.
-        p_perm = res_df["pval_perm"].to_numpy(dtype=float)
-        fill = ~np.isfinite(p) & np.isfinite(p_perm)
-        if fill.any():
-            logger.write(f"  * {int(fill.sum())} phenotypes without a beta approximation: "
-                         "using pval_perm for their q-values.")
-            p = np.where(fill, p_perm, p)
+        logger.write(f"  * {int(fill.sum())} phenotypes without a beta approximation: using pval_perm for their q-values.")
+        p = np.where(fill, p_perm, p)
     if not np.all(np.isfinite(p)):
         logger.write("  * WARNING: non-finite p-values found; replacing with 1.0 for q-value calc.")
         p = np.where(np.isfinite(p), p, 1.0)
 
-    if qvalue_lambda is not None:
-        if isinstance(qvalue_lambda, (list, tuple, np.ndarray)):
-            logger.write(f'  * Calculating q-values with lambda = {qvalue_lambda}')
-        else:
-            logger.write(f'  * Calculating q-values with lambda = {qvalue_lambda:.3f}')
-
-    qvals_res = qvalue(p, lambda_=qvalue_lambda)
+    # Only the q-values and pi0 are used: the local FDR (a kernel density of the p-values) is not requested, as it
+    # fails on tables with tied or very few p-values, which the empirical p of a small scan can produce.
+    if qvalue_lambda is None:
+        qvals_res = qvalue(p, lfdr_out=False)
+    elif isinstance(qvalue_lambda, (list, tuple, np.ndarray)):
+        logger.write(f'  * Calculating q-values with lambda = {qvalue_lambda}')
+        qvals_res = qvalue(p, lambda_=np.asarray(qvalue_lambda, dtype=float), lfdr_out=False)
+    else:
+        # A single lambda (the CLI's --qvalue_lambda, R's qvalue(lambda=x)): pi0 is the plain Storey estimate
+        # at that lambda; py_qvalue's pi0est needs a grid for its smoother, so pi0 is passed to it directly.
+        lam = float(qvalue_lambda)
+        if not 0.0 <= lam < 1.0:
+            raise ValueError(f"qvalue_lambda must be in [0, 1), got {qvalue_lambda!r}")
+        pi0_fixed = float(min(1.0, np.mean(p >= lam) / (1.0 - lam)))
+        if pi0_fixed <= 0.0:
+            raise ValueError(f"qvalue_lambda={lam:g}: the estimated pi0 is 0 (no p-value at or above lambda); "
+                             "use a smaller lambda or the default grid")
+        logger.write(f'  * Calculating q-values with lambda = {lam:.3f} (pi0 = {pi0_fixed:.3f})')
+        qvals_res = qvalue(p, pi0=pi0_fixed, lfdr_out=False)
     qvals, pi0 = qvals_res["qvalues"], qvals_res["pi0"]
 
     res_df['qval'] = qvals
     logger.write(f'  * Proportion of significant phenotypes (1-pi0): {1-pi0:.2f}')
     logger.write(f"  * QTL phenotypes @ FDR {fdr:.2f}: {(res_df['qval'] <= fdr).sum()}")
 
-    # Nominal threshold per phenotype via Beta params
+    # The gene-level cutoff p*: between the last significant and the first non-significant p
     res_df["pval_nominal_threshold"] = np.nan
-    if use_beta:
-        have_params = res_df["beta_shape1"].notna() & res_df["beta_shape2"].notna()
+    sig = res_df["qval"].to_numpy(dtype=float) <= fdr
+    if not sig.any():
+        logger.write("  * No phenotype passes the FDR: no nominal thresholds.")
+        return res_df
+    lb, ub = p[sig].max(), (p[~sig].min() if (~sig).any() else np.nan)
+    p_star = float(lb if not np.isfinite(ub) else 0.5 * (lb + ub))
+    p_star = float(np.clip(p_star, 1e-16, 1 - 1e-16))  # Avoid edge cases
+
+    # Product 2a: the Beta quantile where a Beta was fitted
+    if "beta_shape1" in res_df.columns and "beta_shape2" in res_df.columns:
+        have_params = is_beta & res_df["beta_shape1"].notna().to_numpy() & res_df["beta_shape2"].notna().to_numpy()
         if have_params.any():
-            lb = res_df.loc[(res_df["qval"] <= fdr) & have_params, "pval_beta"].sort_values()
-            ub = res_df.loc[(res_df["qval"] >  fdr) & have_params, "pval_beta"].sort_values()
-            if not lb.empty:
-                # global threshold p* between last sig and first non-sig (tensorQTL convention)
-                p_star = lb.iloc[-1] if ub.empty else 0.5 * (lb.iloc[-1] + ub.iloc[0])
-                p_star = np.clip(p_star, 1e-16, 1 - 1e-16) # Avoid edge cases
-                # phenotype-wise nominal cutoff from Beta quantile
-                from scipy.stats import beta as beta_dist
-                idx = have_params[have_params].index
-                # Sanitize beta shapes
-                a = res_df.loc[idx, "beta_shape1"].clip(lower=1e-6, upper=1e6)
-                b = res_df.loc[idx, "beta_shape2"].clip(lower=1e-6, upper=1e6)
-                res_df.loc[idx, "pval_nominal_threshold"] = beta_dist.ppf(p_star, a=a, b=b)
-                logger.write(f"  * min p-value threshold @ FDR {fdr:.2f}: {p_star:.6g} (beta-quantile per phenotype)")
+            from scipy.stats import beta as beta_dist
+            idx = res_df.index[have_params]
+            a = res_df.loc[idx, "beta_shape1"].clip(lower=1e-6, upper=1e6)
+            b = res_df.loc[idx, "beta_shape2"].clip(lower=1e-6, upper=1e6)
+            res_df.loc[idx, "pval_nominal_threshold"] = beta_dist.ppf(p_star, a=a, b=b)
+            logger.write(f"  * min p-value threshold @ FDR {fdr:.2f}: {p_star:.6g} (beta quantile, {int(have_params.sum())} phenotypes)")
+
+    # Product 2b: the empirical quantile of the window-minimum null where the scan stored it
+    if n_emp:
+        summary, key = _null_summary_lookup(res_df, null_summary)
+        if summary is None or key not in res_df.columns:
+            logger.write(f"  * {n_emp} phenotypes on pval_perm without a null summary: their nominal threshold is NaN.")
         else:
-            logger.write("  * No beta parameters present; skipping nominal threshold computation.")
+            keys = res_df[key].to_numpy()
+            thr = np.full(len(res_df), np.nan)
+            missing = 0
+            for i in np.flatnonzero(~is_beta):
+                k = keys[i]
+                if k not in summary.index:
+                    missing += 1
+                    continue
+                row = summary.loc[k]
+                levels = np.asarray(row["levels"]) if "levels" in summary.columns else NULL_SUMMARY_LEVELS
+                thr[i] = empirical_nominal_threshold(np.asarray(row["null_max_p_top"]), np.asarray(row["null_max_p_levels"]),
+                                                     int(row["nperm"]), p_star, levels=levels)
+            res_df.loc[res_df.index[~is_beta], "pval_nominal_threshold"] = thr[~is_beta]
+            got = int(np.isfinite(thr[~is_beta]).sum())
+            logger.write(f"  * min p-value threshold @ FDR {fdr:.2f}: {p_star:.6g} (empirical quantile of the window-minimum "
+                         f"null, {got} of {n_emp} phenotypes" + (f", {missing} without a stored null" if missing else "") + ")")
+            if got < n_emp - missing:
+                logger.write(f"  * {n_emp - missing - got} phenotypes: p* below the resolution of their permutations, threshold NaN.")
 
     return res_df

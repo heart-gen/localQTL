@@ -218,14 +218,35 @@ Permutations for the ancestry-specific dosage model
 :func:`localqtl.cis.map_permutations` accepts ``ancestry_model="dosage"``.
 The per-variant statistic is the joint Wald F over the K ancestry effects and
 the permutation statistic is its maximum over the cis-window, so ``pval_perm``
-and ``pval_beta`` calibrate the *joint* ancestry signal; ``pval_nominal`` is
-the joint p-value of the lead variant and the per-ancestry columns of
-:func:`localqtl.cis.map_nominal` are reported for it.  Because the joint test
-is an F test rather than a correlation, the Beta approximation is fitted to
-the permuted minimum p-values directly: ``true_dof`` is the residual degrees
-of freedom and ``pval_true_dof`` is ``NaN``.  ``interaction_covariate`` and
-``paired_covariate_df`` are not supported in this mode, and
-:func:`localqtl.cis.map_independent` does not implement it.
+calibrates the *joint* ancestry signal; ``pval_nominal`` is the joint p-value
+of the lead variant and the per-ancestry columns of
+:func:`localqtl.cis.map_nominal` are reported for it.  ``true_dof`` is the
+residual degrees of freedom and ``pval_true_dof`` is ``NaN`` (an F test has no
+t-style effective dof).  ``interaction_covariate`` and ``paired_covariate_df``
+are not supported in this mode, and :func:`localqtl.cis.map_independent` does
+not implement it.
+
+**Two inference products (0.4.5).**  The dosage scan's phenotype-level
+p-value is the calibrated empirical ``pval_perm`` (``pval_fit_method =
+"empirical"``, the default: no Beta is fitted and ``pval_beta``,
+``beta_shape1``, ``beta_shape2`` are NaN), and its variant-level product, the
+pairs :func:`localqtl.cis.get_significant_pairs` extracts, is read from the
+permutation null of the *window-minimum* joint-F p-value: the scan stores a
+compact summary of each phenotype's null (the smallest null p-values and
+quantiles of both the selected-lead null and the window-maximum null;
+the second element of ``map_permutations(..., return_null_summary=True)``, the CLI's
+``<prefix>.cis_qtl.null_summary.parquet``) and
+:func:`localqtl.stats.calculate_qvalues` sets ``pval_nominal_threshold`` to
+the ``p*``-quantile of that null (:func:`localqtl.stats.empirical_nominal_threshold`),
+``p*`` being the gene-level cutoff between the last significant and the first
+non-significant ``pval_perm``.  The pairs are then the variants whose
+``pval_joint`` is at most the threshold (``pair_pval_col="pval_joint"``, what
+the CLI and :class:`CisMapper` choose for a dosage table), so the lead-level
+test, the null and the pair statistic are one joint-F procedure.  With
+``lead_selection="pooled"`` the two nulls differ (the F at the permutation's
+pooled lead against the maximum over the window) and both are read from the
+same F block, at no extra cost.  ``pval_fit_method="beta"`` still fits the
+legacy Beta approximation and derives the threshold from it.
 
 .. code-block:: python
 
@@ -261,25 +282,28 @@ ancestry effects differ.
 
 .. note::
 
-   **Beta approximation of the dosage scan (known limitation).**  ``pval_beta``
-   of the dosage scan is a two-parameter Beta fitted by maximum likelihood to
-   the null joint-F p-values at the nominal ``(K, dof)``; there is no
-   effective-degrees-of-freedom step as in the correlation scans.  The Beta
-   family does not reproduce this null exactly: the fitted ``beta_shape1`` sits
-   near 0.8 rather than 1, the body of the null distribution is slightly
+   **Why the Beta is not the dosage scan's default (0.4.5).**  The Beta
+   approximation of the dosage scan (``pval_fit_method="beta"``) is a
+   two-parameter Beta fitted by maximum likelihood to the null joint-F
+   p-values at the nominal ``(K, dof)``, without the effective-degrees-of-freedom
+   step of the correlation scans.  The Beta family does not reproduce this
+   null: ``beta_shape1`` sits near 0.8 rather than 1, the body is slightly
    misfitted (Kolmogorov-Smirnov distance about 0.012-0.018) and the lower tail
-   is conservative (about 0.042-0.046 of null phenotypes below .05 and
-   0.005-0.008 below .01).  The cost grows into the tail: against
-   ``pval_perm`` on the same null leads, ``pval_beta`` rejects about two
-   thirds as often at .01 and about half as often at .001.  Both lead rules
-   show it.  ``pval_perm`` is
-   calibrated and is the reference; q-values computed on ``pval_beta`` err on
-   the conservative side at the usual FDR levels, and
-   ``calculate_qvalues(perm_df.drop(columns="pval_beta"))`` gives the
-   ``pval_perm``-based q-values as a sensitivity analysis when ``nperm`` is
-   large enough to resolve the discovery threshold.  Solving for an effective
-   denominator dof, the analogue of ``true_dof``, does not remove the misfit;
-   a replacement null fit is planned for a later version.
+   is conservative (0.042-0.046 of null phenotypes below .05, 0.005-0.008
+   below .01; against ``pval_perm`` on the same null leads it rejects about two
+   thirds as often at .01 and about half as often at .001), under both lead
+   rules.  On the localQTL benchmark's power scenarios q-values on
+   ``pval_perm`` found 11.6 % more dosage discoveries at FDR .05 with the
+   realized false-discovery rate at the other models' level, so the empirical
+   p-value is the reference and the Beta a legacy option.  The resolution of
+   ``pval_perm`` is ``1 / (nperm + 1)``: phenotypes at the floor tie, and a
+   gene-level cutoff below the floor leaves ``pval_nominal_threshold`` NaN.  A
+   generalized-Pareto extrapolation of the tail (Knijnenburg et al. 2009) was
+   evaluated against 10^6-permutation references at 200 null loci under both
+   lead rules (localQTL benchmark, 2026-11-10) and is not adopted: fitted to
+   10,000 permutations it meets the pre-registered accuracy down to 1e-5 and
+   not below, where the references themselves cannot resolve it, so the
+   empirical p-value remains the only phenotype-level product.
 
 With ``group_s`` the maximum runs over the phenotypes of a group as well as
 over the window, giving one calibrated row per group -- the layout wanted for

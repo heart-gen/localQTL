@@ -10,6 +10,7 @@ from ..utils import SimpleLogger
 
 __all__ = [
     "get_significant_pairs",
+    "pair_pval_column_of",
     "annotate_ancestry_difference",
     "annotate_with_susie",
     "annotate_with_coloc",
@@ -29,15 +30,31 @@ def _chrom_sort_key(ch: str) -> tuple:
         return (1, s)
 
 
+def pair_pval_column_of(res_df: pd.DataFrame) -> str:
+    """The per-pair statistic a permutation table's thresholds apply to: ``"pval_joint"`` for the
+    ancestry-specific dosage scan (its rows carry ``fstat_joint``), else ``"pval_nominal"``."""
+    return "pval_joint" if "fstat_joint" in getattr(res_df, "columns", []) else "pval_nominal"
+
+
 def get_significant_pairs(res_df: pd.DataFrame,
                           nominal_files: Union[str, Mapping[str, str]],
                           group_s: Optional[pd.Series] = None,
                           fdr: float = 0.05,
                           columns: Optional[List[str]] = None,
-                          logger: Optional[SimpleLogger] = None) -> pd.DataFrame:
+                          logger: Optional[SimpleLogger] = None,
+                          pair_pval_col: str = "pval_nominal") -> pd.DataFrame:
     """
     Collect all significant variant–phenotype pairs from per-chromosome nominal Parquet outputs,
     using phenotype-wise nominal thresholds computed by `calculate_qvalues`.
+
+    ``pair_pval_col`` is the per-pair p-value compared with ``pval_nominal_threshold``; it
+    must be the statistic whose null the threshold was derived from.  For the
+    ancestry-specific dosage scan that is ``"pval_joint"`` (the joint-F p-value of every
+    variant, the statistic of the permutation scan and of its window-minimum null; 0.4.5),
+    for the correlation scans the default ``"pval_nominal"``.  A phenotype (or group) is
+    selected when ``qval <= fdr`` and keeps the pairs with ``pair_pval_col <=
+    pval_nominal_threshold``; phenotypes whose threshold is NaN (no Beta parameters and no
+    stored null, or a cutoff below the permutations' resolution) contribute no pairs.
 
     Parameters
     ----------
@@ -67,7 +84,7 @@ def get_significant_pairs(res_df: pd.DataFrame,
 
     # Select the seed set and thresholds
     if grouped:
-        keep = res_df.loc[res_df["qval"] < fdr, ["group_id", "pval_nominal_threshold"]].copy()
+        keep = res_df.loc[res_df["qval"] <= fdr, ["group_id", "pval_nominal_threshold"]].copy()
         keep = keep.dropna(subset=["pval_nominal_threshold"])
         if keep.empty:
             lg.write("  * No groups pass FDR; returning empty DataFrame.")
@@ -83,7 +100,7 @@ def get_significant_pairs(res_df: pd.DataFrame,
     else:
         if "phenotype_id" not in res_df.columns or "pval_nominal_threshold" not in res_df.columns:
             raise ValueError("Ungrouped mode: res_df must contain 'phenotype_id' and 'pval_nominal_threshold'.")
-        keep = res_df.loc[res_df["qval"] < fdr, ["phenotype_id", "pval_nominal_threshold"]].copy()
+        keep = res_df.loc[res_df["qval"] <= fdr, ["phenotype_id", "pval_nominal_threshold"]].copy()
         keep = keep.dropna(subset=["pval_nominal_threshold"]).drop_duplicates("phenotype_id").set_index("phenotype_id")
         if keep.empty:
             lg.write("  * No phenotypes pass FDR; returning empty DataFrame.")
@@ -103,7 +120,11 @@ def get_significant_pairs(res_df: pd.DataFrame,
     # Read & filter
     default_cols = ["phenotype_id", "variant_id", "pval_nominal",
                     "start_distance", "end_distance"]
-    wanted_cols = columns or default_cols
+    if pair_pval_col not in default_cols:
+        default_cols.append(pair_pval_col)
+    wanted_cols = list(columns) if columns else default_cols
+    if pair_pval_col not in wanted_cols:
+        wanted_cols.append(pair_pval_col)
     out = []
     chroms = sorted(paths.keys(), key=_chrom_sort_key)
     for i, chrom in enumerate(chroms, 1):
@@ -115,7 +136,7 @@ def get_significant_pairs(res_df: pd.DataFrame,
                 raise
             schema_cols = set(pa.parquet.ParquetFile(paths[chrom]).schema.names)
             present = [c for c in default_cols if c in schema_cols]
-            missing_required = {c for c in ["phenotype_id", "variant_id", "pval_nominal"] if c not in schema_cols}
+            missing_required = {c for c in ["phenotype_id", "variant_id", pair_pval_col] if c not in schema_cols}
             if missing_required:
                 missing = ", ".join(sorted(missing_required))
                 raise ValueError(f"Nominal file {paths[chrom]} is missing required columns: {missing}")
@@ -135,8 +156,10 @@ def get_significant_pairs(res_df: pd.DataFrame,
                 continue
             thr = df_nom["phenotype_id"].map(threshold_lookup)
 
-        # Thresholding (use < to include exact boundary)
-        mask = df_nom["pval_nominal"] < thr
+        # Thresholding: the pair's p-value against the phenotype's threshold, boundary included
+        if pair_pval_col not in df_nom.columns:
+            raise ValueError(f"Nominal file {paths[chrom]} has no column {pair_pval_col!r}")
+        mask = df_nom[pair_pval_col].to_numpy(dtype=float) <= thr.to_numpy(dtype=float)
         if mask.any():
             out.append(df_nom.loc[mask].copy())
 

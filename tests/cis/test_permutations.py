@@ -203,7 +203,9 @@ def test_dosage_permutations_match_the_nominal_dosage_scan():
     dof = int(r["true_dof"])
     np.testing.assert_allclose(r["r2_nominal"], 2 * r["fstat_joint"] / (2 * r["fstat_joint"] + dof),
                                rtol=1e-5)
-    assert r["pval_perm"] < 0.05 and r["pval_beta"] < 0.05
+    assert r["pval_perm"] < 0.05
+    # the dosage scan's phenotype-level product is the empirical p (0.4.5): no Beta is fitted
+    assert r["pval_fit_method"] == "empirical" and np.isnan(r["pval_beta"]) and np.isnan(r["beta_shape1"])
     assert np.isnan(r["pval_true_dof"])      # no t-style dof re-estimation for an F test
 
 
@@ -221,9 +223,9 @@ def test_dosage_permutations_are_calibrated_under_the_null():
     pdf = pd.DataFrame(Y, index=[f"g{i}" for i in range(P)], columns=samples)
     pos = pd.DataFrame({"chr": "chr1", "start": 150, "end": 150}, index=pdf.index)
     out = map_permutations(gdf, vdf, pdf, pos, None, haplotypes=panel, ancestry_model="dosage",
-                           nperm=200, device="cpu", seed=2, window=1000,
+                           nperm=200, device="cpu", seed=2, window=1000, pval_fit_method="beta",
                            logger=SimpleLogger(verbose=False))
-    assert len(out) == P
+    assert len(out) == P and (out["pval_fit_method"] == "beta").all()
     for col in ("pval_perm", "pval_beta"):
         p = out[col].to_numpy(float)
         p = p[np.isfinite(p)]
@@ -304,7 +306,7 @@ def test_dosage_permutations_grouped_pick_the_best_phenotype_of_the_group():
     for k in (0, 1):
         np.testing.assert_allclose(r[f"slope_anc{k}"], lead[f"slope_anc{k}"], rtol=1e-4)
         np.testing.assert_allclose(r[f"af_anc{k}"], lead[f"af_anc{k}"], rtol=1e-5)
-    assert r["pval_perm"] < 0.05 and r["pval_beta"] < 0.05
+    assert r["pval_perm"] < 0.05 and r["pval_fit_method"] == "empirical" and np.isnan(r["pval_beta"])
     assert np.isnan(r["pval_true_dof"])
     dof = int(r["true_dof"])
     np.testing.assert_allclose(r["r2_nominal"], 2 * r["fstat_joint"] / (2 * r["fstat_joint"] + dof),
@@ -355,9 +357,9 @@ def test_dosage_permutations_grouped_are_calibrated_under_the_null():
     pos = pd.DataFrame({"chr": "chr1", "start": 150, "end": 150}, index=ids)
     out = map_permutations(gdf, vdf, pdf, pos, None, haplotypes=panel,
                            ancestry_model="dosage", group_s=pd.Series(groups),
-                           nperm=200, device="cpu", seed=5, window=1000,
+                           nperm=200, device="cpu", seed=5, window=1000, pval_fit_method="beta",
                            logger=SimpleLogger(verbose=False))
-    assert len(out) == n_groups
+    assert len(out) == n_groups and (out["pval_fit_method"] == "beta").all()
     for col in ("pval_perm", "pval_beta"):
         p = out[col].to_numpy(float)
         p = p[np.isfinite(p)]
@@ -450,7 +452,7 @@ def test_pooled_lead_is_the_main_models_lead_and_the_row_keeps_the_joint_test():
     np.testing.assert_allclose(r["r2_pooled"], m["r2_nominal"], rtol=1e-3)
     assert set(POOLED_LEAD_COLUMNS) <= set(pooled.columns)
     assert not set(POOLED_LEAD_COLUMNS) & set(joint.columns)
-    assert r["pval_perm"] < 0.05 and r["pval_beta"] < 0.05
+    assert r["pval_perm"] < 0.05 and r["pval_fit_method"] == "empirical" and np.isnan(r["pval_beta"])
     assert np.isnan(r["pval_true_dof"]) and int(r["true_dof"]) == int(joint.iloc[0]["true_dof"])
     # the default is the joint-lead scan, unchanged
     pd.testing.assert_frame_equal(_perm(d, ancestry_model="dosage", lead_selection="joint"), joint)
@@ -474,8 +476,8 @@ def test_pooled_lead_permutations_are_calibrated_under_the_null():
     gdf, vdf, pdf, pos, panel = _null_cohort(99)
     out = map_permutations(gdf, vdf, pdf, pos, None, haplotypes=panel, ancestry_model="dosage",
                            lead_selection="pooled", nperm=200, device="cpu", seed=2, window=1000,
-                           logger=SimpleLogger(verbose=False))
-    assert len(out) == len(pdf)
+                           pval_fit_method="beta", logger=SimpleLogger(verbose=False))
+    assert len(out) == len(pdf) and (out["pval_fit_method"] == "beta").all()
     for col in ("pval_perm", "pval_beta"):
         p = out[col].to_numpy(float)
         p = p[np.isfinite(p)]
@@ -555,9 +557,9 @@ def test_pooled_lead_grouped_permutations_are_calibrated_under_the_null():
     pos = pd.DataFrame({"chr": "chr1", "start": 150, "end": 150}, index=ids)
     out = map_permutations(gdf, vdf, pdf, pos, None, haplotypes=panel,
                            ancestry_model="dosage", lead_selection="pooled", group_s=pd.Series(groups),
-                           nperm=200, device="cpu", seed=5, window=1000,
+                           nperm=200, device="cpu", seed=5, window=1000, pval_fit_method="beta",
                            logger=SimpleLogger(verbose=False))
-    assert len(out) == n_groups
+    assert len(out) == n_groups and (out["pval_fit_method"] == "beta").all()
     for col in ("pval_perm", "pval_beta"):
         p = out[col].to_numpy(float)
         p = p[np.isfinite(p)]
@@ -575,7 +577,7 @@ def test_pooled_lead_with_ld_aware_reports_the_contrast_at_the_pooled_lead():
     assert 0 <= ld.iloc[0]["pval_diff_ld_anc0_anc1"] <= 1
     # the LD-aware pass runs after the selection and does not touch the test columns
     for col in ("pval_perm", "pval_beta", "pval_nominal", "tstat_pooled", "pval_nominal_pooled"):
-        assert ld.iloc[0][col] == pytest.approx(plain.iloc[0][col])
+        assert ld.iloc[0][col] == pytest.approx(plain.iloc[0][col], nan_ok=True)
 
 
 def test_pooled_lead_validation():
@@ -672,10 +674,12 @@ def test_pooled_lead_null_on_the_identity_permutation_is_the_observed_scan():
     assert int(r2_null.argmax()) == ix_obs
     # the whole null path on the identity permutation
     identity = _FixedPermutations(torch.arange(n).unsqueeze(0))
-    r2_sel, f_sel = _pooled_lead_null(ctx, ctx_p, L, G_sum, y, None, identity, 1, n, projectors_of(rez), None)
-    assert tuple(r2_sel.shape) == tuple(f_sel.shape) == (1,)
+    r2_sel, f_sel, f_win = _pooled_lead_null(ctx, ctx_p, L, G_sum, y, None, identity, 1, n, projectors_of(rez), None)
+    assert tuple(r2_sel.shape) == tuple(f_sel.shape) == tuple(f_win.shape) == (1,)
     assert r2_sel.item() == pytest.approx(r2_obs[ix_obs].item(), rel=1e-4)
     assert f_sel.item() == pytest.approx(f_obs[ix_obs].item(), rel=1e-4)
+    # the window maximum of the same block is the observed scan's maximum F, at least the F at the pooled lead
+    assert f_win.item() == pytest.approx(torch.nan_to_num(f_obs, nan=-1.0).max().item(), rel=1e-4) and f_win.item() >= f_sel.item()
 
 
 def test_pooled_lead_ties_follow_one_rule_and_cannot_move_the_null_statistic():

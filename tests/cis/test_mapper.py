@@ -82,7 +82,7 @@ def test_cis_mapper_calculates_qvalues(monkeypatch, toy_data):
     mapper = _build_mapper(toy_data)
     called = {}
 
-    def fake_calc(res_df, fdr, qvalue_lambda, logger):
+    def fake_calc(res_df, fdr, qvalue_lambda, logger, null_summary=None):
         called["res_df"] = res_df
         called["fdr"] = fdr
         called["qvalue_lambda"] = qvalue_lambda

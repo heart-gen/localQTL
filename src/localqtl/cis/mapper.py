@@ -9,7 +9,7 @@ from .nominal import map_nominal as _map_nominal, map_nominal_loci as _map_nomin
 from .permutations import map_permutations as _map_permutations
 from .independent import map_independent as _map_independent
 from .conditional import map_conditional_dosage as _map_conditional_dosage
-from .postproc import get_significant_pairs as _get_significant_pairs
+from .postproc import get_significant_pairs as _get_significant_pairs, pair_pval_column_of
 
 __all__ = [
     "CisMapper",
@@ -129,6 +129,8 @@ class CisMapper:
             ld_aware: bool = False,
             ld_aware_opts: Optional[dict] = None,
             lead_selection: str = "joint",
+            pval_fit_method: Optional[str] = None,
+            return_null_summary: bool = False,
     ) -> pd.DataFrame:
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
         return _map_permutations(
@@ -157,6 +159,8 @@ class CisMapper:
             ld_aware=ld_aware,
             ld_aware_opts=ld_aware_opts,
             lead_selection=lead_selection,
+            pval_fit_method=pval_fit_method,
+            return_null_summary=return_null_summary,
         )
 
     def map_independent(
@@ -226,12 +230,15 @@ class CisMapper:
     def calculate_qvalues(
             self, perm_df: pd.DataFrame, fdr: float = 0.05,
             qvalue_lambda: Optional[float] = None,
+            null_summary: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
-        """Annotate permutation results with q-values via :func:`calculate_qvalues`."""
+        """Annotate permutation results with q-values via :func:`calculate_qvalues`; ``null_summary`` (the second
+        element of ``map_permutations(..., return_null_summary=True)``) gives the empirical nominal thresholds."""
         return _calculate_qvalues(
             perm_df, fdr=fdr,
             qvalue_lambda=qvalue_lambda,
             logger=self.logger,
+            null_summary=null_summary,
         )
 
     def get_significant_pairs(
@@ -241,9 +248,14 @@ class CisMapper:
             group_s: Optional[pd.Series] = None,
             fdr: float = 0.05,
             columns: Optional[Sequence[str]] = None,
+            pair_pval_col: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Thin wrapper around :func:`get_significant_pairs` using stored configuration."""
+        """Thin wrapper around :func:`get_significant_pairs` using stored configuration.  ``pair_pval_col``
+        defaults to the statistic the permutation table was derived from: ``pval_joint`` for a dosage
+        scan (rows carrying ``fstat_joint``), else ``pval_nominal``."""
         gs = self.group_s if group_s is None else group_s
+        if pair_pval_col is None:
+            pair_pval_col = pair_pval_column_of(res_df)
         if nominal_files is None:
             out_dir = self.out_dir.rstrip("/")
             if not out_dir:
@@ -256,4 +268,5 @@ class CisMapper:
             fdr=fdr,
             columns=columns,
             logger=self.logger,
+            pair_pval_col=pair_pval_col,
         )
