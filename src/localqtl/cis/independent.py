@@ -13,7 +13,7 @@ from .._torch_utils import to_device_tensor
 from ..stats import beta_approx_pval, get_t_pval
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from ..preproc import impute_mean_and_filter, filter_by_maf
-from ..regression_kernels import Residualizer, prep_ctx_for_perm, perm_chunk_r2
+from ..regression_kernels import Residualizer, prep_ctx_for_perm, perm_chunk_r2, resolve_mixed_precision
 from ._permute import PermutationStream, compute_perm_r2_max, freedman_lane, perm_source, projectors_of
 from ._buffer import (
     allocate_result_buffers,
@@ -1694,7 +1694,13 @@ def map_independent(
         One phenotype-specific covariate, appended to the shared covariates for
         the phenotypes it lists (tensorQTL ``paired_covariate_df``); the others
         use ``covariates_df`` alone.  Ungrouped mapping only.
+    mixed_precision : {"fp16", "off"}, optional
+        CUDA autocast mode of the permutation kernels (no effect on CPU).  ``None`` (default)
+        is ``"fp16"`` for the ``main`` scan and ``"off"`` (float32) for an interaction scan,
+        as in :func:`localqtl.cis.map_permutations`.
     """
+    mixed_precision = resolve_mixed_precision(
+        mixed_precision, interaction=(ancestry_model == "interaction" or interaction_covariate is not None))
     device = ("cuda" if (device in ("auto", None) and torch.cuda.is_available())
               else (device if device in ("cuda", "cpu") else "cpu"))
     torch_device = torch.device(device)
@@ -1737,6 +1743,8 @@ def map_independent(
         logger.write(
             f"  * including local ancestry channels (K={K}, preload={'on' if preload_flag else 'off'})"
         )
+    if device == "cuda":
+        logger.write(f"  * mixed precision: {mixed_precision}")
     if ancestry_model == "interaction":
         logger.write("  * ancestry model: interaction (GxH)")
     if interaction_covariate is not None:

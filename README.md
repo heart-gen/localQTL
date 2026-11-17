@@ -697,6 +697,7 @@ perm_annotated = annotate_with_coloc(perm_df, coloc_df)
 * Each genotype SNP is matched to the RFMix segment that covers it (`panel.locus_index(chrom, positions)`; `locus_method="nearest"` with `nearest_tolerance` for locus-level sources); SNPs no segment covers are dropped from the ancestry-aware model.
 * Sample order in `genotype_df`, `phenotype_df`, and `covariates_df` should match `H` (reindex as shown).
 * ``af`` in every output is the in-sample frequency of the counted (``alt``) allele, pooled over samples; ``af_anc{k}`` (dosage model) is the same quantity within ancestry *k*.
+* On a GPU the permutation kernels run under `fp16` autocast for the `main` and `dosage` scans and in float32 for the interaction scans (`ancestry_model="interaction"`, `interaction_covariate`), which do not reproduce the CPU result under `fp16`. `mixed_precision="fp16"` / `"off"` on `map_permutations` and `map_independent` sets the mode explicitly; it has no effect on CPU. See "Mixed precision on GPU" in the user guide.
 * The cis-mapping helpers default to ``preload_haplotypes=True`` so the current chromosome's counts are staged as an int8 tensor on the requested device (GPU or CPU) and windows are sliced there. Override this flag when working under strict memory constraints.
 
 ## Testing

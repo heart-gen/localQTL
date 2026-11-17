@@ -11,6 +11,7 @@ except Exception:
 
 __all__ = [
     "Residualizer",
+    "resolve_mixed_precision",
     "run_batch_regression",
     "run_batch_interaction_regression",
     "run_batch_regression_with_permutations",
@@ -19,6 +20,27 @@ __all__ = [
 ]
 
 _DEFAULT_MIXED_PRECISION = os.environ.get("LOCALQTL_MIXED_PRECISION", "fp16").lower()
+
+
+def resolve_mixed_precision(mixed_precision: str | None = None, *, interaction: bool = False) -> str:
+    """The CUDA autocast mode of a permutation scan: ``"fp16"`` or ``"off"`` (float32).
+
+    An explicit ``mixed_precision`` is returned as given.  Otherwise the environment variable
+    ``LOCALQTL_MIXED_PRECISION`` applies to every scan when it is set, and without it the
+    default depends on the scan: ``"off"`` for an interaction scan (``ancestry_model=
+    "interaction"`` or an ``interaction_covariate``), ``"fp16"`` for the others (``main``,
+    ``dosage``, ``tensorqtl_flavor``).  The interaction scan tests a genotype-by-ancestry (or
+    genotype-by-covariate) product after projecting out the genotype and the ancestry it is
+    built from; under fp16 that nearly collinear projection loses the precision the partial
+    R^2 needs, and the scan stops reproducing the CPU (float32) result.  The mode has no
+    effect on CPU.
+    """
+    if mixed_precision is not None:
+        return str(mixed_precision).lower()
+    env = os.environ.get("LOCALQTL_MIXED_PRECISION")
+    if env:
+        return env.lower()
+    return "off" if interaction else "fp16"
 
 def _resolve_amp_dtype(device: torch.device, mode: str | None) -> torch.dtype | None:
     if device.type != "cuda":

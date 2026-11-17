@@ -25,6 +25,7 @@ from ..regression_kernels import (
     dosage_perm_chunk_f_at_and_max,
     prep_ctx_for_perm,
     perm_chunk_r2_argmax,
+    resolve_mixed_precision,
 )
 from ._permute import PermutationStream, compute_perm_r2_max, freedman_lane, perm_source, projectors_of
 from ._buffer import (
@@ -1384,6 +1385,13 @@ def map_permutations(
     paired_covariate_df : DataFrame (phenotypes x samples), optional
         One phenotype-specific covariate added to the shared covariates for the
         phenotypes it lists (tensorQTL ``paired_covariate_df``); ungrouped only.
+    mixed_precision : {"fp16", "off"}, optional
+        CUDA autocast mode of the permutation kernels (no effect on CPU).  ``None`` (default)
+        is ``"fp16"`` for the ``main`` and ``dosage`` scans and ``"off"`` (float32) for an
+        interaction scan (``ancestry_model="interaction"`` or ``interaction_covariate``),
+        which does not reproduce the CPU result under fp16; the environment variable
+        ``LOCALQTL_MIXED_PRECISION`` replaces that default for every scan
+        (:func:`localqtl.regression_kernels.resolve_mixed_precision`).
     ancestry_model : {"main", "interaction", "dosage"}
         ``"dosage"`` runs the ancestry-specific dosage scan: the per-variant
         statistic is the joint Wald F over the K ancestry effects and the
@@ -1448,6 +1456,10 @@ def map_permutations(
     # Header (tensorQTL-style)
     logger.write("cis-QTL mapping: permutation scan (top per phenotype)")
     logger.write(f"  * device: {device}")
+    mixed_precision = resolve_mixed_precision(
+        mixed_precision, interaction=(ancestry_model == "interaction" or interaction_covariate is not None))
+    if device == "cuda":
+        logger.write(f"  * mixed precision: {mixed_precision}")
     logger.write(f"  * {phenotype_df.shape[1]} samples")
     logger.write(f"  * {phenotype_df.shape[0]} phenotypes")
     logger.write(f"  * {variant_df.shape[0]} variants")

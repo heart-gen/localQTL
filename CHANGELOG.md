@@ -10,6 +10,31 @@ To release: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`, u
 compare links at the bottom, merge, and only then tag `vX.Y.Z`. The release workflow builds
 the GitHub release body from that section and stops if the tag has none.
 
+## [Unreleased]
+
+### Changed
+
+- **On CUDA the interaction permutation scans run in float32 by default.** With
+  `mixed_precision=None`, `map_permutations` and `map_independent` now use `"off"` for an
+  interaction scan (`ancestry_model="interaction"` or `interaction_covariate`) and keep `"fp16"`
+  for the `main`, `dosage` and `tensorqtl_flavor` scans
+  (`localqtl.regression_kernels.resolve_mixed_precision`); before, every scan defaulted to
+  `"fp16"`. An explicit `mixed_precision` is honoured for any scan, and the environment variable
+  `LOCALQTL_MIXED_PRECISION` still replaces the default of every scan. `CisMapper` and the
+  command line, which do not expose the argument, follow the new defaults. The resolved mode is
+  written to the log header on CUDA. Motivation (localQTL benchmark, device parity of
+  2026-11-15: one chromosome, 585 genes, 10,000 permutations, CUDA against the CPU scan with the
+  same seed): under `fp16` the `main` and `dosage` scans reproduce the CPU scan (identical lead
+  in 100 % and 99.7 % of phenotypes, Spearman of `pval_perm` 1.000), the interaction scan does
+  not (identical lead in 95.0 %, Spearman .979, 5 eGenes against 1), and with autocast off it
+  reproduces it exactly. The interaction scan tests a genotype-by-ancestry product after
+  projecting out the genotype and the ancestry it is built from, a nearly collinear projection
+  that half precision does not carry. **Interaction permutation scans run on a GPU with 0.4.5
+  or earlier under the default should be rerun**; CPU results and the `main` and `dosage`
+  scans are unaffected. The genotype-by-covariate scan shares the kernel and takes the same
+  default; it was not measured separately. Documented under "Mixed precision on GPU" in the
+  user guide.
+
 ## [0.4.5] - 2026-11-10
 
 ### Changed

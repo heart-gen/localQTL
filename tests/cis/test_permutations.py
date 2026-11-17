@@ -803,3 +803,36 @@ def test_grouped_scan_reports_a_consistent_standard_error_for_a_negative_effect(
     assert r["phenotype_id"] == "geneB" and r["variant_id"] == "v3" and r["slope"] < 0
     np.testing.assert_allclose(r["slope"] / r["slope_se"], r["tstat"], rtol=1e-4)
     np.testing.assert_allclose(r["slope_se"], u["slope_se"], rtol=1e-3)
+
+
+@pytest.mark.parametrize("scan, expected", [("main", "fp16"), ("interaction", "off"), ("covariate_interaction", "off")])
+def test_permutation_scan_passes_its_default_mixed_precision_to_the_kernels(
+        monkeypatch, toy_data, toy_hap_data_2anc, scan, expected):
+    """``mixed_precision=None`` is fp16 for the main scan and off for the interaction scans
+    (they do not reproduce the CPU result under fp16 on CUDA); an explicit mode is passed on."""
+    from src.localqtl.cis import permutations as perm_mod
+
+    monkeypatch.delenv("LOCALQTL_MIXED_PRECISION", raising=False)
+    seen = []
+    orig = perm_mod.compute_perm_r2_max
+
+    def wrapped(*args, **kwargs):
+        seen.append(kwargs.get("mixed_precision"))
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(perm_mod, "compute_perm_r2_max", wrapped)
+    kw = dict(genotype_df=toy_data["genotype_df"], variant_df=toy_data["variant_df"],
+              phenotype_df=toy_data["phenotype_df"], phenotype_pos_df=toy_data["phenotype_pos_df"],
+              device="cpu", nperm=4, seed=123, logger=SimpleLogger(verbose=False))
+    if scan == "interaction":
+        kw.update(haplotypes=toy_hap_data_2anc["haplotypes"], loci_df=toy_hap_data_2anc["loci_df"],
+                  ancestry_model="interaction")
+    elif scan == "covariate_interaction":
+        kw.update(covariates_df=pd.DataFrame({"cov1": [0.1, 0.2, 0.3, 0.4], "cov2": [1.0, 0.5, -0.5, -1.0]},
+                                             index=toy_data["samples"]), interaction_covariate="cov1")
+    map_permutations(**kw)
+    assert seen and set(seen) == {expected}
+
+    seen.clear()
+    map_permutations(**kw, mixed_precision="fp16")
+    assert seen and set(seen) == {"fp16"}

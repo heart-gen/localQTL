@@ -261,3 +261,20 @@ def test_single_predictor_kernel_standard_error_is_positive_at_a_zero_effect():
                                                             device="cpu")
     assert b.item() == 0.0 and t.item() == 0.0
     assert se.item() == pytest.approx(float(np.sqrt(n / (n - 2) / n)), rel=1e-5)
+
+
+def test_mixed_precision_default_is_fp16_except_for_interaction_scans(monkeypatch):
+    from src.localqtl.regression_kernels import resolve_mixed_precision
+
+    monkeypatch.delenv("LOCALQTL_MIXED_PRECISION", raising=False)
+    assert resolve_mixed_precision(None) == "fp16"
+    assert resolve_mixed_precision(None, interaction=True) == "off"
+    # an explicit mode wins for every scan
+    assert resolve_mixed_precision("fp16", interaction=True) == "fp16"
+    assert resolve_mixed_precision("OFF") == "off"
+    # the environment variable replaces the default of every scan, not an explicit mode
+    monkeypatch.setenv("LOCALQTL_MIXED_PRECISION", "off")
+    assert resolve_mixed_precision(None) == "off"
+    monkeypatch.setenv("LOCALQTL_MIXED_PRECISION", "fp16")
+    assert resolve_mixed_precision(None, interaction=True) == "fp16"
+    assert resolve_mixed_precision("off", interaction=True) == "off"
