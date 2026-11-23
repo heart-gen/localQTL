@@ -32,7 +32,8 @@ documentation-only call-outs for common production workflows:
   when CUDA devices are unavailable (``localqtl.utils.pick_device`` drives
   device selection). The permutation kernels run under ``fp16`` autocast for the
   ``main`` and ``dosage`` scans and in float32 for the interaction scans
-  (:ref:`mixed-precision`). See the `feature summary <../README.md#features>`_ for a
+  (:ref:`mixed-precision`); permutations are drawn per phenotype or once for the
+  run (:ref:`permutation-indices`). See the `feature summary <../README.md#features>`_ for a
   concise checklist.
 - **Modular cis-QTL mapping helpers** such as
   :func:`localqtl.cis.map_nominal`, :func:`localqtl.cis.map_permutations`, and

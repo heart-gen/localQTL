@@ -17,7 +17,8 @@ the GitHub release body from that section and stops if the tag has none.
 - **`perm_indices_mode="shared"`: one set of permutations for the run.** `map_permutations`,
   `map_independent` and the `CisMapper` methods accept it. The default (`"generator"`) is
   unchanged: every phenotype has its own seeded stream, drawn on the host one permutation at a
-  time, a cost that grows with the number of phenotypes and that a GPU does not speed up. With
+  time, a cost that grows with the number of phenotypes and that a GPU does not speed up (0.4.5
+  on an A100, interaction scan of 150 genes with 10,000 permutations: 49 % of the wall). With
   `"shared"` the run draws `nperm` permutations once, seeded from `seed`, and permutes every
   phenotype with them (tensorQTL's design; with `tensorqtl_flavor=True` the scheme is tensorQTL's
   in full). Each phenotype's permutation p-value is as valid as before; the Monte Carlo error of

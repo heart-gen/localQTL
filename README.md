@@ -698,6 +698,7 @@ perm_annotated = annotate_with_coloc(perm_df, coloc_df)
 * Sample order in `genotype_df`, `phenotype_df`, and `covariates_df` should match `H` (reindex as shown).
 * ``af`` in every output is the in-sample frequency of the counted (``alt``) allele, pooled over samples; ``af_anc{k}`` (dosage model) is the same quantity within ancestry *k*.
 * On a GPU the permutation kernels run under `fp16` autocast for the `main` and `dosage` scans and in float32 for the interaction scans (`ancestry_model="interaction"`, `interaction_covariate`), which do not reproduce the CPU result under `fp16`. `mixed_precision="fp16"` / `"off"` on `map_permutations` and `map_independent` sets the mode explicitly; it has no effect on CPU. See "Mixed precision on GPU" in the user guide.
+* Permutations are drawn per phenotype by default (each phenotype has its own seeded stream). `perm_indices_mode="shared"` on `map_permutations` and `map_independent` draws one seeded set for the run and permutes every phenotype with it, as tensorQTL does: the cost of drawing permutations no longer grows with the number of phenotypes, and the Monte Carlo error of the p-values is shared across phenotypes instead of independent. See "Permutation indices: per phenotype or shared" in the user guide.
 * The cis-mapping helpers default to ``preload_haplotypes=True`` so the current chromosome's counts are staged as an int8 tensor on the requested device (GPU or CPU) and windows are sliced there. Override this flag when working under strict memory constraints.
 
 ## Testing
