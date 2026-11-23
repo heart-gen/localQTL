@@ -942,7 +942,10 @@ from ``nperm`` permutations of its own values either way.  They differ in two th
 
 *Cost.*  The per-phenotype streams draw ``nperm`` permutations for every phenotype on the
 host, a cost that grows with the number of phenotypes and that a GPU does not speed up.  The
-shared set is drawn once.
+shared set is drawn once.  Measured with 0.4.6 on one chromosome of a brain expression cohort
+(585 genes, 10,000 permutations, interaction scan, wall per gene): 138 ms with the
+per-phenotype streams and 60 ms with the shared set on an A100, where the draw is about half
+of the wall; 364 ms and 261 ms on 4 CPU threads.
 
 *Monte Carlo error.*  With per-phenotype streams the sampling error of ``pval_perm`` is
 independent across phenotypes.  With the shared set it is common to all of them: the
