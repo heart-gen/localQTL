@@ -21,6 +21,8 @@ Usage:
       --nperm 200 \
       --maf 0.00 \
       --device auto \
+      --ancestry-model interaction \
+      --perm-indices-mode generator \
       --csv bench_perm_results.csv
 
 Notes:
@@ -217,6 +219,12 @@ def main():
     p.add_argument("--maf", type=float, default=0.0)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--beta_approx", action="store_true", help="Also compute Beta-approx p-values.")
+    p.add_argument("--ancestry-model", type=str, default="main", choices=["main", "interaction", "dosage"],
+                   help="Model of the scans with haplotypes.")
+    p.add_argument("--perm-indices-mode", type=str, default="generator",
+                   choices=["generator", "cpu_pinned", "gpu", "shared"],
+                   help="Per-phenotype permutation streams, or one shared set for the run.")
+    p.add_argument("--seed", type=int, default=13)
     p.add_argument("--csv", type=str, default="")
     args = p.parse_args()
 
@@ -246,6 +254,7 @@ def main():
                     phenotype_pos_df=pheno_pos, covariates_df=covs,
                     maf_threshold=args.maf, window=window, nperm=args.nperm,
                     device=device, beta_approx=args.beta_approx,
+                    seed=args.seed, perm_indices_mode=args.perm_indices_mode,
                 )
                 t_func = time.perf_counter() - t0
                 print(f"map_permutations (no H): {t_func:.3f} s, rows={len(df_func):,}")
@@ -261,7 +270,8 @@ def main():
                     device=device, window=window, maf_threshold=args.maf,
                 )
                 t0 = time.perf_counter()
-                df_class = mapper.map_permutations(nperm=args.nperm, beta_approx=args.beta_approx)
+                df_class = mapper.map_permutations(nperm=args.nperm, beta_approx=args.beta_approx, seed=args.seed,
+                                                   perm_indices_mode=args.perm_indices_mode)
                 t_class = time.perf_counter() - t0
                 print(f"CisMapper.map_permutations (no H): {t_class:.3f} s, rows={len(df_class):,}")
             except Exception as e:
@@ -309,6 +319,8 @@ def main():
                         phenotype_pos_df=pheno_pos, covariates_df=covs, haplotypes=H,
                         loci_df=None, maf_threshold=args.maf, window=window, nperm=args.nperm,
                         device=device, beta_approx=args.beta_approx,
+                        seed=args.seed, ancestry_model=args.ancestry_model,
+                        perm_indices_mode=args.perm_indices_mode,
                     )
                     t_func_h = time.perf_counter() - t0
                     print(f"map_permutations (with H): {t_func_h:.3f} s, rows={len(df_func_h):,}")
@@ -325,7 +337,9 @@ def main():
                         maf_threshold=args.maf,
                     )
                     t0 = time.perf_counter()
-                    df_class_h = mapper_h.map_permutations(nperm=args.nperm, beta_approx=args.beta_approx)
+                    df_class_h = mapper_h.map_permutations(nperm=args.nperm, beta_approx=args.beta_approx, seed=args.seed,
+                                                           ancestry_model=args.ancestry_model,
+                                                           perm_indices_mode=args.perm_indices_mode)
                     t_class_h = time.perf_counter() - t0
                     print(f"CisMapper.map_permutations (with H): {t_class_h:.3f} s, rows={len(df_class_h):,}")
                 except Exception as e:

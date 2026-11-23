@@ -14,7 +14,10 @@ from ..stats import beta_approx_pval, get_t_pval
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from ..preproc import impute_mean_and_filter, filter_by_maf
 from ..regression_kernels import Residualizer, prep_ctx_for_perm, perm_chunk_r2, resolve_mixed_precision
-from ._permute import PermutationStream, compute_perm_r2_max, freedman_lane, perm_source, projectors_of
+from ._permute import (
+    PermutationStream, compute_perm_r2_max, freedman_lane, perm_source, projectors_of,
+    resolve_perm_indices_mode,
+)
 from ._buffer import (
     allocate_result_buffers,
     ensure_capacity, write_row,
@@ -117,9 +120,7 @@ def _run_independent_core(
     progress_interval = max(1, int(total_items) // 10) if total_items else 0
     chrom_label = f"{chrom}" if chrom is not None else "all chromosomes"
 
-    perm_indices_mode = (perm_indices_mode or "generator").lower()
-    if perm_indices_mode not in {"generator", "cpu_pinned", "gpu"}:
-        perm_indices_mode = "generator"
+    perm_indices_mode = resolve_perm_indices_mode(perm_indices_mode)
     stage1_cap = None
     if nperm_stage1 is not None and nperm_stage1 > 0:
         stage1_cap = int(nperm_stage1)
@@ -790,9 +791,7 @@ def _run_independent_core_group(
     progress_interval = max(1, int(total_items) // 10) if total_items else 0
     chrom_label = f"{chrom}" if chrom is not None else "all chromosomes"
 
-    perm_indices_mode = (perm_indices_mode or "generator").lower()
-    if perm_indices_mode not in {"generator", "cpu_pinned", "gpu"}:
-        perm_indices_mode = "generator"
+    perm_indices_mode = resolve_perm_indices_mode(perm_indices_mode)
     stage1_cap = None
     if nperm_stage1 is not None and nperm_stage1 > 0:
         stage1_cap = int(nperm_stage1)
@@ -1769,6 +1768,10 @@ def map_independent(
 
     if nperm is None or nperm <= 0:
         raise ValueError("nperm must be a positive integer for map_independent.")
+    perm_indices_mode = resolve_perm_indices_mode(perm_indices_mode, n_samples=int(ig.phenotype_df.shape[1]),
+                                                  nperm=nperm, seed=seed, device=device)
+    if not isinstance(perm_indices_mode, str):
+        logger.write("  * permutation indices: one shared set for every phenotype")
 
     covariates_use = covariates_df
     if isinstance(interaction_covariate, str) and covariates_df is not None:

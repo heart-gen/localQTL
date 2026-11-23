@@ -131,6 +131,7 @@ class CisMapper:
             lead_selection: str = "joint",
             pval_fit_method: Optional[str] = None,
             return_null_summary: bool = False,
+            perm_indices_mode: str = "generator",
     ) -> pd.DataFrame:
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
         return _map_permutations(
@@ -161,6 +162,7 @@ class CisMapper:
             lead_selection=lead_selection,
             pval_fit_method=pval_fit_method,
             return_null_summary=return_null_summary,
+            perm_indices_mode=perm_indices_mode,
         )
 
     def map_independent(
@@ -172,6 +174,7 @@ class CisMapper:
             ancestry_model: str = "main",
             interaction_covariate: Optional[object] = None,
             paired_covariate_df: Optional[pd.DataFrame] = None,
+            perm_indices_mode: str = "generator",
     ) -> pd.DataFrame:
         mt = self.maf_threshold if maf_threshold is None else maf_threshold
         return _map_independent(
@@ -201,6 +204,7 @@ class CisMapper:
             ancestry_model=ancestry_model,
             interaction_covariate=interaction_covariate,
             paired_covariate_df=paired_covariate_df,
+            perm_indices_mode=perm_indices_mode,
         )
 
     def map_conditional_dosage(

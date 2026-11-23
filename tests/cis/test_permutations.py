@@ -836,3 +836,183 @@ def test_permutation_scan_passes_its_default_mixed_precision_to_the_kernels(
     seen.clear()
     map_permutations(**kw, mixed_precision="fp16")
     assert seen and set(seen) == {"fp16"}
+
+
+# ---- the interaction scan against a brute-force replay; the shared permutation set ----
+
+def _interaction_cohort(seed=21, n=90, m=9, P=6, n_anc=2, k=3):
+    from tests.conftest import make_random_panel
+    rng = np.random.default_rng(seed)
+    samples = [f"S{i}" for i in range(n)]
+    G = rng.integers(0, 3, size=(m, n)).astype(np.float32)
+    gdf = pd.DataFrame(G, index=[f"v{i}" for i in range(m)], columns=samples)
+    vdf = pd.DataFrame({"chrom": "chr1", "pos": 100 + 10 * np.arange(m)}, index=gdf.index)
+    panel, admix = make_random_panel(vdf, samples, seed=seed + 1, n_anc=n_anc)
+    Y = rng.normal(size=(P, n))
+    Y[0] += 0.9 * G[4] * admix[4, :, 0]                              # one phenotype with a g x ancestry effect
+    pdf = pd.DataFrame(Y, index=[f"g{i}" for i in range(P)], columns=samples).astype(np.float32)
+    pos = pd.DataFrame({"chr": "chr1", "start": 140, "end": 140}, index=pdf.index)
+    cov = pd.DataFrame(rng.normal(size=(n, k)), index=samples, columns=[f"c{i}" for i in range(k)])
+    return dict(genotype_df=gdf, variant_df=vdf, phenotype_df=pdf, phenotype_pos_df=pos, covariates_df=cov,
+                panel=panel, admix=admix, samples=samples, G=G)
+
+
+class _InteractionReference:
+    """float64 reference of the interaction scan: each g*h_k tested given [g, h_1..h_pH] and the covariates,
+    one (variant, ancestry) at a time; Freedman-Lane permutations from a given index matrix."""
+
+    def __init__(self, d):
+        G = d["G"].astype(np.float64)
+        n = G.shape[1]
+        pH = d["admix"].shape[2] - 1
+        self.Q = np.linalg.qr(np.column_stack([np.ones(n), d["covariates_df"].to_numpy(np.float64)]))[0]
+        self.designs = []
+        for v in range(G.shape[0]):
+            H = d["admix"][v, :, :pH].astype(np.float64)
+            QN = np.linalg.qr(self.M(np.column_stack([G[v], H])))[0]
+            X = self.M(G[v][:, None] * H)
+            self.designs.append((QN, X - QN @ (QN.T @ X)))
+        self.pH, self.n = pH, n
+        self.dof = n - self.Q.shape[1] - (2 + pH)
+
+    def M(self, a):
+        return a - self.Q @ (self.Q.T @ a)
+
+    def r2(self, Y):
+        """(n, c) residualised phenotypes -> (m, pH, c)."""
+        out = np.empty((len(self.designs), self.pH, Y.shape[1]))
+        for v, (QN, Xo) in enumerate(self.designs):
+            Yo = Y - QN @ (QN.T @ Y)
+            out[v] = (Xo.T @ Yo) ** 2 / ((Xo * Xo).sum(0)[:, None] * (Yo * Yo).sum(0)[None, :])
+        return out
+
+    def scan(self, y, idx):
+        """Observed (m, pH) R^2, the per-ancestry slopes (m, pH) and the null maxima of one phenotype."""
+        yr = self.M(np.asarray(y, dtype=np.float64))
+        slopes = np.stack([(Xo.T @ yr) / (Xo * Xo).sum(0) for _, Xo in self.designs])
+        null = self.r2(self.M(yr[idx].T)).max(axis=(0, 1))
+        return self.r2(yr[:, None])[:, :, 0], slopes, null
+
+
+def _stream_indices(n, nperm, seed):
+    from src.localqtl.cis._permute import PermutationStream
+    s = PermutationStream(n_samples=n, nperm=nperm, device=torch.device("cpu"), chunk_size=64, seed=seed)
+    return torch.cat(list(s.iter_chunks(nperm))).numpy()
+
+
+@pytest.mark.parametrize("n_anc", [2, 3])
+def test_interaction_scan_matches_a_brute_force_replay(n_anc):
+    """The single-pass interaction scan reproduces, for every phenotype, the lead (variant, ancestry), its
+    R^2, the per-ancestry slopes at the lead and the permutation p-value of a float64 scan that tests one
+    (variant, ancestry) at a time on the same permutations."""
+    from src.localqtl.utils import subseed
+    d = _interaction_cohort(n_anc=n_anc)
+    nperm, seed = 300, 5
+    res = _perm(d, ancestry_model="interaction", nperm=nperm, seed=seed, perm_chunk=128).set_index("phenotype_id")
+    ref = _InteractionReference(d)
+    assert len(res) == d["phenotype_df"].shape[0]
+    for pid, y in d["phenotype_df"].iterrows():
+        obs, slopes, null = ref.scan(y.to_numpy(), _stream_indices(ref.n, nperm, subseed(seed, pid)))
+        v, a = np.unravel_index(np.argmax(obs), obs.shape)
+        r = res.loc[pid]
+        assert r["variant_id"] == f"v{v}", pid
+        np.testing.assert_allclose(r["r2_nominal"], obs[v, a], rtol=5e-4)
+        np.testing.assert_allclose(r["slope"], slopes[v, a], rtol=2e-3)
+        np.testing.assert_allclose([r[f"slope_gxh_anc{k}"] for k in range(ref.pH)], slopes[v], rtol=2e-3, atol=1e-5)
+        np.testing.assert_allclose(r["pval_perm"], (np.sum(null >= obs[v, a]) + 1) / (nperm + 1), atol=1.5 / (nperm + 1))
+    assert res.loc["g0", "variant_id"] == "v4" and res.loc["g0", "pval_perm"] < 0.05
+
+
+@pytest.mark.parametrize("n_anc", [2, 3])
+def test_interaction_scan_grouped_matches_a_brute_force_replay(n_anc):
+    """Grouped: the lead is the best (phenotype, variant, ancestry) of the group and every phenotype of the
+    group is permuted with the group's permutations, the null being the maximum over all of them."""
+    from src.localqtl.utils import subseed
+    d = _interaction_cohort(n_anc=n_anc, seed=33)
+    nperm, seed = 300, 9
+    ids = list(d["phenotype_df"].index)
+    group_s = pd.Series({pid: f"grp{i // 3}" for i, pid in enumerate(ids)})
+    res = _perm(d, ancestry_model="interaction", nperm=nperm, seed=seed, group_s=group_s, perm_chunk=128).set_index("group_id")
+    ref = _InteractionReference(d)
+    assert set(res.index) == set(group_s)
+    for gid, members in group_s.groupby(group_s).groups.items():
+        idx = _stream_indices(ref.n, nperm, subseed(seed, f"group:{gid}"))
+        scans = {pid: ref.scan(d["phenotype_df"].loc[pid].to_numpy(), idx) for pid in members}
+        best = max(members, key=lambda pid: scans[pid][0].max())
+        obs, slopes, _ = scans[best]
+        v, a = np.unravel_index(np.argmax(obs), obs.shape)
+        null = np.max([scans[pid][2] for pid in members], axis=0)
+        r = res.loc[gid]
+        assert r["phenotype_id"] == best and r["variant_id"] == f"v{v}", gid
+        np.testing.assert_allclose(r["slope"], slopes[v, a], rtol=2e-3)
+        np.testing.assert_allclose(r["pval_perm"], (np.sum(null >= obs[v, a]) + 1) / (nperm + 1), atol=1.5 / (nperm + 1))
+
+
+def test_shared_permutations_are_one_seeded_set():
+    from src.localqtl.cis._permute import PermutationStream, SharedPermutations, resolve_perm_indices_mode
+    n = 23
+    sp = SharedPermutations(n, seed=7, device="cpu", nperm=40)
+    assert len(sp) == 40
+    full = sp.take(0, 40).clone()
+    assert (full.sort(dim=1).values == torch.arange(n)).all()                      # every row is a permutation
+    assert torch.equal(SharedPermutations(n, seed=7, device="cpu").take(0, 40), full)   # the seed fixes the set,
+    assert torch.equal(sp.take(10, 5), full[10:15])                                # whatever is asked for at a time
+    assert torch.equal(sp.take(30, 25)[:10], full[30:40]) and len(sp) == 55        # and extending keeps the rows
+    # streams of different phenotypes (seeds) and chunk sizes hand out the same rows
+    a = torch.cat(list(PermutationStream(n, 40, torch.device("cpu"), chunk_size=16, seed=1, mode=sp).iter_chunks(40)))
+    b = torch.cat(list(PermutationStream(n, 40, torch.device("cpu"), chunk_size=7, seed=2, mode=sp).iter_chunks(40)))
+    assert torch.equal(a, full) and torch.equal(b, full)
+    assert resolve_perm_indices_mode(sp) is sp
+    assert isinstance(resolve_perm_indices_mode("shared", n_samples=n, nperm=3, seed=7), SharedPermutations)
+    assert resolve_perm_indices_mode(None) == "generator" and resolve_perm_indices_mode("GPU") == "gpu"
+    assert resolve_perm_indices_mode("no-such-mode") == "generator"
+    with pytest.raises(ValueError, match="samples"):
+        PermutationStream(n + 1, 4, torch.device("cpu"), chunk_size=4, mode=sp)
+    with pytest.raises(ValueError, match="SharedPermutations"):
+        PermutationStream(n, 4, torch.device("cpu"), chunk_size=4, mode="shared")
+    with pytest.raises(ValueError, match="shared"):
+        resolve_perm_indices_mode("shared")
+
+
+def test_shared_mode_permutes_every_phenotype_with_the_same_set():
+    """``perm_indices_mode="shared"``: each phenotype's p-value is the brute-force one on the run's single
+    index matrix (seeded by the run seed, not by the phenotype), reruns are identical, and the default
+    per-phenotype streams give other p-values for the same observed statistics."""
+    from src.localqtl.cis._permute import SharedPermutations
+    d = _interaction_cohort(seed=41)
+    nperm, seed = 300, 11
+    kw = dict(ancestry_model="interaction", nperm=nperm, seed=seed, perm_chunk=128)
+    res = _perm(d, perm_indices_mode="shared", **kw).set_index("phenotype_id")
+    ref = _InteractionReference(d)
+    idx = SharedPermutations(ref.n, seed, "cpu").take(0, nperm).numpy()
+    for pid, y in d["phenotype_df"].iterrows():
+        obs, _, null = ref.scan(y.to_numpy(), idx)
+        np.testing.assert_allclose(res.loc[pid, "pval_perm"], (np.sum(null >= obs.max()) + 1) / (nperm + 1),
+                                   atol=1.5 / (nperm + 1))
+    again = _perm(d, perm_indices_mode="shared", **kw).set_index("phenotype_id")
+    pd.testing.assert_frame_equal(res, again)
+    own = _perm(d, **kw).set_index("phenotype_id")
+    assert (own["variant_id"] == res["variant_id"]).all()
+    np.testing.assert_allclose(own["r2_nominal"], res["r2_nominal"])
+    assert not np.allclose(own["pval_perm"], res["pval_perm"])
+
+
+def test_shared_mode_reaches_the_other_scans():
+    """The shared set is accepted by the scans without local ancestry, the grouped scan and map_independent."""
+    from src.localqtl.cis.independent import map_independent
+    d = _interaction_cohort(seed=52)
+    base = dict(device="cpu", window=1000, logger=SimpleLogger(verbose=False), nperm=100, seed=3, perm_indices_mode="shared")
+    args = (d["genotype_df"], d["variant_df"], d["phenotype_df"], d["phenotype_pos_df"], d["covariates_df"])
+    plain = map_permutations(*args, **base)
+    flavor = map_permutations(*args, tensorqtl_flavor=True, **base)
+    group_s = pd.Series({pid: f"grp{i // 3}" for i, pid in enumerate(d["phenotype_df"].index)})
+    grouped = map_permutations(*args, haplotypes=d["panel"], group_s=group_s, **base)
+    assert len(plain) == len(flavor) == 6 and len(grouped) == 2
+    for df in (plain, flavor, grouped):
+        assert df["pval_perm"].between(0, 1, inclusive="right").all()
+    cis_df = plain.copy()
+    cis_df["qval"] = 0.01
+    ind = [map_independent(d["genotype_df"], d["variant_df"], cis_df, d["phenotype_df"], d["phenotype_pos_df"],
+                           d["covariates_df"], **base) for _ in range(2)]
+    assert len(ind[0]) >= len(cis_df)
+    pd.testing.assert_frame_equal(ind[0], ind[1])

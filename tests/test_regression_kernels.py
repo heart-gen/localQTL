@@ -278,3 +278,109 @@ def test_mixed_precision_default_is_fp16_except_for_interaction_scans(monkeypatc
     monkeypatch.setenv("LOCALQTL_MIXED_PRECISION", "fp16")
     assert resolve_mixed_precision(None, interaction=True) == "fp16"
     assert resolve_mixed_precision("off", interaction=True) == "off"
+
+
+# ---- permutation kernel with nuisance columns (prep_ctx_for_perm / perm_chunk_r2) ----
+
+def _partial_reference(y, x, H, dof):
+    """float64 least squares: partial R^2, slope, se and t of ``x`` for ``y`` given the columns of ``H``."""
+    y, x, H = (np.asarray(a, dtype=np.float64) for a in (y, x, H))
+    ry = y - H @ np.linalg.lstsq(H, y, rcond=None)[0]
+    rx = x - H @ np.linalg.lstsq(H, x, rcond=None)[0]
+    xy, xx, yy = rx @ ry, rx @ rx, ry @ ry
+    beta = xy / xx
+    se = np.sqrt((yy - beta * xy) / dof / xx)
+    return xy * xy / (xx * yy), beta, se, beta / se
+
+
+def _nuisance_design(seed=0, m=6, n=50, pH=2, q=1, c=7):
+    g = torch.Generator().manual_seed(seed)
+    X = torch.randn(m, n, q, generator=g)
+    H = torch.randn(m, n, pH, generator=g)
+    X = X + 0.6 * H[:, :, :1]                                    # the tested column leans on the nuisance
+    y = torch.randn(n, generator=g) + 0.5 * X[0, :, 0]
+    return y, X, H, torch.randn(n, c, generator=g)
+
+
+def test_nuisance_kernel_matches_least_squares():
+    """Nominal statistics and the partial R^2 of every permuted phenotype equal a float64 least-squares fit
+    of each variant, and the maximum over variants is what the chunk kernel returns."""
+    from src.localqtl import regression_kernels as rk
+    y, X, H, Yp = _nuisance_design()
+    x = X[:, :, 0].contiguous()
+    m, n, pH = H.shape
+    k_eff = 1
+    dof = n - k_eff - (1 + pH)
+    ctx, b, s, t = rk.prep_ctx_for_perm(y, x, H, k_eff)
+    assert b.shape == s.shape == t.shape == (m, 1) and ctx["dof"] == dof and bool(ctx["tested"].all())
+    R2 = rk._perm_chunk_r2_block(ctx, H, x, Yp)
+    assert R2.shape == (m, Yp.shape[1])
+    for v in range(m):
+        _, beta, se, tval = _partial_reference(y, x[v], H[v], dof)
+        np.testing.assert_allclose([b[v, 0], s[v, 0], t[v, 0]], [beta, se, tval], rtol=2e-4)
+        for j in range(Yp.shape[1]):
+            np.testing.assert_allclose(R2[v, j], _partial_reference(Yp[:, j], x[v], H[v], dof)[0], rtol=2e-4, atol=1e-7)
+    torch.testing.assert_close(rk.perm_chunk_r2(ctx, H, x, Yp), R2.amax(dim=0))
+    r2_max, ix = rk.perm_chunk_r2_argmax(ctx, H, x, Yp)
+    assert ix.tolist() == R2.argmax(dim=0).tolist()
+    # the one-call form goes through the same kernel
+    b2, s2, t2, r2_perm = rk.run_batch_regression_with_permutations(y=y, G=x, H=H, y_perm=Yp, k_eff=k_eff, device="cpu")
+    torch.testing.assert_close(b2, b)
+    torch.testing.assert_close(t2, t)
+    torch.testing.assert_close(r2_perm, R2.amax(dim=0))
+
+
+def test_nuisance_kernel_does_not_test_a_column_collinear_with_the_nuisance():
+    """A tested column that is a combination of the nuisance columns (g*h = c*g when every carrier has the
+    same ancestry) has NaN nominal statistics and a null R^2 of 0, so it is never a lead and never a null
+    maximum; the other variants are unaffected."""
+    from src.localqtl import regression_kernels as rk
+    y, X, H, Yp = _nuisance_design(seed=3)
+    x = X[:, :, 0].clone()
+    x[2] = 2.0 * H[2, :, 0] - 0.5 * H[2, :, 1]
+    m, n, pH = H.shape
+    dof = n - 1 - (1 + pH)
+    ctx, b, s, t = rk.prep_ctx_for_perm(y, x, H, 1)
+    assert ctx["tested"].tolist() == [True, True, False, True, True, True]
+    assert torch.isnan(b[2]).all() and torch.isnan(s[2]).all() and torch.isnan(t[2]).all()
+    R2 = rk._perm_chunk_r2_block(ctx, H, x, Yp)
+    assert float(R2[2].abs().max()) == 0.0 and bool(torch.isfinite(R2).all())
+    for v in (0, 1, 3, 4, 5):
+        np.testing.assert_allclose(b[v, 0], _partial_reference(y, x[v], H[v], dof)[1], rtol=2e-4)
+        np.testing.assert_allclose(R2[v, 0], _partial_reference(Yp[:, 0], x[v], H[v], dof)[0], rtol=2e-4, atol=1e-7)
+
+
+def test_nuisance_kernel_with_a_constant_nuisance_column():
+    """A nuisance column that is zero after residualisation (no local-ancestry variation at the variant)
+    makes H'H singular: the factorisation falls back to its regularised form and the statistic is the one
+    of the remaining nuisance columns."""
+    from src.localqtl import regression_kernels as rk
+    y, X, H, Yp = _nuisance_design(seed=5)
+    x = X[:, :, 0].contiguous()
+    H = H.clone()
+    H[1, :, 1] = 0.0
+    m, n, pH = H.shape
+    ctx, b, s, t = rk.prep_ctx_for_perm(y, x, H, 1)
+    R2 = rk._perm_chunk_r2_block(ctx, H, x, Yp)
+    assert bool(torch.isfinite(b).all()) and bool(torch.isfinite(R2).all())
+    ref_r2, ref_b, _, _ = _partial_reference(Yp[:, 0], x[1], H[1, :, :1], n - 1 - (1 + pH))
+    np.testing.assert_allclose(R2[1, 0], ref_r2, rtol=1e-3)
+    np.testing.assert_allclose(b[1, 0], _partial_reference(y, x[1], H[1, :, :1], n - 1 - (1 + pH))[1], rtol=1e-3)
+
+
+def test_nuisance_kernel_tests_several_columns_in_one_pass():
+    """``q`` tested columns against the same nuisance columns: the nominal statistics are those of ``q``
+    single runs and the block is their maximum (the ancestries of the interaction model)."""
+    from src.localqtl import regression_kernels as rk
+    y, X, H, Yp = _nuisance_design(seed=8, q=3)
+    ctx, b, s, t = rk.prep_ctx_for_perm(y, X, H, 1)
+    assert b.shape == (X.shape[0], 3) and ctx["q"] == 3
+    singles = []
+    for k in range(3):
+        xk = X[:, :, k].contiguous()
+        ck, bk, sk, tk = rk.prep_ctx_for_perm(y, xk, H, 1)
+        torch.testing.assert_close(b[:, k], bk[:, 0], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(s[:, k], sk[:, 0], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(t[:, k], tk[:, 0], rtol=1e-5, atol=1e-5)
+        singles.append(rk._perm_chunk_r2_block(ck, H, xk, Yp))
+    torch.testing.assert_close(rk._perm_chunk_r2_block(ctx, H, X, Yp), torch.stack(singles).amax(dim=0), rtol=1e-5, atol=1e-7)
