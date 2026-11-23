@@ -13,8 +13,11 @@ from .._torch_utils import to_device_tensor
 from ..stats import beta_approx_pval, get_t_pval
 from ..haplotypeio import InputGeneratorCis, InputGeneratorCisWithHaps
 from ..preproc import impute_mean_and_filter, filter_by_maf
-from ..regression_kernels import Residualizer, prep_ctx_for_perm, perm_chunk_r2
-from ._permute import PermutationStream, compute_perm_r2_max, freedman_lane, perm_source, projectors_of
+from ..regression_kernels import Residualizer, prep_ctx_for_perm, perm_chunk_r2, resolve_mixed_precision
+from ._permute import (
+    PermutationStream, compute_perm_r2_max, freedman_lane, perm_source, projectors_of,
+    resolve_perm_indices_mode,
+)
 from ._buffer import (
     allocate_result_buffers,
     ensure_capacity, write_row,
@@ -117,9 +120,7 @@ def _run_independent_core(
     progress_interval = max(1, int(total_items) // 10) if total_items else 0
     chrom_label = f"{chrom}" if chrom is not None else "all chromosomes"
 
-    perm_indices_mode = (perm_indices_mode or "generator").lower()
-    if perm_indices_mode not in {"generator", "cpu_pinned", "gpu"}:
-        perm_indices_mode = "generator"
+    perm_indices_mode = resolve_perm_indices_mode(perm_indices_mode)
     stage1_cap = None
     if nperm_stage1 is not None and nperm_stage1 > 0:
         stage1_cap = int(nperm_stage1)
@@ -790,9 +791,7 @@ def _run_independent_core_group(
     progress_interval = max(1, int(total_items) // 10) if total_items else 0
     chrom_label = f"{chrom}" if chrom is not None else "all chromosomes"
 
-    perm_indices_mode = (perm_indices_mode or "generator").lower()
-    if perm_indices_mode not in {"generator", "cpu_pinned", "gpu"}:
-        perm_indices_mode = "generator"
+    perm_indices_mode = resolve_perm_indices_mode(perm_indices_mode)
     stage1_cap = None
     if nperm_stage1 is not None and nperm_stage1 > 0:
         stage1_cap = int(nperm_stage1)
@@ -1694,7 +1693,20 @@ def map_independent(
         One phenotype-specific covariate, appended to the shared covariates for
         the phenotypes it lists (tensorQTL ``paired_covariate_df``); the others
         use ``covariates_df`` alone.  Ungrouped mapping only.
+    perm_indices_mode : {"generator", "cpu_pinned", "gpu", "shared"}, default "generator"
+        How the sample permutations are drawn.  ``"generator"`` (and its variants
+        ``"cpu_pinned"`` / ``"gpu"``) gives every phenotype (or group) its own seeded stream.
+        ``"shared"`` draws one seeded set for the run and permutes every phenotype with it
+        (tensorQTL's design): the permutations are drawn once instead of once per phenotype,
+        each phenotype's p-value stays valid, and the Monte Carlo error of the p-values is
+        shared across phenotypes instead of independent.  The set is the same on CPU and CUDA.
+    mixed_precision : {"fp16", "off"}, optional
+        CUDA autocast mode of the permutation kernels (no effect on CPU).  ``None`` (default)
+        is ``"fp16"`` for the ``main`` scan and ``"off"`` (float32) for an interaction scan,
+        as in :func:`localqtl.cis.map_permutations`.
     """
+    mixed_precision = resolve_mixed_precision(
+        mixed_precision, interaction=(ancestry_model == "interaction" or interaction_covariate is not None))
     device = ("cuda" if (device in ("auto", None) and torch.cuda.is_available())
               else (device if device in ("cuda", "cpu") else "cpu"))
     torch_device = torch.device(device)
@@ -1737,6 +1749,8 @@ def map_independent(
         logger.write(
             f"  * including local ancestry channels (K={K}, preload={'on' if preload_flag else 'off'})"
         )
+    if device == "cuda":
+        logger.write(f"  * mixed precision: {mixed_precision}")
     if ancestry_model == "interaction":
         logger.write("  * ancestry model: interaction (GxH)")
     if interaction_covariate is not None:
@@ -1761,6 +1775,10 @@ def map_independent(
 
     if nperm is None or nperm <= 0:
         raise ValueError("nperm must be a positive integer for map_independent.")
+    perm_indices_mode = resolve_perm_indices_mode(perm_indices_mode, n_samples=int(ig.phenotype_df.shape[1]),
+                                                  nperm=nperm, seed=seed, device=device)
+    if not isinstance(perm_indices_mode, str):
+        logger.write("  * permutation indices: one shared set for every phenotype")
 
     covariates_use = covariates_df
     if isinstance(interaction_covariate, str) and covariates_df is not None:

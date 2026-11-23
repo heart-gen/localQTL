@@ -14,9 +14,15 @@ from ..regression_kernels import (
 
 __all__ = [
     "PermutationStream",
+    "SharedPermutations",
+    "PERM_INDICES_MODES",
+    "resolve_perm_indices_mode",
     "perm_chunk_generator",
     "compute_perm_r2_max",
 ]
+
+# per-phenotype streams ("generator", "cpu_pinned", "gpu") and the run-wide set ("shared")
+PERM_INDICES_MODES = ("generator", "cpu_pinned", "gpu", "shared")
 
 
 def _combine_seed(seed: int | None, key: str | int | None) -> int | None:
@@ -27,23 +33,94 @@ def _combine_seed(seed: int | None, key: str | int | None) -> int | None:
     return subseed(int(seed), key)
 
 
+class SharedPermutations:
+    """
+    One set of sample permutations for a whole run (``perm_indices_mode="shared"``).
+
+    Every phenotype (and every group) is permuted with the same index matrix, row ``i`` being
+    permutation ``i``, which is tensorQTL's design: the permutations are drawn once instead of
+    once per phenotype, so their cost no longer scales with the number of phenotypes.  Each
+    phenotype's permutation p-value is as valid as with its own stream; what changes is that
+    the Monte Carlo error of the p-values is shared across phenotypes instead of independent.
+    The rows are drawn on the host from one seeded generator, in order, so they do not depend
+    on the device, on the chunk size, or on how many are asked for at a time.
+    """
+
+    def __init__(self, n_samples: int, seed: int | None, device: torch.device | str, nperm: int = 0):
+        self.n_samples = int(n_samples)
+        self.seed = None if seed is None else int(seed)
+        self.device = torch.device(device)
+        self._gen = torch.Generator(device="cpu")
+        if self.seed is not None:
+            self._gen.manual_seed(self.seed)
+        self._idx = torch.empty((0, self.n_samples), dtype=torch.long, device=self.device)
+        self.take(0, int(nperm))
+
+    def __len__(self) -> int:
+        return int(self._idx.shape[0])
+
+    def take(self, start: int, count: int) -> torch.Tensor:
+        """Rows ``start .. start + count`` of the set, ``(count, n_samples)`` on the device (a view: not to be written)."""
+        need = int(start) + int(count)
+        have = int(self._idx.shape[0])
+        if need > have:
+            rows = torch.stack([torch.randperm(self.n_samples, generator=self._gen) for _ in range(need - have)], dim=0)
+            self._idx = torch.cat([self._idx, rows.to(self.device)], dim=0)
+        return self._idx[int(start):need]
+
+
+def resolve_perm_indices_mode(mode, n_samples: int | None = None, nperm: int = 0, seed: int | None = None,
+                              device: torch.device | str = "cpu"):
+    """
+    Normalise ``perm_indices_mode``.  The per-phenotype modes come back as their name (an
+    unknown name as ``"generator"``, as before).  ``"shared"`` comes back as the run's
+    :class:`SharedPermutations`, built here from ``n_samples``, ``seed`` and ``device``; it is
+    passed wherever a mode is and :class:`PermutationStream` reads its rows.  A
+    :class:`SharedPermutations` is returned as it is.
+    """
+    if isinstance(mode, SharedPermutations):
+        return mode
+    mode = (mode or "generator").lower()
+    if mode == "shared":
+        if n_samples is None:
+            raise ValueError("perm_indices_mode='shared' is resolved by map_permutations / map_independent, "
+                             "which know the samples; pass a SharedPermutations here.")
+        return SharedPermutations(n_samples, seed, device, nperm=nperm)
+    return mode if mode in PERM_INDICES_MODES else "generator"
+
+
 @dataclass
 class PermutationStream:
-    """Stateful permutation chunk generator living on the requested device."""
+    """
+    Stateful permutation chunk generator living on the requested device.
+
+    ``mode`` names how a phenotype's own permutations are drawn (``"generator"``,
+    ``"cpu_pinned"``, ``"gpu"``; seeded by ``seed``) or is the run's
+    :class:`SharedPermutations`, whose rows the stream then hands out in order (``seed`` is
+    not used: every stream of the run sees the same permutations).
+    """
 
     n_samples: int
     nperm: int
     device: torch.device
     chunk_size: int
     seed: int | None = None
-    mode: str = "generator"
+    mode: object = "generator"
 
     def __post_init__(self) -> None:
         self.n_samples = int(self.n_samples)
         self.nperm = int(self.nperm)
         self.chunk_size = max(1, int(self.chunk_size))
+        self._shared: SharedPermutations | None = None
+        if isinstance(self.mode, SharedPermutations):
+            self._shared = self.mode
+            if self._shared.n_samples != self.n_samples:
+                raise ValueError(f"shared permutations are of {self._shared.n_samples} samples, the stream of {self.n_samples}")
+            self.mode = "shared"
         self.mode = (self.mode or "generator").lower()
-        if self.mode not in {"generator", "cpu_pinned", "gpu"}:
+        if self.mode == "shared" and self._shared is None:
+            raise ValueError("mode='shared' needs the run's SharedPermutations (resolve_perm_indices_mode).")
+        if self.mode not in PERM_INDICES_MODES:
             self.mode = "generator"
 
         self._generated = 0
@@ -102,7 +179,11 @@ class PermutationStream:
         if count <= 0:
             return None
 
-        if self.mode == "gpu" and self.device.type == "cuda":
+        if self._shared is not None:
+            chunk = self._shared.take(self._generated, count)
+            if chunk.device != torch.device(self.device):
+                chunk = chunk.to(self.device)
+        elif self.mode == "gpu" and self.device.type == "cuda":
             chunk = self._generate_gpu_chunk(count)
         else:
             chunk = self._generate_cpu_chunk(count)
@@ -212,7 +293,12 @@ def compute_perm_r2_max(
     permuted phenotype chunk (:func:`freedman_lane`).  ``y_source`` is the vector whose sample
     order is permuted: ``None`` permutes ``y_resid`` (Freedman-Lane, ``M P M y``); the centred raw
     phenotype from :func:`perm_source` gives tensorQTL's ``M P y``.  The nominal statistics
-    always come from ``y_resid``."""
+    always come from ``y_resid``.
+
+    With ``H_resid``, ``G_resid`` may be ``(m, n, q)``: ``q`` columns tested one at a time
+    against the same nuisance columns in a single pass over the permutations (the ancestries of
+    the interaction model).  The nominal statistics and ``r2_nominal`` are then ``(m, q)`` and
+    each permutation's value is the maximum over variants and columns."""
     device = y_resid.device
     device_str = device.type if isinstance(device, torch.device) else str(device)
     y_resid = y_resid.contiguous()
@@ -269,7 +355,7 @@ def compute_perm_r2_max(
         )
         if return_nominal:
             nominal_b, nominal_s, nominal_t = b_nom, s_nom, t_nom
-            tvals = nominal_t[:, 0].double()
+            tvals = (nominal_t if G_resid.dim() == 3 else nominal_t[:, 0]).double()
             t2 = tvals.pow(2)
             dof = ctx.get("dof", max(n_samples - 1 - int(k_eff), 1))
             r2_nominal = (t2 / (t2 + float(dof))).to(torch.float32)

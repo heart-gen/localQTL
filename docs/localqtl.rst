@@ -30,7 +30,10 @@ documentation-only call-outs for common production workflows:
 
 - **GPU-accelerated pipelines** via ``torch``, with automatic fallbacks to CPU
   when CUDA devices are unavailable (``localqtl.utils.pick_device`` drives
-  device selection). See the `feature summary <../README.md#features>`_ for a
+  device selection). The permutation kernels run under ``fp16`` autocast for the
+  ``main`` and ``dosage`` scans and in float32 for the interaction scans
+  (:ref:`mixed-precision`); permutations are drawn per phenotype or once for the
+  run (:ref:`permutation-indices`). See the `feature summary <../README.md#features>`_ for a
   concise checklist.
 - **Modular cis-QTL mapping helpers** such as
   :func:`localqtl.cis.map_nominal`, :func:`localqtl.cis.map_permutations`, and
@@ -204,6 +207,12 @@ phenotype (or group) is collected with optional eigenMT correction
 ``<out_prefix>.top_assoc.txt.gz`` (``top_assoc_path``); ``write_stats=False``
 skips the pair-level output.  ``interaction_df`` is mutually exclusive with
 ``ancestry_model="interaction"``.
+
+.. note::
+
+   On a GPU the interaction permutation scans (``ancestry_model="interaction"`` and
+   ``interaction_covariate``) run in float32 by default, not under ``fp16`` autocast like the
+   ``main`` and ``dosage`` scans; see :ref:`mixed-precision`.
 
 ``paired_covariate_df`` (phenotypes x samples) adds one phenotype-specific
 covariate to the shared covariates in :func:`localqtl.cis.map_nominal`,
@@ -818,6 +827,142 @@ attaching fine-mapping and colocalization results to existing cis outputs.
 sets, ``susie_cs`` stores a comma-separated list of set IDs.
 ``annotate_with_coloc`` appends a phenotype-level ``coloc_pp_h4`` column to
 permutation results.
+
+.. _mixed-precision:
+
+Mixed precision on GPU
+----------------------
+
+On a CUDA device the permutation kernels of :func:`localqtl.cis.map_permutations` and
+:func:`localqtl.cis.map_independent` can run under half-precision autocast (``fp16``) or in
+float32 (``off``).  The mode is the ``mixed_precision`` argument; it has no effect on CPU,
+and the nominal scans do not use it.  Left at ``None``, the default depends on the scan:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 46 14 40
+
+   * - Scan
+     - Default
+     - Why
+   * - ``ancestry_model="main"`` (and ``tensorqtl_flavor``)
+     - ``fp16``
+     - reproduces the CPU scan
+   * - ``ancestry_model="dosage"``
+     - ``fp16``
+     - reproduces the CPU scan
+   * - ``ancestry_model="interaction"``, ``interaction_covariate``
+     - ``off``
+     - does not reproduce the CPU scan under ``fp16``
+
+The interaction scan tests the product of the genotype with local ancestry (or with a
+covariate) after projecting out the genotype and the ancestry the product is built from.
+That projection is nearly collinear, and half precision does not carry the partial
+:math:`R^2` through it: the permutation null and the selected lead both move.  The ``main``
+and ``dosage`` scans have no such term and are unaffected.
+
+The defaults follow the device-parity check of the localQTL benchmark (2026-11-15; localQTL
+0.4.5, one chromosome of a brain expression cohort, 585 genes, 10,000 permutations, an A100
+GPU against the CPU scan with the same seed):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 14 22 22 20
+
+   * - Scan
+     - Mode
+     - Identical lead
+     - Spearman of ``pval_perm``
+     - eGenes (CPU)
+   * - main
+     - ``fp16``
+     - 1.000
+     - 1.000
+     - 170 (170)
+   * - dosage
+     - ``fp16``
+     - 0.997
+     - 1.000
+     - 173 (174)
+   * - interaction
+     - ``fp16``
+     - 0.950
+     - 0.979
+     - 5 (1)
+   * - interaction
+     - ``off``
+     - 1.000
+     - 1.000
+     - 1 (1)
+
+In that check the float32 scan took the same wall time as the ``fp16`` scan, so the
+interaction default costs no measurable time there.
+
+.. code-block:: python
+
+   # the defaults: nothing to pass
+   perm_df = map_permutations(..., haplotypes=H, loci_df=loci_df, ancestry_model="interaction")  # float32 on CUDA
+
+   # an explicit mode is honoured for any scan
+   perm_df = map_permutations(..., ancestry_model="main", mixed_precision="off")
+
+:class:`localqtl.cis.CisMapper` and the command line use the defaults.  The environment
+variable ``LOCALQTL_MIXED_PRECISION`` (``fp16`` or ``off``) replaces the default of every
+scan; an explicit ``mixed_precision`` argument wins over it.  Do not set it to ``fp16`` for an
+interaction scan.  Through 0.4.5 the default was ``fp16`` for every scan: interaction
+permutation scans run on a GPU with those releases under the default should be rerun; CPU
+results are unaffected.  The resolved mode is written to the scan's log header on CUDA
+(:func:`localqtl.regression_kernels.resolve_mixed_precision`).
+
+.. _permutation-indices:
+
+Permutation indices: per phenotype or shared
+--------------------------------------------
+
+:func:`localqtl.cis.map_permutations` and :func:`localqtl.cis.map_independent` take
+``perm_indices_mode``:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 78
+
+   * - Mode
+     - What is permuted
+   * - ``"generator"`` (default)
+     - Every phenotype (every group, in a grouped scan) has its own stream of permutations,
+       seeded from ``seed`` and the phenotype's ID.  A phenotype's result does not depend on
+       which other phenotypes are in the run.  ``"cpu_pinned"`` and ``"gpu"`` are variants of
+       it that change where the indices are drawn.
+   * - ``"shared"``
+     - One set of ``nperm`` permutations is drawn for the run, seeded from ``seed``, and every
+       phenotype is permuted with it.  This is tensorQTL's design.
+
+Both give a valid permutation p-value for each phenotype: the null of a phenotype is built
+from ``nperm`` permutations of its own values either way.  They differ in two things.
+
+*Cost.*  The per-phenotype streams draw ``nperm`` permutations for every phenotype on the
+host, a cost that grows with the number of phenotypes and that a GPU does not speed up.  The
+shared set is drawn once.
+
+*Monte Carlo error.*  With per-phenotype streams the sampling error of ``pval_perm`` is
+independent across phenotypes.  With the shared set it is common to all of them: the
+phenotypes of one run see the same draws, so their errors are correlated, and a rerun with
+another seed moves them together.  The size of the error of any one p-value is the same.
+
+The shared set is drawn on the host from one generator, in order, so it is identical on CPU
+and CUDA and does not depend on ``perm_chunk``.  A run of a subset of the phenotypes with the
+same seed reproduces their rows exactly.
+
+.. code-block:: python
+
+   perm_df = map_permutations(..., nperm=10_000, seed=1, perm_indices_mode="shared")
+
+   # tensorQTL's scheme in full: its degrees of freedom and permutation scheme, shared permutations
+   perm_df = map_permutations(..., tensorqtl_flavor=True, perm_indices_mode="shared")
+
+Results of the two modes are not comparable row by row at the level of single permutations:
+the observed statistics are the same and the p-values differ by Monte Carlo error.  Keep one
+mode within an analysis.
 
 Device, logging, and reproducibility helpers
 --------------------------------------------
