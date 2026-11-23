@@ -1016,3 +1016,52 @@ def test_shared_mode_reaches_the_other_scans():
                            d["covariates_df"], **base) for _ in range(2)]
     assert len(ind[0]) >= len(cis_df)
     pd.testing.assert_frame_equal(ind[0], ind[1])
+
+
+def _untestable_cohort(kind, seed=5, n=80, m=6):
+    """Three genes on three chromosomes.  ``untestable``: no variant of the window carries a test;
+    ``free``: every variant does; ``mixed``: only ``v14`` does.  ``kind="covariate"``: every carrier
+    of an untestable variant has ``c == 1`` for the binary covariate ``c``, so ``g * c`` is a
+    multiple of ``g``.  ``kind="ancestry"``: an untestable genotype equals the haplotype count of
+    the first ancestry, so it is collinear with the local-ancestry column of the main model."""
+    from tests.conftest import make_random_panel
+    rng = np.random.default_rng(seed)
+    samples = [f"S{i}" for i in range(n)]
+    ids = [f"v{i}" for i in range(3 * m)]
+    vdf = pd.DataFrame({"chrom": np.repeat(["chr1", "chr2", "chr3"], m), "pos": np.tile(100 + 10 * np.arange(m), 3)},
+                       index=ids)
+    c = (np.arange(n) % 2).astype(np.float64)
+    panel, admix = make_random_panel(vdf, samples, seed=3, n_anc=2)
+    G = rng.integers(0, 3, size=(3 * m, n)).astype(np.float64)
+    locked = [i for i in range(3 * m) if i < m or (i >= 2 * m and i != 2 * m + 2)]
+    G[locked] = G[locked] * c if kind == "covariate" else admix[locked, :, 0]
+    pdf = pd.DataFrame(rng.normal(size=(3, n)), index=["untestable", "free", "mixed"], columns=samples).astype(np.float32)
+    pos = pd.DataFrame({"chr": ["chr1", "chr2", "chr3"], "start": 120, "end": 120}, index=pdf.index)
+    cov = pd.DataFrame({"a": rng.normal(size=n), "c": c}, index=samples)
+    args = (pd.DataFrame(G.astype(np.float32), index=ids, columns=samples), vdf, pdf, pos)
+    if kind == "covariate":
+        return args + (cov,), dict(interaction_covariate="c")
+    return args + (cov[["a"]],), dict(haplotypes=panel, ancestry_model="main")
+
+
+@pytest.mark.parametrize("kind", ["covariate", "ancestry"])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_scan_reports_no_test_for_a_window_with_no_testable_variant(kind, grouped):
+    """A tested column that is collinear with its nuisance columns has NaN statistics and a null
+    R^2 of 0.  A window (or a group) made only of such columns is left out of the output: neither
+    the NaN nor the rounding noise of another estimator is compared with the null, which would give
+    ``pval_perm = 1 / (nperm + 1)``.  In a window with one testable variant, that variant is the lead."""
+    args, model = _untestable_cohort(kind)
+    nperm = 200
+    kw = dict(device="cpu", logger=SimpleLogger(verbose=False), nperm=nperm, seed=1, **model)
+    if grouped:
+        kw["group_s"] = pd.Series({"untestable": "gU", "free": "gF", "mixed": "gM"})
+    res = map_permutations(*args, **kw).set_index("phenotype_id")
+    assert sorted(res.index) == ["free", "mixed"]
+    assert res.loc["mixed", "variant_id"] == "v14"
+    assert res.loc["free", "variant_id"] in [f"v{i}" for i in range(6, 12)]
+    assert np.isfinite(res[["slope", "slope_se", "tstat", "pval_nominal", "pval_beta"]].to_numpy()).all()
+    assert (res["r2_nominal"] >= 0).all()
+    assert res["pval_perm"].between(2 / (nperm + 1), 1).all()        # noise phenotypes: never the smallest p-value
+    if grouped:
+        assert list(res["group_id"]) == ["gF", "gM"]

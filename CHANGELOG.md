@@ -50,8 +50,12 @@ the GitHub release body from that section and stops if the tag has none.
   interaction model this is a variant whose carriers all have the same local ancestry, where
   the genotype-by-ancestry product is a multiple of the genotype. The old kernel returned a
   slope from rounding noise there (with a t-statistic near 0, so it was not selected); the
-  permutation kernels now return NaN statistics and a null R^2 of 0 for it, and a window in
-  which no column can be tested has no row.
+  permutation kernels now return NaN statistics and a null R^2 of 0 for it. The same holds for
+  the genotype-by-covariate scan (every carrier in one category of a binary covariate) and for
+  `main` (a genotype equal to a local-ancestry haplotype count). Such a variant is never the
+  lead, and a window or phenotype group in which no variant can be tested has no row in the
+  output of `map_permutations`, whatever the model and with or without `group_s`: nothing is
+  compared with a null of zeros.
 - **On CUDA the interaction permutation scans run in float32 by default.** With
   `mixed_precision=None`, `map_permutations` and `map_independent` now use `"off"` for an
   interaction scan (`ancestry_model="interaction"` or `interaction_covariate`) and keep `"fp16"`

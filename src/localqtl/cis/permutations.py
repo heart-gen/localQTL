@@ -641,6 +641,10 @@ def _run_permutation_core(
                 r2_nominal_vec = torch.zeros(G_resid.shape[0], device=y_resid_t.device, dtype=torch.float32)
             r2_nominal_vec = torch.nan_to_num(r2_nominal_vec, nan=-1.0)
             ix = int(r2_nominal_vec.argmax().item())
+            if float(r2_nominal_vec[ix].item()) < 0:
+                # No g:c column of the window is identifiable beside g and c (every carrier in one
+                # category of a binary covariate, for one): there is no lead and no test to report.
+                continue
 
             beta = float(betas[ix, 0].item())
             se = float(ses[ix, 0].item())
@@ -672,13 +676,6 @@ def _run_permutation_core(
             t_sq = t_g.double().pow(2)
             r2_nominal_vec = (t_sq / (t_sq + dof)).to(torch.float32)
             r2_nominal_vec = torch.nan_to_num(r2_nominal_vec, nan=-1.0)
-            ix = int(r2_nominal_vec.argmax().item())
-
-            # Extract top variant stats
-            beta = float(betas[ix, 0].item())
-            se = float(ses[ix, 0].item())
-            tval = float(tstats[ix, 0].item())
-            r2_nominal = float(r2_nominal_vec[ix].item())
 
             # Build permutation indices for phenotype
             perm_stream = PermutationStream(
@@ -689,7 +686,7 @@ def _run_permutation_core(
                 seed=subseed(seed, pid) if seed is not None else None,
                 mode=perm_indices_mode,
             )
-            _, _, _, _, r2_perm_max = compute_perm_r2_max(
+            _, _, _, r2_kernel, r2_perm_max = compute_perm_r2_max(
                 projectors=projectors_of(rez_b),
                 y_source=y_src,
                 y_resid=y_resid_t,
@@ -698,9 +695,25 @@ def _run_permutation_core(
                 k_eff=k_eff,
                 perm_stream=perm_stream,
                 max_permutations=nperm,
-                return_nominal=False,
+                return_nominal=H_resid is not None,
                 mixed_precision=mixed_precision,
             )
+            # Beside local-ancestry columns the null comes from the nuisance kernel, which gives a
+            # genotype collinear with them no test (NaN nominal, null R^2 of 0).  The observed scan
+            # follows the same rule: the ridge-regularised OLS above returns rounding noise for such
+            # a variant, and noise above a null of zeros would be the smallest p-value there is.
+            if r2_kernel is not None:
+                r2_nominal_vec = torch.where(torch.isnan(r2_kernel), torch.full_like(r2_nominal_vec, -1.0),
+                                             r2_nominal_vec)
+            ix = int(r2_nominal_vec.argmax().item())
+            if float(r2_nominal_vec[ix].item()) < 0:
+                continue                                               # no testable variant in the window
+
+            # Extract top variant stats
+            beta = float(betas[ix, 0].item())
+            se = float(ses[ix, 0].item())
+            tval = float(tstats[ix, 0].item())
+            r2_nominal = float(r2_nominal_vec[ix].item())
 
             r2_perm_np = r2_perm_max.detach().cpu().numpy()
 
@@ -1165,7 +1178,8 @@ def _run_permutation_core_group(
                     r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
                     ix = int(ix_t.item())
                     t_g = tstats[:, 0].double()
-                    if r2_max_t > best_r2_val:
+                    # r2 < 0: this phenotype has no testable variant, so it cannot give the group's lead
+                    if r2_max_t >= 0 and r2_max_t > best_r2_val:
                         best_r2_val = float(r2_max_t.item())
                         best_ix_var = ix
                         best_ix_pheno = j
@@ -1201,7 +1215,8 @@ def _run_permutation_core_group(
                     r2_max_t, ix_t = _nanmax(r2_nominal_vec, dim=0)
                     ix = int(ix_t.item())
                     t_g = tstats[:, 0].double()
-                    if r2_max_t > best_r2_val:
+                    # r2 < 0: this phenotype has no testable variant, so it cannot give the group's lead
+                    if r2_max_t >= 0 and r2_max_t > best_r2_val:
                         best_r2_val = float(r2_max_t.item())
                         best_ix_var = ix
                         best_ix_pheno = j
