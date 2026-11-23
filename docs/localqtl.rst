@@ -913,6 +913,56 @@ permutation scans run on a GPU with those releases under the default should be r
 results are unaffected.  The resolved mode is written to the scan's log header on CUDA
 (:func:`localqtl.regression_kernels.resolve_mixed_precision`).
 
+.. _permutation-indices:
+
+Permutation indices: per phenotype or shared
+--------------------------------------------
+
+:func:`localqtl.cis.map_permutations` and :func:`localqtl.cis.map_independent` take
+``perm_indices_mode``:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 78
+
+   * - Mode
+     - What is permuted
+   * - ``"generator"`` (default)
+     - Every phenotype (every group, in a grouped scan) has its own stream of permutations,
+       seeded from ``seed`` and the phenotype's ID.  A phenotype's result does not depend on
+       which other phenotypes are in the run.  ``"cpu_pinned"`` and ``"gpu"`` are variants of
+       it that change where the indices are drawn.
+   * - ``"shared"``
+     - One set of ``nperm`` permutations is drawn for the run, seeded from ``seed``, and every
+       phenotype is permuted with it.  This is tensorQTL's design.
+
+Both give a valid permutation p-value for each phenotype: the null of a phenotype is built
+from ``nperm`` permutations of its own values either way.  They differ in two things.
+
+*Cost.*  The per-phenotype streams draw ``nperm`` permutations for every phenotype on the
+host, a cost that grows with the number of phenotypes and that a GPU does not speed up.  The
+shared set is drawn once.
+
+*Monte Carlo error.*  With per-phenotype streams the sampling error of ``pval_perm`` is
+independent across phenotypes.  With the shared set it is common to all of them: the
+phenotypes of one run see the same draws, so their errors are correlated, and a rerun with
+another seed moves them together.  The size of the error of any one p-value is the same.
+
+The shared set is drawn on the host from one generator, in order, so it is identical on CPU
+and CUDA and does not depend on ``perm_chunk``.  A run of a subset of the phenotypes with the
+same seed reproduces their rows exactly.
+
+.. code-block:: python
+
+   perm_df = map_permutations(..., nperm=10_000, seed=1, perm_indices_mode="shared")
+
+   # tensorQTL's scheme in full: its degrees of freedom and permutation scheme, shared permutations
+   perm_df = map_permutations(..., tensorqtl_flavor=True, perm_indices_mode="shared")
+
+Results of the two modes are not comparable row by row at the level of single permutations:
+the observed statistics are the same and the p-values differ by Monte Carlo error.  Keep one
+mode within an analysis.
+
 Device, logging, and reproducibility helpers
 --------------------------------------------
 

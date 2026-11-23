@@ -1338,6 +1338,13 @@ def map_permutations(
     paired_covariate_df : DataFrame (phenotypes x samples), optional
         One phenotype-specific covariate added to the shared covariates for the
         phenotypes it lists (tensorQTL ``paired_covariate_df``); ungrouped only.
+    perm_indices_mode : {"generator", "cpu_pinned", "gpu", "shared"}, default "generator"
+        How the sample permutations are drawn.  ``"generator"`` (and its variants
+        ``"cpu_pinned"`` / ``"gpu"``) gives every phenotype (or group) its own seeded stream.
+        ``"shared"`` draws one seeded set for the run and permutes every phenotype with it
+        (tensorQTL's design): the permutations are drawn once instead of once per phenotype,
+        each phenotype's p-value stays valid, and the Monte Carlo error of the p-values is
+        shared across phenotypes instead of independent.  The set is the same on CPU and CUDA.
     mixed_precision : {"fp16", "off"}, optional
         CUDA autocast mode of the permutation kernels (no effect on CPU).  ``None`` (default)
         is ``"fp16"`` for the ``main`` and ``dosage`` scans and ``"off"`` (float32) for an

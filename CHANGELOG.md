@@ -12,8 +12,45 @@ the GitHub release body from that section and stops if the tag has none.
 
 ## [Unreleased]
 
+### Added
+
+- **`perm_indices_mode="shared"`: one set of permutations for the run.** `map_permutations`,
+  `map_independent` and the `CisMapper` methods accept it. The default (`"generator"`) is
+  unchanged: every phenotype has its own seeded stream, drawn on the host one permutation at a
+  time, a cost that grows with the number of phenotypes and that a GPU does not speed up. With
+  `"shared"` the run draws `nperm` permutations once, seeded from `seed`, and permutes every
+  phenotype with them (tensorQTL's design; with `tensorqtl_flavor=True` the scheme is tensorQTL's
+  in full). Each phenotype's permutation p-value is as valid as before; the Monte Carlo error of
+  the p-values is shared across the phenotypes of a run instead of independent. The set is drawn
+  on the host and is identical on CPU and CUDA (`localqtl.cis._permute.SharedPermutations`).
+  Documented under "Permutation indices: per phenotype or shared" in the user guide.
+
 ### Changed
 
+- **The permutation kernel of the scans with local ancestry is faster and computes the same
+  statistic.** `main`, `interaction`, the genotype-by-covariate scan, the pooled-lead null of the
+  dosage scan and `map_independent` take each permutation's partial R^2 of the tested column
+  given per-variant nuisance columns from `regression_kernels.prep_ctx_for_perm` /
+  `perm_chunk_r2`. Before, every chunk of permutations solved a Cholesky system with one
+  right-hand side per permutation and per variant. Now the nuisance columns are whitened and
+  projected out of the tested column once per phenotype, in float32, and a chunk costs one matrix
+  product. With the default permutation streams the results are those of 0.4.5 up to float32
+  rounding (caudate expression, chromosome 22, 40 genes, 10,000 permutations, CPU: identical
+  lead and identical `pval_perm` for every gene and model; slopes within 2e-6 relative).
+  Measured there on 4 threads, per gene: `interaction` 283 ms to 175 ms, `main` 236 ms to
+  150 ms; with `perm_indices_mode="shared"` 128 ms and 106 ms (and the scan without local
+  ancestry 145 ms to 103 ms).
+- **The interaction scan passes over the permutations once.** With more than two ancestries it
+  ran one full permutation pass per ancestry, redrawing the same permutations each time; every
+  ancestry's genotype-by-ancestry column is now tested in the same pass (synthetic bench, 8,000
+  variants, three ancestries, CPU: 10.4 s to 4.8 s). The lead, its statistics and the null are
+  unchanged.
+- **A tested column that is collinear with its nuisance columns carries no test.** In the
+  interaction model this is a variant whose carriers all have the same local ancestry, where
+  the genotype-by-ancestry product is a multiple of the genotype. The old kernel returned a
+  slope from rounding noise there (with a t-statistic near 0, so it was not selected); the
+  permutation kernels now return NaN statistics and a null R^2 of 0 for it, and a window in
+  which no column can be tested has no row.
 - **On CUDA the interaction permutation scans run in float32 by default.** With
   `mixed_precision=None`, `map_permutations` and `map_independent` now use `"off"` for an
   interaction scan (`ancestry_model="interaction"` or `interaction_covariate`) and keep `"fp16"`
