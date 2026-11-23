@@ -24,6 +24,11 @@ the GitHub release body from that section and stops if the tag has none.
   in full). Each phenotype's permutation p-value is as valid as before; the Monte Carlo error of
   the p-values is shared across the phenotypes of a run instead of independent. The set is drawn
   on the host and is identical on CPU and CUDA (`localqtl.cis._permute.SharedPermutations`).
+  Measured on an A100 (caudate expression, chromosome 22, 585 genes, 10,000 permutations, wall
+  per gene, default streams against the shared set): `interaction` 138 ms and 60 ms, `main`
+  139 ms and 58 ms, the scan without local ancestry (`tensorqtl_flavor=True`) 136 ms and 56 ms.
+  Under the shared set CUDA reproduces the CPU scan as it does under the default streams
+  (`interaction`: `pval_perm` within one permutation count for every gene).
   Documented under "Permutation indices: per phenotype or shared" in the user guide.
 
 ### Changed
@@ -36,11 +41,27 @@ the GitHub release body from that section and stops if the tag has none.
   right-hand side per permutation and per variant. Now the nuisance columns are whitened and
   projected out of the tested column once per phenotype, in float32, and a chunk costs one matrix
   product. With the default permutation streams the results are those of 0.4.5 up to float32
-  rounding (caudate expression, chromosome 22, 40 genes, 10,000 permutations, CPU: identical
-  lead and identical `pval_perm` for every gene and model; slopes within 2e-6 relative).
-  Measured there on 4 threads, per gene: `interaction` 283 ms to 175 ms, `main` 236 ms to
-  150 ms; with `perm_indices_mode="shared"` 128 ms and 106 ms (and the scan without local
-  ancestry 145 ms to 103 ms).
+  rounding, and closer to the exact fit where 0.4.5 was not. Caudate expression, chromosome 22,
+  585 genes, 10,000 permutations, CPU: every lead is identical in `main` and `interaction`;
+  `pval_perm` differs by at most one permutation count in `main` (2 genes) and by at most two in
+  `interaction` for 583 genes. The other two interaction leads are variants with six minor
+  alleles: there the slope of 0.4.5 was 3e-3 and 5e-3 (relative) off a float64 least-squares
+  fit and differed between CPU and CUDA, the new kernel is within 4e-6 of the fit on both
+  devices, and `pval_perm` moved by 0.003 and 0.006. The scan without local ancestry does not
+  use this kernel and its table is unchanged.
+  Wall per gene on 4 CPU threads, 0.4.5 to this release: 40 genes of that chromosome,
+  `interaction` 283 ms to 175 ms, `main` 236 ms to 150 ms (with `perm_indices_mode="shared"`
+  128 ms and 106 ms; the scan without local ancestry 145 ms to 103 ms with the shared set); all
+  585 genes on another node, `interaction` 497 ms to 364 ms, `main` 411 ms to 336 ms (shared:
+  261 ms and 235 ms).
+  **On a GPU the default streams leave the wall where it was** (A100, the same 585 genes:
+  `interaction` 137 ms to 138 ms per gene, `main` 144 ms to 139 ms): the kernel was 7 % of that
+  wall, and drawing every phenotype's permutations on the host is about half of it. The gain on
+  a GPU comes from the shared permutation set (above). Peak GPU memory of the scan fell
+  (`interaction` 923 MB to 556 MB, `main` 719 MB to 463 MB). CUDA against the CPU scan with the
+  same seed, `interaction` in float32: `pval_perm` within one permutation count for every gene
+  (0.4.5: up to 18), the same lead in 580 of 585 genes and a variant with the same R^2 in the
+  other five (0.4.5: the same lead in 572).
 - **The interaction scan passes over the permutations once.** With more than two ancestries it
   ran one full permutation pass per ancestry, redrawing the same permutations each time; every
   ancestry's genotype-by-ancestry column is now tested in the same pass (synthetic bench, 8,000
@@ -74,7 +95,11 @@ the GitHub release body from that section and stops if the tag has none.
   that half precision does not carry. **Interaction permutation scans run on a GPU with 0.4.5
   or earlier under the default should be rerun**; CPU results and the `main` and `dosage`
   scans are unaffected. The genotype-by-covariate scan shares the kernel and takes the same
-  default; it was not measured separately. Documented under "Mixed precision on GPU" in the
+  default; it was not measured separately. With this release's permutation kernel, one run of
+  the same chromosome no longer shows that failure (interaction under `fp16` on an A100 against
+  the CPU scan: the leads of the float32 scan, `pval_perm` within 11 permutation counts, as
+  `main` under `fp16`), and `fp16` gave the interaction scan no wall there (138 ms per gene in
+  both modes): the default stays `"off"`. Documented under "Mixed precision on GPU" in the
   user guide.
 
 ## [0.4.5] - 2026-11-10
