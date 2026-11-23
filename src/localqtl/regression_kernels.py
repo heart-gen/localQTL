@@ -648,157 +648,109 @@ def run_batch_regression_with_permutations(
 
         return betas, ses, tstats, r2_perm
     else:
-        # Gauss-Markov Projection (with H covariates)
+        # Nuisance columns H: project them out of the tested column once and take
+        # every permutation from one matrix product (prep_ctx_for_perm).
         H = move_to_device(H, device)
         assert H.dim() == 3, "H must be (m, n, pH)"
-        m, n, pH = H.shape
-
-        dof = max(n - (1 + pH) - int(k_eff), 1)
-
-        Gy = (G @ y)
-        G2 = (G * G).sum(dim=1) + EPS
-        y2 = (y * y).sum() + EPS
-        Hy = torch.einsum("mnp,n->mp", H, y).to(torch.float32)
-        Hg = torch.einsum("mnp,mn->mp", H, G).to(torch.float32)
-
-        # Precompute common variables
-        with (_autocast_ctx(device, mixed_precision) if _is_cuda(G, H) else nullcontext()):
-            # S = H^T H  (m, pH, pH)
-            S = torch.einsum("mnp,mnq->mpq", H, H).to(torch.float32)
-
-        # Cholesky with gentle regularization
-        I = torch.eye(pH, device=device, dtype=torch.float32).expand_as(S)
-        L, info = torch.linalg.cholesky_ex(S)
-        if (info != 0).any():
-            S = S + (1e-6 * I)
-            L = torch.linalg.cholesky(S)
-
-        # Solve S * alpha = RHS in batch
-        alpha_y = _solve_chol(L, Hy.unsqueeze(-1)).squeeze(-1)
-        alpha_g = _solve_chol(L, Hg.unsqueeze(-1)).squeeze(-1)
-
-        # Norms after projecting out H (variant-specific!)
-        y_resid2 = (y2 - (Hy * alpha_y).sum(dim=1)) + EPS        # (m,)
-        G_resid2 = (G2 - (Hg * alpha_g).sum(dim=1)) + EPS        # (m,)
-
-        # Cross term after projection: <G_resid, y_resid> = Gy - Hg^T alpha_y
-        Gy_resid = (Gy - (Hg * alpha_y).sum(dim=1))              # (m,)
-
-        # Nominal partial correlation -> t, beta, se
-        r = Gy_resid / torch.sqrt(G_resid2 * y_resid2)
-        r = torch.clamp(r, min=-1 + 1e-7, max=1 - 1e-7)
-        t = r * torch.sqrt(torch.tensor(dof, device=device, dtype=torch.float32) /
-                           torch.clamp(1.0 - r * r, min=EPS))
-        beta = Gy_resid / G_resid2
-        se   = _slope_se(y_resid2, G_resid2, r, dof, EPS)
-
-        betas  = beta.view(m, 1)
-        ses    = se.view(m, 1)
-        tstats = t.view(m, 1)
-
-        # Permutations
+        ctx, betas, ses, tstats = prep_ctx_for_perm(y, G, H, k_eff, mixed_precision=mixed_precision)
         r2_perm = None
         if y_perm is not None:
             y_perm = y_perm.to(device, non_blocking=True)        # (n, chunk)
-            Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS         # (chunk,)
-            amp_needed = _is_cuda(G, y_perm, H)
-            with (_autocast_ctx(device, mixed_precision) if amp_needed else nullcontext()):
-                U = torch.einsum("mnp,nc->mpc", H, y_perm).to(torch.float32)
-            alpha_perm = _solve_chol(L, U)
-            with (_autocast_ctx(device, mixed_precision) if amp_needed else nullcontext()):
-                T0 = (G @ y_perm).to(torch.float32)
-                T1 = torch.einsum("mp,mpc->mc", Hg, alpha_perm)
-            # Numerator dot after projection
-            GiYp_proj = T0 - T1                                  # (m, chunk)
-            Yp_resid2 = (Ypnorm2.unsqueeze(0)
-                         - (U * alpha_perm).sum(dim=1)) + EPS    # (m, chunk)
-            denom = torch.sqrt(G_resid2).unsqueeze(1) * torch.sqrt(Yp_resid2)
-            R2 = (GiYp_proj / torch.clamp(denom, min=EPS)) ** 2  # (m, chunk)
-            # max across variants for each permutation
-            r2_perm = torch.nan_to_num(R2, nan=0.0).amax(dim=0).to(torch.float32)
-
+            r2_perm = perm_chunk_r2(ctx, H, G, y_perm, mixed_precision=mixed_precision)
         return betas, ses, tstats, r2_perm
+
+
+# A tested column whose squared norm, after the nuisance columns are projected out, is below this
+# fraction of its squared norm before is collinear with them at float32 resolution (in the
+# interaction model: g*h at a variant whose carriers all have the same local ancestry, so that
+# g*h = c*g).  It carries no test: its nominal statistics are NaN and its null R^2 is 0.
+_COLLINEAR_TOL = 1e-9
 
 
 @torch.no_grad()
 def prep_ctx_for_perm(y: torch.Tensor, G: torch.Tensor, H: torch.Tensor, k_eff: int,
                       mixed_precision: str | None = None):
     """
-    Precompute all variant-wise quantities for permutations when H is present.
-    Returns a ctx dict with Cholesky factor and cached pieces, plus nominal stats.
-    Shapes: y(n,), G(m,n), H(m,n,pH)
+    Everything the permutations of one phenotype reuse when nuisance columns ``H`` are present,
+    plus the nominal statistics.
+
+    Per variant, with ``S = H'H = L L'``: the nuisance columns are whitened once,
+    ``W = L^-1 H'`` (``W W' = I``), and each tested column has them projected out and is scaled
+    to unit norm, ``x~ = (x - W'W x) / |x - W'W x|`` (two passes, so that ``x~`` is orthogonal
+    to ``W`` at float32 resolution even when ``x`` is nearly collinear with ``H``, as a
+    genotype-by-ancestry product is with the genotype and the ancestry).  The rows of ``x~`` and
+    ``W`` are stacked in ``ctx["Z"]``, and the partial R^2 of ``x`` given ``H`` for a phenotype
+    ``v`` is ``(x~.v)^2 / (v.v - |W v|^2)``: one product ``Z @ v`` per chunk of permuted
+    phenotypes (:func:`perm_chunk_r2`), with no per-chunk solve.  The projection is done here
+    in float32; only that product runs under autocast.
+
+    Shapes: ``y (n,)``, ``H (m, n, pH)``, ``G (m, n)`` for one tested column or ``(m, n, q)``
+    for ``q`` columns tested one at a time against the same ``H`` (the ancestries of the
+    interaction model).  Returns ``(ctx, betas, ses, tstats)``, each statistic ``(m, 1)`` or
+    ``(m, q)``; ``mixed_precision`` is accepted for the callers and not used here.
     """
     device = y.device
     m, n, pH = H.shape
     EPS = 1e-8
     dof = max(n - (1 + pH) - int(k_eff), 1)
+    X = G if G.dim() == 3 else G.unsqueeze(-1)                    # (m, n, q)
+    q = int(X.shape[2])
+    X = X.to(torch.float32).transpose(1, 2)                       # (m, q, n)
+    Ht = H.to(torch.float32).transpose(1, 2)                      # (m, pH, n)
+    y = y.to(torch.float32)
 
-    with _autocast_ctx(device, mixed_precision) if _is_cuda(G, H, y) else nullcontext():
-        S = torch.einsum("mnp,mnq->mpq", H, H).to(torch.float32)
-    I = torch.eye(pH, device=device, dtype=torch.float32).expand_as(S)
+    S = Ht @ Ht.transpose(1, 2)                                   # (m, pH, pH)
     L, info = torch.linalg.cholesky_ex(S)
     if (info != 0).any():
-        S = S + (1e-6 * I)
-        L = torch.linalg.cholesky(S)
+        I = torch.eye(pH, device=device, dtype=torch.float32).expand_as(S)
+        L = torch.linalg.cholesky(S + (1e-6 * I))
+    W = torch.linalg.solve_triangular(L, Ht, upper=False)         # (m, pH, n)
+    Wt = W.transpose(1, 2)
 
-    Gy = (G @ y)
-    G2 = (G * G).sum(dim=1) + EPS
-    y2 = (y * y).sum() + EPS
-    with _autocast_ctx(device, mixed_precision) if _is_cuda(G, H, y) else nullcontext():
-        Hy = torch.einsum("mnp,n->mp", H, y)
-        Hg = torch.einsum("mnp,mn->mp", H, G)
+    x_ss = (X * X).sum(dim=2)                                     # (m, q)
+    Xo = X - (X @ Wt) @ W
+    Xo = Xo - (Xo @ Wt) @ W
+    G_resid2 = (Xo * Xo).sum(dim=2)                               # (m, q)
+    tested = G_resid2 > _COLLINEAR_TOL * x_ss
+    scale = torch.where(tested, torch.rsqrt(torch.clamp(G_resid2, min=1e-30)), torch.zeros_like(G_resid2))
+    Xu = Xo * scale.unsqueeze(-1)                                 # unit rows; zero where not tested
+    Z = torch.cat([Xu, W], dim=1).reshape(m * (q + pH), n).contiguous()
 
-    Hy = Hy.to(L.dtype)
-    Hg = Hg.to(L.dtype)
-
-    alpha_y = _solve_chol(L, Hy.unsqueeze(-1)).squeeze(-1)
-    alpha_g = _solve_chol(L, Hg.unsqueeze(-1)).squeeze(-1)
-
-    y_resid2 = (y2 - (Hy * alpha_y).sum(dim=1)) + EPS
-    G_resid2 = (G2 - (Hg * alpha_g).sum(dim=1)) + EPS
-    Gy_resid = (Gy - (Hg * alpha_y).sum(dim=1))
-
-    # nominal stats
-    r = Gy_resid / torch.sqrt(G_resid2 * y_resid2)
+    # nominal statistics from the same design as the null
+    A = (Z @ y).view(m, q + pH)
+    y_resid2 = ((y * y).sum() - (A[:, q:] * A[:, q:]).sum(dim=1)).clamp_min(EPS)   # (m,)
+    r = A[:, :q] / torch.sqrt(y_resid2).unsqueeze(1)
     r = torch.clamp(r, min=-1 + 1e-7, max=1 - 1e-7)
-    t = r * torch.sqrt(torch.tensor(dof, device=device, dtype=torch.float32) /
-                       torch.clamp(1.0 - r * r, min=EPS))
-    beta = Gy_resid / G_resid2
-    se = _slope_se(y_resid2, G_resid2, r, dof, EPS)
+    t = r * torch.sqrt(float(dof) / torch.clamp(1.0 - r * r, min=EPS))
+    nan = torch.full_like(r, float("nan"))
+    betas = torch.where(tested, A[:, :q] * scale, nan)
+    ses = torch.where(tested, _slope_se(y_resid2.unsqueeze(1), torch.clamp(G_resid2, min=1e-30), r, dof, EPS), nan)
+    tstats = torch.where(tested, t, nan)
 
-    ctx = {
-        "L": L, "Hg": Hg, "G_resid2": G_resid2, "dof": dof,
-    }
-    betas  = beta.view(m, 1)
-    ses    = se.view(m, 1)
-    tstats = t.view(m, 1)
+    ctx = {"Z": Z, "m": m, "q": q, "pH": pH, "L": L, "G_resid2": G_resid2 if G.dim() == 3 else G_resid2[:, 0],
+           "tested": tested if G.dim() == 3 else tested[:, 0], "dof": dof}
     return ctx, betas, ses, tstats
 
 
 @torch.no_grad()
 def _perm_chunk_r2_block(ctx: dict, H: torch.Tensor, G: torch.Tensor, y_perm: torch.Tensor,
                          mixed_precision: str | None = None) -> torch.Tensor:
-    """Partial R^2 of every variant against every permuted phenotype (n x chunk) -> (m, chunk), NaN as 0."""
+    """
+    Partial R^2 of every variant against every permuted phenotype, ``(n, chunk) -> (m, chunk)``,
+    NaN as 0; with several tested columns, the largest over the columns.  ``H`` and ``G`` are
+    the arrays ``ctx`` was built from (:func:`prep_ctx_for_perm`) and are not read again.
+    """
     EPS = 1e-8
-    L, Hg, G_resid2 = ctx["L"], ctx["Hg"], ctx["G_resid2"]
-
-    # U = H^T y_perm: (m,pH,chunk); Alpha solves S*Alpha = U via Cholesky
-    amp_needed = _is_cuda(H, G, y_perm)
-    with (_autocast_ctx(y_perm.device, mixed_precision) if amp_needed else nullcontext()):
-        U = torch.einsum("mnp,nc->mpc", H, y_perm).to(torch.float32)
-
-    _alpha = _solve_chol(L, U)
-
-    with (_autocast_ctx(y_perm.device, mixed_precision) if amp_needed else nullcontext()):
-        T0 = (G @ y_perm).to(torch.float32)
-        T1 = torch.einsum("mp,mpc->mc", Hg, _alpha)
-    GiYp_proj = T0 - T1
-
-    Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS
-    Yp_resid2 = (Ypnorm2.unsqueeze(0) - (U * _alpha).sum(dim=1)) + EPS
-
-    R2 = (GiYp_proj ** 2) / (G_resid2.unsqueeze(1) * Yp_resid2)
-    return torch.nan_to_num(R2, nan=0.0)
+    Z, m, q, pH = ctx["Z"], ctx["m"], ctx["q"], ctx["pH"]
+    y_perm = y_perm.to(Z.dtype)
+    with (_autocast_ctx(y_perm.device, mixed_precision) if _is_cuda(Z, y_perm) else nullcontext()):
+        A = Z @ y_perm                                            # (m * (q + pH), chunk)
+    A = A.to(torch.float32).view(m, q + pH, -1)
+    A = A * A
+    Ypnorm2 = (y_perm * y_perm).sum(dim=0) + EPS                  # (chunk,)
+    Yp_resid2 = (Ypnorm2.unsqueeze(0) - A[:, q:].sum(dim=1)) + EPS
+    num = A[:, 0] if q == 1 else A[:, :q].amax(dim=1)
+    return torch.nan_to_num(num / Yp_resid2, nan=0.0)
 
 
 @torch.no_grad()
