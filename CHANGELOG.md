@@ -10,7 +10,7 @@ To release: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`, u
 compare links at the bottom, merge, and only then tag `vX.Y.Z`. The release workflow builds
 the GitHub release body from that section and stops if the tag has none.
 
-## [Unreleased]
+## [0.4.7] - 2026-11-27
 
 ### Fixed
 
@@ -26,7 +26,9 @@ the GitHub release body from that section and stops if the tag has none.
   The run still exited 0. The copies are now blocking. On one shared GPU, six concurrent runs of
   470 phenotypes went from 226–470 corrupted phenotypes per run to none, and the patched output
   equals the unpatched output wherever the latter was intact. The permutation pass (`cis`) and its
-  leads were not affected. Affects at least 0.4.2–0.4.6.
+  leads were not affected. The asynchronous copy is in every release from 0.1.1 to 0.4.6;
+  corrupted output was observed on 0.4.2–0.4.6. Nominal results from any of these releases that
+  were mapped on a shared GPU should be regenerated.
 
 ## [0.4.6] - 2026-11-23
 
@@ -654,7 +656,8 @@ output; see *Upgrading from 0.1* in the README.
   (`InputGeneratorCisWithHaps`), PLINK 1/2 readers, streaming Parquet sinks and pure-Python
   q-values.
 
-[Unreleased]: https://github.com/heart-gen/localQTL/compare/v0.4.6...HEAD
+[Unreleased]: https://github.com/heart-gen/localQTL/compare/v0.4.7...HEAD
+[0.4.7]: https://github.com/heart-gen/localQTL/compare/v0.4.6...v0.4.7
 [0.4.6]: https://github.com/heart-gen/localQTL/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/heart-gen/localQTL/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/heart-gen/localQTL/compare/v0.4.3...v0.4.4
