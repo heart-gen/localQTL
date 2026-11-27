@@ -10,6 +10,24 @@ To release: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`, u
 compare links at the bottom, merge, and only then tag `vX.Y.Z`. The release workflow builds
 the GitHub release body from that section and stops if the tag has none.
 
+## [Unreleased]
+
+### Fixed
+
+- **`cis_nominal` no longer writes zeros or stale values into `cis_qtl_pairs` under GPU contention.**
+  `_run_nominal_core` copied each phenotype's results from the GPU with `non_blocking=True` and read
+  them with `.numpy()` before the copy had finished. When the GPU was shared (several mapping
+  processes on one device), whole phenotype blocks, or their tails, were written as:
+  - zeros (`slope`, `slope_se`, `pval_nominal`, `af` = 0, with `ma_samples` / `ma_count` holding
+    float bit patterns);
+  - or stale rows from an earlier phenotype. These are internally consistent and visible only as an
+    `af` that differs from the same variant's `af` in other phenotypes.
+
+  The run still exited 0. The copies are now blocking. On one shared GPU, six concurrent runs of
+  470 phenotypes went from 226–470 corrupted phenotypes per run to none, and the patched output
+  equals the unpatched output wherever the latter was intact. The permutation pass (`cis`) and its
+  leads were not affected. Affects at least 0.4.2–0.4.6.
+
 ## [0.4.6] - 2026-11-23
 
 ### Added

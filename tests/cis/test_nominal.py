@@ -666,3 +666,17 @@ def test_grouped_interaction_top_per_group():
                       logger=SimpleLogger(verbose=False))
     top = res.attrs["top_assoc"]
     assert len(top) == 1 and top["group_id"].iloc[0] == "grp" and top["num_phenotypes"].iloc[0] == 2
+
+
+def test_nominal_device_to_host_copies_are_blocking():
+    """Regression guard: a non-blocking GPU->CPU copy read with .numpy() before the stream is
+    synchronised writes zeros or stale rows into cis_qtl_pairs under GPU contention. CI has no GPU
+    to trigger the race, so guard the source instead."""
+    import inspect
+    import re
+
+    from src.localqtl.cis import nominal
+
+    src = inspect.getsource(nominal)
+    assert not re.search(r'to\(\s*["\']cpu["\']\s*,\s*non_blocking\s*=\s*True\s*\)', src)
+    assert not re.search(r'\.cpu\(\s*non_blocking\s*=\s*True\s*\)', src)
