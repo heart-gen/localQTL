@@ -583,8 +583,12 @@ def _run_nominal_core(ig, variant_df, rez, nperm, device, maf_threshold: float =
                                         pvals_t, af_t], dim=1).to(torch.float32)
                 ints_t   = torch.stack([ma_samples_t, ma_count_t], dim=1).to(torch.int32)
 
-                floats = floats_t.detach().to("cpu", non_blocking=True).numpy()
-                ints   = ints_t.detach().to("cpu", non_blocking=True).numpy()
+                # Blocking device-to-host copies. With non_blocking=True the host
+                # tensor can be read by .numpy() before the asynchronous copy has
+                # finished, which writes zeros or stale values from an earlier
+                # phenotype into whole blocks of the nominal output.
+                floats = floats_t.detach().to("cpu").numpy()
+                ints   = ints_t.detach().to("cpu").numpy()
 
             beta_np, se_np, tstat_np, pval_np, af_np = (floats[:, i] for i in range(5))
             ma_samples_np, ma_count_np = ints[:, 0], ints[:, 1]
